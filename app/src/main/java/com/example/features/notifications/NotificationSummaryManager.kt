@@ -14,9 +14,17 @@ import com.example.R
 import com.example.core.security.GroqModelRole
 import com.example.core.security.SecureKeyStore
 import com.example.core.security.SensitiveDataSanitizer
+import com.example.data.remote.GeminiApiService
+import com.example.data.remote.GeminiContent
+import com.example.data.remote.GeminiGenerateRequest
+import com.example.data.remote.GeminiGenerationConfig
+import com.example.data.remote.GeminiPart
+import com.example.data.remote.GeminiThinkingConfig
 import com.example.data.remote.GroqApiService
 import com.example.data.remote.GroqChatRequest
 import com.example.data.remote.GroqMessage
+import com.example.data.remote.MercuryApiService
+import com.example.data.remote.MercuryChatRequest
 import com.example.domain.ai.AiResilienceHelper
 import com.example.domain.ai.AiResponseParser
 import com.example.service.BabyNotificationListenerService
@@ -39,8 +47,17 @@ class NotificationSummaryManager @Inject constructor(
     @ApplicationContext private val context: Context,
     private val keyStore: SecureKeyStore,
     private val groqApi: GroqApiService,
-    private val ttsManager: BabyTtsManager
+    private val ttsManager: BabyTtsManager,
+    private val mercuryApi: MercuryApiService? = null,
+    private val geminiApi: GeminiApiService? = null
 ) {
+    constructor(
+        context: Context,
+        keyStore: SecureKeyStore,
+        groqApi: GroqApiService,
+        ttsManager: BabyTtsManager
+    ) : this(context, keyStore, groqApi, ttsManager, null, null)
+
     suspend fun buildSummary(
         scope: String = "all",
         speakAloud: Boolean = false
@@ -113,29 +130,9 @@ class NotificationSummaryManager @Inject constructor(
         }.trim()
 
         val safeRemotePayload = SensitiveDataSanitizer.sanitizeForRemoteAi(structuredInput)
-        val summary = if (!settings.dataSaverEnabled && settings.groqApiKey.isNotBlank()) {
-            AiResilienceHelper.executeGroqChatWithRecovery(
-                groqApi = groqApi,
-                keyStore = keyStore,
-                key = settings.groqApiKey.trim(),
-                initialModel = settings.modelConfig.fastModel,
-                role = GroqModelRole.FAST,
-                requestBuilder = { modelId ->
-                    GroqChatRequest(
-                        model = modelId,
-                        messages = listOf(
-                            GroqMessage(
-                                role = "system",
-                                content = "You are Baby. Summarize these notifications in 2-4 crisp Hinglish sentences grouped by app and importance: ALWAYS mention PEOPLE messages first, updates next, and PROMOS last. Never invent or reveal masked OTP/bank numbers."
-                            ),
-                            GroqMessage(role = "user", content = safeRemotePayload)
-                        ),
-                        tools = null,
-                        toolChoice = null
-                    )
-                }
-            ).getOrNull()?.value?.choices?.firstOrNull()?.message?.content
-                ?.let { AiResponseParser.stripReasoning(it) }
+        val systemInstruction = "You are Baby, an AI assistant. Summarize these notifications in 2-4 crisp Hinglish sentences grouped by app and importance: ALWAYS mention PEOPLE messages first, updates next, and PROMOS last. Never invent or reveal masked OTP/bank numbers."
+        val summary = if (!settings.dataSaverEnabled && settings.hasAnyApiKey) {
+            summarizeViaAiRouter(settings, systemInstruction, safeRemotePayload)
                 ?: formatLocalSummary(orderedByBucketAndApp, allowSensitive)
         } else {
             formatLocalSummary(orderedByBucketAndApp, allowSensitive)
@@ -153,6 +150,84 @@ class NotificationSummaryManager @Inject constructor(
             ttsManager.speak(spokenSafe, "hinglish")
         }
         return finalSummary
+    }
+
+    private suspend fun summarizeViaAiRouter(
+        settings: com.example.core.security.BabySettings,
+        systemInstruction: String,
+        payload: String
+    ): String? {
+        if (mercuryApi != null && settings.inceptionApiKey.isNotBlank()) {
+            val mercText = AiResilienceHelper.executeMercuryChatWithRecovery(
+                mercuryApi = mercuryApi,
+                keyStore = keyStore,
+                key = settings.inceptionApiKey.trim(),
+                baseUrl = settings.modelConfig.inceptionBaseUrl,
+                initialModel = settings.modelConfig.mindModel,
+                requestBuilder = { modelId, stream ->
+                    MercuryChatRequest(
+                        model = modelId,
+                        messages = listOf(
+                            GroqMessage(role = "system", content = systemInstruction),
+                            GroqMessage(role = "user", content = payload)
+                        ),
+                        tools = null,
+                        toolChoice = null,
+                        reasoningEffort = "low",
+                        maxCompletionTokens = 320,
+                        stream = stream
+                    )
+                },
+                streamResponses = false
+            ).getOrNull()?.value?.choices?.firstOrNull()?.message?.content
+                ?.let { AiResponseParser.stripReasoning(it) }
+            if (!mercText.isNullOrBlank()) return mercText
+            if (!settings.autoFallbackEnabled) return null
+        }
+
+        if (geminiApi != null && settings.geminiApiKey.isNotBlank()) {
+            val gemText = AiResilienceHelper.executeGeminiWithRecovery(
+                geminiApi = geminiApi,
+                keyStore = keyStore,
+                key = settings.geminiApiKey.trim(),
+                initialModel = settings.modelConfig.geminiModel,
+                request = GeminiGenerateRequest(
+                    systemInstruction = GeminiContent(parts = listOf(GeminiPart(text = systemInstruction))),
+                    contents = listOf(GeminiContent(role = "user", parts = listOf(GeminiPart(text = payload)))),
+                    generationConfig = GeminiGenerationConfig(
+                        maxOutputTokens = 320,
+                        thinkingConfig = GeminiThinkingConfig("low")
+                    )
+                )
+            ).getOrNull()?.value?.candidates?.firstOrNull()?.content?.parts
+                ?.let { AiResilienceHelper.extractGeminiVisibleText(it) }
+            if (!gemText.isNullOrBlank()) return gemText
+            if (!settings.autoFallbackEnabled) return null
+        }
+
+        if (settings.groqApiKey.isNotBlank()) {
+            val groqText = AiResilienceHelper.executeGroqChatWithRecovery(
+                groqApi = groqApi,
+                keyStore = keyStore,
+                key = settings.groqApiKey.trim(),
+                initialModel = settings.modelConfig.fastModel,
+                role = GroqModelRole.FAST,
+                requestBuilder = { modelId ->
+                    GroqChatRequest(
+                        model = modelId,
+                        messages = listOf(
+                            GroqMessage(role = "system", content = systemInstruction),
+                            GroqMessage(role = "user", content = payload)
+                        ),
+                        tools = null,
+                        toolChoice = null
+                    )
+                }
+            ).getOrNull()?.value?.choices?.firstOrNull()?.message?.content
+                ?.let { AiResponseParser.stripReasoning(it) }
+            if (!groqText.isNullOrBlank()) return groqText
+        }
+        return null
     }
 
     fun showSummaryNotification(summaryText: String) {

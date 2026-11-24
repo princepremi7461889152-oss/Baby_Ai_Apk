@@ -31,3 +31,19 @@ data class SettingsRoute(val initialSection: String = "")
 
 @Serializable
 data object PermissionsRoute
+
+@Serializable
+data object CompareModelsRoute
+
+@Serializable
+data object LatencyDebugRoute
+
+@Serializable
+data object WakeWordTestRoute
+
+@Serializable
+data object RecipeTestRoute
+
+@Serializable
+data object CallAssistantRoute
+

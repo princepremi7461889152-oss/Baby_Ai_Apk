@@ -44,11 +44,33 @@ class PhoneControlExecutor @Inject constructor(
     private val ttsManager: BabyTtsManager,
     private val keyStore: SecureKeyStore,
     private val allowedAppDao: AllowedAppDao,
-    private val memoryDao: MemoryDao
+    private val memoryDao: MemoryDao,
+    private val appResolver: AppResolver
 ) {
+    // Legacy 6-arg constructor for unit tests that construct PhoneControlExecutor directly
+    constructor(
+        context: Context,
+        permissionHelper: PermissionHelper,
+        ttsManager: BabyTtsManager,
+        keyStore: SecureKeyStore,
+        allowedAppDao: AllowedAppDao,
+        memoryDao: MemoryDao
+    ) : this(
+        context = context,
+        permissionHelper = permissionHelper,
+        ttsManager = ttsManager,
+        keyStore = keyStore,
+        allowedAppDao = allowedAppDao,
+        memoryDao = memoryDao,
+        appResolver = AppResolver(context = context, allowedAppDao = allowedAppDao, keyStore = keyStore)
+    )
+
     suspend fun execute(name: String, args: Map<String, Any?>): ToolExecutionResult {
         return when (name) {
-            "open_app" -> openApp(args["app_name"]?.toString().orEmpty())
+            "open_app" -> openApp(
+                query = args["app_name"]?.toString().orEmpty(),
+                fromBackground = asBool(args["from_background"], false)
+            )
             "call_contact" -> callContact(args["target"]?.toString().orEmpty())
             "send_sms" -> sendSms(
                 args["recipient"]?.toString().orEmpty(),
@@ -102,88 +124,12 @@ class PhoneControlExecutor @Inject constructor(
         }
     }
 
-    private suspend fun openApp(query: String): ToolExecutionResult {
-        if (query.isBlank()) return ToolExecutionResult(false, "App name missing.")
-
-        SafetyManager.isBlockedScreen(query, query)?.let { blocked ->
-            val msg = "Safety guard: $blocked ($query) ko Baby automate ya open nahi karegi."
-            ttsManager.speak(msg, "hinglish")
-            return ToolExecutionResult(false, msg)
+    private suspend fun openApp(query: String, fromBackground: Boolean = false): ToolExecutionResult {
+        val outcome = appResolver.openApp(query, fromBackground = fromBackground)
+        if (outcome.status == AppOpenStatus.BLOCKED) {
+            ttsManager.speak(outcome.message, "hinglish")
         }
-
-        if (keyStore.settings.value.allowedAppsOnlyEnabled) {
-            val allowed = allowedAppDao.getAllowed()
-            val q = query.trim().lowercase()
-            val ok = q == context.packageName.lowercase() || allowed.any {
-                it.packageName.lowercase() == q ||
-                    it.appLabel.lowercase().contains(q) ||
-                    it.packageName.lowercase().contains(q)
-            }
-            if (!ok) {
-                val msg = "Safety guard: '$query' Allowed Apps list mein nahi hai."
-                ttsManager.speak(msg, "hinglish")
-                return ToolExecutionResult(false, msg)
-            }
-        }
-        val pm = context.packageManager
-        val directIntent = pm.getLaunchIntentForPackage(query)
-        if (directIntent != null) {
-            directIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            return runCatching {
-                context.startActivity(directIntent)
-                ToolExecutionResult(true, "Opened $query")
-            }.getOrElse { e ->
-                ToolExecutionResult(false, "Cannot launch $query: ${e.message}")
-            }
-        }
-
-        val launcherIntent = Intent(Intent.ACTION_MAIN).apply {
-            addCategory(Intent.CATEGORY_LAUNCHER)
-        }
-        val apps = pm.queryIntentActivities(launcherIntent, 0)
-        val qLower = query.trim().lowercase()
-        val match = apps.firstOrNull {
-            it.loadLabel(pm).toString().lowercase() == qLower
-        } ?: apps.firstOrNull {
-            it.loadLabel(pm).toString().lowercase().contains(qLower) ||
-                it.activityInfo.packageName.lowercase().contains(qLower)
-        }
-
-        return if (match != null) {
-            val resolvedPkg = match.activityInfo.packageName
-            val resolvedLabel = match.loadLabel(pm).toString()
-            SafetyManager.isBlockedScreen(resolvedPkg, resolvedLabel)?.let { blocked ->
-                val msg = "Safety guard: $blocked ($resolvedLabel) ko Baby open nahi karegi."
-                ttsManager.speak(msg, "hinglish")
-                return ToolExecutionResult(false, msg)
-            }
-            if (keyStore.settings.value.allowedAppsOnlyEnabled && resolvedPkg != context.packageName) {
-                val allowed = allowedAppDao.getAllowed()
-                val ok = allowed.any {
-                    it.packageName.equals(resolvedPkg, ignoreCase = true) ||
-                        it.appLabel.equals(resolvedLabel, ignoreCase = true)
-                }
-                if (!ok) {
-                    val msg = "Safety guard: '$resolvedLabel' Allowed Apps list mein nahi hai."
-                    ttsManager.speak(msg, "hinglish")
-                    return ToolExecutionResult(false, msg)
-                }
-            }
-            val launch = pm.getLaunchIntentForPackage(resolvedPkg)
-            if (launch != null) {
-                launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                runCatching {
-                    context.startActivity(launch)
-                    ToolExecutionResult(true, "Opened $resolvedLabel")
-                }.getOrElse { e ->
-                    ToolExecutionResult(false, "Cannot launch $resolvedLabel: ${e.message}")
-                }
-            } else {
-                ToolExecutionResult(false, "Cannot launch $resolvedLabel")
-            }
-        } else {
-            ToolExecutionResult(false, "App '$query' not found on device.")
-        }
+        return ToolExecutionResult(ok = outcome.ok, output = outcome.message)
     }
 
     private suspend fun callContact(target: String): ToolExecutionResult {

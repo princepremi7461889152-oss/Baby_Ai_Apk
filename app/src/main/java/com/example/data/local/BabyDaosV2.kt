@@ -224,3 +224,58 @@ interface EmergencyContactDao {
     @Query("DELETE FROM emergency_contacts WHERE id = :id")
     suspend fun deleteById(id: Long)
 }
+
+@Dao
+interface AppAliasDao {
+    @Query("SELECT * FROM app_aliases ORDER BY isUserEdited DESC, alias ASC")
+    fun observeAll(): Flow<List<AppAliasEntity>>
+
+    @Query("SELECT * FROM app_aliases ORDER BY isUserEdited DESC, alias ASC")
+    suspend fun getAllSnapshot(): List<AppAliasEntity>
+
+    @Query("SELECT COUNT(*) FROM app_aliases")
+    suspend fun count(): Int
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsert(entry: AppAliasEntity)
+
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertMissing(entries: List<AppAliasEntity>)
+
+    @Query("DELETE FROM app_aliases WHERE alias = :alias")
+    suspend fun deleteByAlias(alias: String)
+}
+
+@Dao
+interface SearchRecipeDao {
+    @Query("SELECT * FROM search_recipes ORDER BY displayName ASC")
+    fun observeAll(): Flow<List<SearchRecipeEntity>>
+
+    @Query("SELECT * FROM search_recipes ORDER BY displayName ASC")
+    suspend fun getAllSnapshot(): List<SearchRecipeEntity>
+
+    @Query("SELECT * FROM search_recipes WHERE LOWER(appKey) = LOWER(:key) OR LOWER(displayName) = LOWER(:key) LIMIT 1")
+    suspend fun findByKeyOrName(key: String): SearchRecipeEntity?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsert(recipe: SearchRecipeEntity)
+
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertMissing(recipes: List<SearchRecipeEntity>)
+}
+
+@Dao
+interface CallScreeningLogDao {
+    @Query("SELECT * FROM call_screening_logs ORDER BY timestamp DESC LIMIT 200")
+    fun observeRecent(): Flow<List<CallScreeningLogEntity>>
+
+    @Query("SELECT COUNT(*) FROM call_screening_logs WHERE callerNumber = :number AND timestamp >= :sinceMs")
+    suspend fun countRecentFromNumber(number: String, sinceMs: Long): Int
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insert(entry: CallScreeningLogEntity): Long
+
+    @Query("DELETE FROM call_screening_logs")
+    suspend fun clearAll()
+}
+

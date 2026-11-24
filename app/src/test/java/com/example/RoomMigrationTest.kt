@@ -10,6 +10,7 @@ import com.example.data.local.MIGRATION_1_2
 import com.example.data.local.MIGRATION_2_3
 import com.example.data.local.MIGRATION_3_4
 import com.example.data.local.MIGRATION_4_5
+import com.example.data.local.MIGRATION_5_6
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -39,7 +40,7 @@ class RoomMigrationTest {
 
     private fun openMigratedDb(dbName: String): BabyDatabase {
         return Room.databaseBuilder(context, BabyDatabase::class.java, dbName)
-            .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5)
+            .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6)
             .allowMainThreadQueries()
             .build()
     }
@@ -237,6 +238,76 @@ class RoomMigrationTest {
             assertEquals(1, places.size)
             assertEquals("Home", places.first().label)
             assertEquals(28.6139, places.first().latitude, 0.0001)
+        } finally {
+            roomDb.close()
+        }
+    }
+
+    @Test
+    fun `migrate version 5 to 6 adds app_aliases, search_recipes, and call_screening_logs preserving existing data`() = runBlocking {
+        val dbName = "migration_v5_v6_${System.nanoTime()}.db"
+        createdDbNames += dbName
+        val dbFile = context.getDatabasePath(dbName)
+        dbFile.parentFile?.mkdirs()
+
+        val helper = object : SQLiteOpenHelper(context, dbName, null, 5) {
+            override fun onCreate(db: SQLiteDatabase) {
+                db.execSQL("CREATE TABLE IF NOT EXISTS `chat_messages` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `role` TEXT NOT NULL, `content` TEXT NOT NULL, `brainUsed` TEXT, `toolName` TEXT, `toolArgsJson` TEXT, `toolResult` TEXT, `languageHint` TEXT, `timestamp` INTEGER NOT NULL)")
+                db.execSQL("CREATE TABLE IF NOT EXISTS `task_runs` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `commandText` TEXT NOT NULL, `status` TEXT NOT NULL, `stepsCount` INTEGER NOT NULL, `maxSteps` INTEGER NOT NULL, `brainSummary` TEXT NOT NULL, `finalReply` TEXT NOT NULL, `stepLogsJson` TEXT NOT NULL, `startedAt` INTEGER NOT NULL, `finishedAt` INTEGER)")
+                db.execSQL("CREATE TABLE IF NOT EXISTS `pending_queued_tasks` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `commandText` TEXT NOT NULL, `source` TEXT NOT NULL, `createdAt` INTEGER NOT NULL)")
+                db.execSQL("CREATE TABLE IF NOT EXISTS `routines` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `name` TEXT NOT NULL, `triggerPhrase` TEXT NOT NULL, `stepsJson` TEXT NOT NULL, `isBuiltIn` INTEGER NOT NULL, `scheduleType` TEXT NOT NULL, `scheduleTime` TEXT NOT NULL, `isEnabled` INTEGER NOT NULL, `createdAt` INTEGER NOT NULL)")
+                db.execSQL("CREATE TABLE IF NOT EXISTS `auto_reply_rules` (`contactKey` TEXT NOT NULL, `displayName` TEXT NOT NULL, `ruleType` TEXT NOT NULL, `lastRepliedAt` INTEGER NOT NULL, PRIMARY KEY(`contactKey`))")
+                db.execSQL("CREATE TABLE IF NOT EXISTS `memories` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `category` TEXT NOT NULL, `memoryKey` TEXT NOT NULL, `memoryValue` TEXT NOT NULL, `usageCount` INTEGER NOT NULL, `updatedAt` INTEGER NOT NULL, `createdAt` INTEGER NOT NULL)")
+                db.execSQL("CREATE TABLE IF NOT EXISTS `action_logs` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `timestamp` INTEGER NOT NULL, `commandText` TEXT NOT NULL, `toolName` TEXT NOT NULL, `argsSummary` TEXT NOT NULL, `resultText` TEXT NOT NULL, `targetApp` TEXT NOT NULL, `status` TEXT NOT NULL, `source` TEXT NOT NULL)")
+                db.execSQL("CREATE TABLE IF NOT EXISTS `reminders` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `title` TEXT NOT NULL, `triggerType` TEXT NOT NULL, `triggerAtMs` INTEGER NOT NULL, `latitude` REAL, `longitude` REAL, `radiusMeters` REAL NOT NULL, `placeLabel` TEXT NOT NULL, `isCompleted` INTEGER NOT NULL, `createdAt` INTEGER NOT NULL)")
+                db.execSQL("CREATE TABLE IF NOT EXISTS `macros` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `name` TEXT NOT NULL, `triggerPhrase` TEXT NOT NULL, `stepsJson` TEXT NOT NULL, `isEnabled` INTEGER NOT NULL, `createdAt` INTEGER NOT NULL)")
+                db.execSQL("CREATE TABLE IF NOT EXISTS `allowed_apps` (`packageName` TEXT NOT NULL, `appLabel` TEXT NOT NULL, `isAllowed` INTEGER NOT NULL, PRIMARY KEY(`packageName`))")
+                db.execSQL("CREATE TABLE IF NOT EXISTS `emergency_contacts` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `name` TEXT NOT NULL, `phoneNumber` TEXT NOT NULL)")
+                db.execSQL("CREATE TABLE IF NOT EXISTS `saved_places` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `placeKey` TEXT NOT NULL, `label` TEXT NOT NULL, `latitude` REAL NOT NULL, `longitude` REAL NOT NULL, `radiusMeters` REAL NOT NULL, `addressHint` TEXT NOT NULL, `updatedAt` INTEGER NOT NULL)")
+                db.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS `index_saved_places_placeKey` ON `saved_places` (`placeKey`)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_chat_messages_timestamp` ON `chat_messages` (`timestamp`)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_task_runs_startedAt` ON `task_runs` (`startedAt`)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_action_logs_timestamp` ON `action_logs` (`timestamp`)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_action_logs_status` ON `action_logs` (`status`)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_action_logs_source` ON `action_logs` (`source`)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_reminders_isCompleted_triggerAtMs` ON `reminders` (`isCompleted`, `triggerAtMs`)")
+            }
+
+            override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) = Unit
+        }
+        helper.writableDatabase.use { rawDb ->
+            rawDb.execSQL(
+                "INSERT INTO memories (id, category, memoryKey, memoryValue, usageCount, updatedAt, createdAt) VALUES (1, 'NICKNAME', 'Bhai', '9999988888', 2, 1000, 1000)"
+            )
+        }
+        helper.close()
+
+        val roomDb = openMigratedDb(dbName)
+        try {
+            val memories = roomDb.memoryDao().getAllSnapshot()
+            assertEquals(1, memories.size)
+            assertEquals("9999988888", memories.first().memoryValue)
+
+            roomDb.appAliasDao().upsert(
+                com.example.data.local.AppAliasEntity("yutub", "com.google.android.youtube", "YouTube", isUserEdited = true)
+            )
+            assertEquals(1, roomDb.appAliasDao().getAllSnapshot().size)
+
+            roomDb.searchRecipeDao().upsert(
+                com.example.data.local.SearchRecipeEntity("youtube", "YouTube", "com.google.android.youtube", "{}")
+            )
+            assertEquals("YouTube", roomDb.searchRecipeDao().findByKeyOrName("youtube")?.displayName)
+
+            roomDb.callScreeningLogDao().insert(
+                com.example.data.local.CallScreeningLogEntity(
+                    callerNumber = "+919876543210",
+                    callerName = "Unknown",
+                    mode = "SMART",
+                    decision = "ALLOW",
+                    reason = "Normal call"
+                )
+            )
+            assertEquals(1, roomDb.callScreeningLogDao().countRecentFromNumber("+919876543210", 0L))
         } finally {
             roomDb.close()
         }

@@ -11,6 +11,7 @@ import com.example.data.local.BabyDatabase
 import com.example.data.local.HistoryRepository
 import com.example.data.remote.GeminiApiService
 import com.example.data.remote.GroqApiService
+import com.example.data.remote.MercuryApiService
 import com.example.domain.ai.AgentOrchestrator
 import com.example.domain.ai.AgentStepTurn
 import com.example.domain.ai.AiCallException
@@ -71,6 +72,7 @@ class AiRouterAndSanitizerTest {
     private lateinit var keyStore: SecureKeyStore
     private lateinit var moshi: Moshi
 
+    private val capturedMercuryBodies = mutableListOf<String>()
     private val capturedGroqBodies = mutableListOf<String>()
     private val capturedGeminiBodies = mutableListOf<String>()
     private val recordedSleepDelays = mutableListOf<Long>()
@@ -85,6 +87,7 @@ class AiRouterAndSanitizerTest {
         keyStore.updatePreferredBrain(PreferredBrain.GROQ_FIRST)
         keyStore.setBooleanPref(SecureKeyStore.KEY_DATA_SAVER, false)
         moshi = Moshi.Builder().addLast(KotlinJsonAdapterFactory()).build()
+        capturedMercuryBodies.clear()
         capturedGroqBodies.clear()
         capturedGeminiBodies.clear()
         recordedSleepDelays.clear()
@@ -106,10 +109,27 @@ class AiRouterAndSanitizerTest {
             .body(json.toResponseBody("application/json".toMediaType()))
             .build()
 
+    private fun buildSseResponse(req: Request, sseBody: String): Response =
+        Response.Builder()
+            .request(req)
+            .protocol(Protocol.HTTP_1_1)
+            .code(200)
+            .message("OK")
+            .body(sseBody.toResponseBody("text/event-stream".toMediaType()))
+            .build()
+
     private fun buildRouter(
         groqHandler: (Request) -> Response,
-        geminiHandler: (Request) -> Response
+        geminiHandler: (Request) -> Response,
+        mercuryHandler: (Request) -> Response = { req -> buildJsonResponse(req, 500, "{}") }
     ): AiRouter {
+        val mercuryClient = OkHttpClient.Builder()
+            .addInterceptor(Interceptor { chain ->
+                val req = chain.request()
+                capturedMercuryBodies += readRequestBody(req)
+                mercuryHandler(req)
+            })
+            .build()
         val groqClient = OkHttpClient.Builder()
             .addInterceptor(Interceptor { chain ->
                 val req = chain.request()
@@ -124,6 +144,12 @@ class AiRouterAndSanitizerTest {
                 geminiHandler(req)
             })
             .build()
+        val mercuryApi = Retrofit.Builder()
+            .baseUrl("https://api.inceptionlabs.ai/")
+            .client(mercuryClient)
+            .addConverterFactory(MoshiConverterFactory.create(moshi))
+            .build()
+            .create(MercuryApiService::class.java)
         val groqApi = Retrofit.Builder()
             .baseUrl("https://api.groq.com/")
             .client(groqClient)
@@ -136,25 +162,27 @@ class AiRouterAndSanitizerTest {
             .addConverterFactory(MoshiConverterFactory.create(moshi))
             .build()
             .create(GeminiApiService::class.java)
-        return AiRouter(geminiApi, groqApi, keyStore, moshi).apply {
+        return AiRouter(geminiApi, groqApi, mercuryApi, keyStore, moshi).apply {
             sleeper = { ms -> recordedSleepDelays += ms }
             jitterRatioProvider = { 0.0 }
         }
     }
 
     @Test
-    fun `model config defaults use gpt-oss-120b, gpt-oss-20b, whisper-large-v3-turbo, gemini-2_5-flash and migrate legacy defaults`() {
+    fun `model config defaults use mercury-3, gemini-3_8-flash, gpt-oss-120b, whisper-large-v3-turbo and migrate legacy defaults`() {
         val cfg = AiModelConfig()
+        assertEquals("mercury-3", cfg.mindModel)
+        assertEquals("gemini-3.8-flash", cfg.geminiModel)
         assertEquals("openai/gpt-oss-120b", cfg.chatModel)
         assertEquals("openai/gpt-oss-20b", cfg.fastModel)
         assertEquals("whisper-large-v3-turbo", cfg.sttModel)
-        assertEquals("gemini-2.5-flash", cfg.geminiModel)
+        assertEquals("gemini-3.8-flash-lite-tts", cfg.ttsModel)
 
-        val prefs = context.getSharedPreferences("baby_secure_prefs_fallback", Context.MODE_PRIVATE)
+        val prefs = context.getSharedPreferences("baby_secure_keystore_prefs_fallback", Context.MODE_PRIVATE)
         prefs.edit()
             .putString("groq_model", "llama-3.3-70b-versatile")
             .putString("groq_fast_model", "llama-3.3-70b-versatile")
-            .putString("gemini_model", "gemini-3.8-flash")
+            .putString("gemini_model", "gemini-1.5-flash")
             .commit()
 
         val migratedStore = SecureKeyStore(context)
@@ -696,5 +724,111 @@ class AiRouterAndSanitizerTest {
         assertTrue(results.items[1].detail.contains("404"))
         assertEquals(true, results.items[2].passed) // STT
         assertEquals(true, results.items[3].passed) // Gemini
+    }
+
+    @Test
+    fun `mercury streams SSE tokens cleanly, falls back Mercury to Gemini to Groq, and repairs malformed tool JSON once`() = runBlocking {
+        keyStore.updateAllApiKeys(
+            inceptionKey = "inc_testKey1234567890",
+            geminiKey = "AIzaTestGeminiKey1234567890abc",
+            groqKey = "gsk_testGroqKey1234567890"
+        )
+        keyStore.updatePreferredBrain(PreferredBrain.MERCURY_FIRST)
+
+        // 1. Streaming SSE tokens from Mercury
+        val streamedTokens = mutableListOf<String>()
+        val streamRouter = buildRouter(
+            groqHandler = { req -> buildJsonResponse(req, 500, "{}") },
+            geminiHandler = { req -> buildJsonResponse(req, 500, "{}") },
+            mercuryHandler = { req ->
+                val sse = listOf(
+                    """data: {"choices":[{"delta":{"content":"Namaste "}}]}""",
+                    """data: {"choices":[{"delta":{"content":"main Baby hoon!"}}]}""",
+                    """data: [DONE]"""
+                ).joinToString("\n\n") + "\n\n"
+                buildSseResponse(req, sse)
+            }
+        )
+        val streamRes = streamRouter.planNextStep(
+            turns = listOf(AgentStepTurn(role = "user", text = "Kaun ho tum?")),
+            screenContext = null,
+            screenshotBase64 = null,
+            stepIndex = 0,
+            isLocked = false,
+            userLanguageHint = "hinglish",
+            onStreamingToken = { streamedTokens += it }
+        ).getOrThrow()
+        assertEquals(BrainType.MERCURY, streamRes.brainUsed)
+        assertEquals("Namaste main Baby hoon!", streamRes.replyText)
+        assertEquals(listOf("Namaste ", "main Baby hoon!"), streamedTokens)
+
+        // 2. Fallback chain: Mercury 401 -> Gemini 403 -> Groq 200 (also tests malformed tool JSON repair)
+        val groqAttempt = AtomicInteger(0)
+        val fallbackRouter = buildRouter(
+            mercuryHandler = { req -> buildJsonResponse(req, 401, """{"error":{"message":"bad inception key"}}""") },
+            geminiHandler = { req -> buildJsonResponse(req, 403, """{"error":{"message":"gemini blocked"}}""") },
+            groqHandler = { req ->
+                if (groqAttempt.incrementAndGet() == 1) {
+                    buildJsonResponse(
+                        req,
+                        200,
+                        """{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call_bad","type":"function","function":{"name":"toggle_flashlight","arguments":"{broken_json"}}]}}]}"""
+                    )
+                } else {
+                    buildJsonResponse(
+                        req,
+                        200,
+                        """{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call_fixed","type":"function","function":{"name":"toggle_flashlight","arguments":"{\"enable\":true}"}}]}}]}"""
+                    )
+                }
+            }
+        )
+        val fbRes = fallbackRouter.planNextStep(
+            turns = listOf(AgentStepTurn(role = "user", text = "Flashlight on karo")),
+            screenContext = null,
+            screenshotBase64 = null,
+            stepIndex = 0,
+            isLocked = false,
+            userLanguageHint = "hinglish"
+        ).getOrThrow()
+        assertEquals(BrainType.GROQ, fbRes.brainUsed)
+        assertEquals(2, groqAttempt.get())
+        assertEquals("toggle_flashlight", fbRes.toolCalls.single().name)
+        assertEquals(true, fbRes.toolCalls.single().args["enable"])
+    }
+
+    @Test
+    fun `gemini search grounding sends googleSearch without temperature and extracts source links`() = runBlocking {
+        keyStore.updateAllApiKeys(inceptionKey = "", geminiKey = "AIzaTestGeminiKey1234567890abc", groqKey = "")
+        val router = buildRouter(
+            groqHandler = { req -> buildJsonResponse(req, 500, "{}") },
+            geminiHandler = { req ->
+                buildJsonResponse(
+                    req,
+                    200,
+                    """
+                    {
+                      "candidates": [{
+                        "content": {"role": "model", "parts": [{"text": "Aaj Delhi mein 29 degree aur clear sky hai."}]},
+                        "groundingMetadata": {
+                          "groundingChunks": [
+                            {"web": {"uri": "https://weather.example.com/delhi", "title": "Delhi Weather"}}
+                          ]
+                        }
+                      }]
+                    }
+                    """.trimIndent()
+                )
+            }
+        )
+        val searchRes = router.searchWebWithGrounding("Delhi ka mausam").getOrThrow()
+        assertEquals(BrainType.GEMINI, searchRes.brainUsed)
+        assertTrue(searchRes.replyText!!.contains("29 degree"))
+        assertEquals(1, searchRes.sources.size)
+        assertEquals("Delhi Weather", searchRes.sources.first().title)
+        val sentPayload = capturedGeminiBodies.single()
+        assertTrue(sentPayload.contains("googleSearch"))
+        assertTrue(sentPayload.contains("\"thinkingLevel\":\"low\""))
+        assertFalse(sentPayload.contains("temperature"))
     }
 }

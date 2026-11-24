@@ -144,3 +144,49 @@ val MIGRATION_4_5 = object : Migration(4, 5) {
         db.execSQL("CREATE INDEX IF NOT EXISTS `index_reminders_isCompleted_triggerAtMs` ON `reminders` (`isCompleted`, `triggerAtMs`)")
     }
 }
+
+val MIGRATION_5_6 = object : Migration(5, 6) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS `app_aliases` (
+                `alias` TEXT NOT NULL,
+                `packageName` TEXT NOT NULL,
+                `appLabel` TEXT NOT NULL,
+                `isUserEdited` INTEGER NOT NULL,
+                `updatedAt` INTEGER NOT NULL,
+                PRIMARY KEY(`alias`)
+            )
+            """.trimIndent()
+        )
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS `search_recipes` (
+                `appKey` TEXT NOT NULL,
+                `displayName` TEXT NOT NULL,
+                `packageName` TEXT NOT NULL,
+                `recipeJson` TEXT NOT NULL,
+                `updatedAt` INTEGER NOT NULL,
+                PRIMARY KEY(`appKey`)
+            )
+            """.trimIndent()
+        )
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS `call_screening_logs` (
+                `id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                `timestamp` INTEGER NOT NULL,
+                `callerNumber` TEXT NOT NULL,
+                `callerName` TEXT NOT NULL,
+                `mode` TEXT NOT NULL,
+                `decision` TEXT NOT NULL,
+                `reason` TEXT NOT NULL,
+                `transcript` TEXT NOT NULL,
+                `replySent` TEXT NOT NULL
+            )
+            """.trimIndent()
+        )
+        db.execSQL("CREATE INDEX IF NOT EXISTS `index_call_screening_logs_timestamp` ON `call_screening_logs` (`timestamp`)")
+    }
+}
+

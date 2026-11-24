@@ -2,6 +2,7 @@ package com.example.core.security
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.util.Base64
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -10,20 +11,20 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.security.MessageDigest
 import java.security.SecureRandom
-import android.util.Base64
 import javax.inject.Inject
 import javax.inject.Singleton
 
 enum class AppLanguage(val displayName: String, val localeTag: String, val instruction: String) {
-    HINGLISH("Hinglish (Default)", "hi-IN", "Natural conversational Hinglish (mix of Hindi and English in Latin script)."),
-    HINDI("Hindi", "hi-IN", "Natural conversational Hindi in Devanagari or simple Hindi."),
+    HINGLISH("Hinglish (Default)", "hi-IN", "Natural conversational Hinglish (mix of Hindi and English in Latin script). Never convert Hinglish or English words to Devanagari."),
+    HINDI("Hindi", "hi-IN", "Natural conversational Hindi matching the user's script."),
     ENGLISH("English", "en-IN", "Friendly, concise natural English.")
 }
 
 enum class PreferredBrain(val label: String) {
-    AUTO("Smart Auto (Groq fast + Gemini heavy)"),
+    AUTO("Smart Auto (Mercury MIND + Gemini Vision/Search)"),
+    MERCURY_FIRST("Mercury 3 First (Inception)"),
     GROQ_FIRST("Groq First (gpt-oss-120b)"),
-    GEMINI_FIRST("Gemini First (Vision & Reasoning)")
+    GEMINI_FIRST("Gemini First (Vision & Search)")
 }
 
 enum class AutoReplyMode(val label: String) {
@@ -40,7 +41,36 @@ enum class BabyPersonality(val label: String, val toneInstruction: String) {
     SERIOUS("Serious", "Crisp, direct, professional, zero-fluff tone.")
 }
 
+enum class EmotionIntensity(val label: String) {
+    OFF("Off"),
+    SUBTLE("Subtle"),
+    EXPRESSIVE("Expressive")
+}
+
+enum class TtsTierMode(val label: String) {
+    AUTO("Auto (Android fast + Gemini rich)"),
+    ANDROID_ONLY("Android TTS Only (Fast & Offline)"),
+    GEMINI_STANDARD("Gemini Flash Lite TTS"),
+    GEMINI_PREMIUM("Gemini Premium Voice TTS")
+}
+
+enum class CallAssistantMode(val label: String) {
+    OFF("Off"),
+    SMART("Smart Screening"),
+    BUSY("Busy"),
+    DRIVING("Driving"),
+    SLEEPING("Sleeping")
+}
+
+enum class UnknownCallerPolicy(val label: String) {
+    ALLOW("Let Ring"),
+    SILENCE("Silence + Screen"),
+    LEVEL1_REJECT("Reject + SMS/WA Reply"),
+    LEVEL2_AI_ANSWER("Best-Effort AI Answer (Opt-In)")
+}
+
 data class BabySettings(
+    val inceptionApiKey: String = "",
     val geminiApiKey: String = "",
     val groqApiKey: String = "",
     val modelConfig: AiModelConfig = AiModelConfig(),
@@ -48,10 +78,15 @@ data class BabySettings(
     val autoFallbackEnabled: Boolean = true,
     val wakeWordEnabled: Boolean = true,
     val wakeWordSensitivity: Float = 0.65f,
+    val wakeWordBatterySaver: Boolean = false,
     val confirmSensitiveActions: Boolean = true,
     val preferredLanguage: AppLanguage = AppLanguage.HINGLISH,
     val floatingBubbleEnabled: Boolean = false,
     val ttsRepliesEnabled: Boolean = true,
+    val ttsTierMode: TtsTierMode = TtsTierMode.AUTO,
+    val ttsVoiceName: String = "Kore",
+    val ttsSpeed: Float = 1.0f,
+    val ttsVolume: Float = 1.0f,
     val onboardingCompleted: Boolean = false,
     // Phase 1-3 feature toggles & configs
     val routinesEnabled: Boolean = true,
@@ -93,9 +128,24 @@ data class BabySettings(
     val offlineCommandsEnabled: Boolean = true,
     val personality: BabyPersonality = BabyPersonality.FRIENDLY,
     val dataSaverEnabled: Boolean = false,
-    val lastTaskSummary: String = "Tap Mic to speak with Baby"
+    val lastTaskSummary: String = "Tap Mic to speak with Baby",
+    // Emotion Layer
+    val emotionIntensity: EmotionIntensity = EmotionIntensity.SUBTLE,
+    val orbFaceModeEnabled: Boolean = false,
+    val emotionalVoiceEnabled: Boolean = true,
+    val hapticsEnabled: Boolean = true,
+    val understandMyMoodEnabled: Boolean = false,
+    // Call Assistant
+    val callAssistantEnabled: Boolean = false,
+    val callAssistantMode: CallAssistantMode = CallAssistantMode.OFF,
+    val unknownCallerPolicy: UnknownCallerPolicy = UnknownCallerPolicy.SILENCE,
+    val callAssistantLevel2OptIn: Boolean = false,
+    val callAssistantSaveAudio: Boolean = false,
+    val callAssistantReplyTemplate: String = "Hi, abhi main call nahi le pa raha/rahi. Please message bhej dein, jaldi call back karunga.",
+    val callAssistantCountryWarningAck: Boolean = false
 ) {
-    val hasAnyApiKey: Boolean get() = geminiApiKey.isNotBlank() || groqApiKey.isNotBlank()
+    val hasAnyApiKey: Boolean
+        get() = inceptionApiKey.isNotBlank() || geminiApiKey.isNotBlank() || groqApiKey.isNotBlank()
 
     fun activeAutoReplyTemplate(): String = when (autoReplyMode) {
         AutoReplyMode.BUSY -> autoReplyBusyMsg
@@ -128,7 +178,6 @@ class SecureKeyStore @Inject constructor(
                 EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
             )
         } catch (e: Exception) {
-            // Fallback for rare Robolectric/OEM keystore edge cases while preserving app stability
             context.getSharedPreferences(PREFS_FILE + "_fallback", Context.MODE_PRIVATE)
         }
     }
@@ -156,24 +205,29 @@ class SecureKeyStore @Inject constructor(
         val brainName = prefs.getString(KEY_BRAIN, PreferredBrain.AUTO.name) ?: PreferredBrain.AUTO.name
         val replyModeName = prefs.getString(KEY_AUTO_REPLY_MODE, AutoReplyMode.OFF.name) ?: AutoReplyMode.OFF.name
         val personalityName = prefs.getString(KEY_PERSONALITY, BabyPersonality.FRIENDLY.name) ?: BabyPersonality.FRIENDLY.name
-        val rawGemini = prefs.getString(KEY_GEMINI_MODEL, AiModelConfig.DEFAULT_GEMINI_MODEL)
-            ?.trim().orEmpty()
+        val emotionIntensityName = prefs.getString(KEY_EMOTION_INTENSITY, EmotionIntensity.SUBTLE.name) ?: EmotionIntensity.SUBTLE.name
+        val ttsTierName = prefs.getString(KEY_TTS_TIER_MODE, TtsTierMode.AUTO.name) ?: TtsTierMode.AUTO.name
+        val callModeName = prefs.getString(KEY_CALL_ASSISTANT_MODE, CallAssistantMode.OFF.name) ?: CallAssistantMode.OFF.name
+        val unknownPolicyName = prefs.getString(KEY_UNKNOWN_CALLER_POLICY, UnknownCallerPolicy.SILENCE.name) ?: UnknownCallerPolicy.SILENCE.name
+
+        val rawMind = prefs.getString(KEY_MIND_MODEL, AiModelConfig.DEFAULT_MIND_MODEL)?.trim().orEmpty()
+        val resolvedMind = rawMind.ifBlank { AiModelConfig.DEFAULT_MIND_MODEL }
+
+        val rawGemini = prefs.getString(KEY_GEMINI_MODEL, AiModelConfig.DEFAULT_GEMINI_MODEL)?.trim().orEmpty()
         val resolvedGemini = if (rawGemini.isBlank() || AiModelConfig.isDeprecatedGeminiDefault(rawGemini)) {
             AiModelConfig.DEFAULT_GEMINI_MODEL
         } else {
             rawGemini
         }
 
-        val rawChat = prefs.getString(KEY_GROQ_MODEL, AiModelConfig.DEFAULT_CHAT_MODEL)
-            ?.trim().orEmpty()
+        val rawChat = prefs.getString(KEY_GROQ_MODEL, AiModelConfig.DEFAULT_CHAT_MODEL)?.trim().orEmpty()
         val resolvedChat = if (rawChat.isBlank() || AiModelConfig.isDeprecatedGroqDefault(rawChat)) {
             AiModelConfig.DEFAULT_CHAT_MODEL
         } else {
             rawChat
         }
 
-        val rawFast = prefs.getString(KEY_GROQ_FAST_MODEL, AiModelConfig.DEFAULT_FAST_MODEL)
-            ?.trim().orEmpty()
+        val rawFast = prefs.getString(KEY_GROQ_FAST_MODEL, AiModelConfig.DEFAULT_FAST_MODEL)?.trim().orEmpty()
         val resolvedFast = if (rawFast.isBlank() || AiModelConfig.isDeprecatedGroqDefault(rawFast)) {
             AiModelConfig.DEFAULT_FAST_MODEL
         } else {
@@ -183,23 +237,48 @@ class SecureKeyStore @Inject constructor(
         val resolvedStt = prefs.getString(KEY_WHISPER_MODEL, AiModelConfig.DEFAULT_STT_MODEL)
             ?.trim()?.ifBlank { AiModelConfig.DEFAULT_STT_MODEL } ?: AiModelConfig.DEFAULT_STT_MODEL
 
+        val resolvedTts = prefs.getString(KEY_TTS_MODEL, AiModelConfig.DEFAULT_TTS_MODEL)
+            ?.trim()?.ifBlank { AiModelConfig.DEFAULT_TTS_MODEL } ?: AiModelConfig.DEFAULT_TTS_MODEL
+
+        val resolvedTtsPremium = prefs.getString(KEY_TTS_PREMIUM_MODEL, AiModelConfig.DEFAULT_TTS_PREMIUM_MODEL)
+            ?.trim()?.ifBlank { AiModelConfig.DEFAULT_TTS_PREMIUM_MODEL } ?: AiModelConfig.DEFAULT_TTS_PREMIUM_MODEL
+
+        val inceptionBase = prefs.getString(KEY_INCEPTION_BASE_URL, AiModelConfig.DEFAULT_INCEPTION_BASE_URL)
+            ?.trim()?.ifBlank { AiModelConfig.DEFAULT_INCEPTION_BASE_URL } ?: AiModelConfig.DEFAULT_INCEPTION_BASE_URL
+        val groqBase = prefs.getString(KEY_GROQ_BASE_URL, AiModelConfig.DEFAULT_GROQ_BASE_URL)
+            ?.trim()?.ifBlank { AiModelConfig.DEFAULT_GROQ_BASE_URL } ?: AiModelConfig.DEFAULT_GROQ_BASE_URL
+        val geminiBase = prefs.getString(KEY_GEMINI_BASE_URL, AiModelConfig.DEFAULT_GEMINI_BASE_URL)
+            ?.trim()?.ifBlank { AiModelConfig.DEFAULT_GEMINI_BASE_URL } ?: AiModelConfig.DEFAULT_GEMINI_BASE_URL
+
         return BabySettings(
+            inceptionApiKey = prefs.getString(KEY_INCEPTION_API_KEY, "") ?: "",
             geminiApiKey = prefs.getString(KEY_GEMINI_API_KEY, "") ?: "",
             groqApiKey = prefs.getString(KEY_GROQ_API_KEY, "") ?: "",
             modelConfig = AiModelConfig(
+                mindModel = resolvedMind,
+                geminiModel = resolvedGemini,
                 chatModel = resolvedChat,
                 fastModel = resolvedFast,
                 sttModel = resolvedStt,
-                geminiModel = resolvedGemini
+                ttsModel = resolvedTts,
+                ttsPremiumModel = resolvedTtsPremium,
+                inceptionBaseUrl = inceptionBase,
+                groqBaseUrl = groqBase,
+                geminiBaseUrl = geminiBase
             ),
             preferredBrain = runCatching { PreferredBrain.valueOf(brainName) }.getOrDefault(PreferredBrain.AUTO),
             autoFallbackEnabled = prefs.getBoolean(KEY_AUTO_FALLBACK, true),
             wakeWordEnabled = prefs.getBoolean(KEY_WAKE_WORD_ENABLED, true),
             wakeWordSensitivity = prefs.getFloat(KEY_WAKE_SENSITIVITY, 0.65f).coerceIn(0.1f, 1.0f),
+            wakeWordBatterySaver = prefs.getBoolean(KEY_WAKE_BATTERY_SAVER, false),
             confirmSensitiveActions = prefs.getBoolean(KEY_CONFIRM_SENSITIVE, true),
             preferredLanguage = runCatching { AppLanguage.valueOf(langName) }.getOrDefault(AppLanguage.HINGLISH),
             floatingBubbleEnabled = prefs.getBoolean(KEY_FLOATING_BUBBLE, false),
             ttsRepliesEnabled = prefs.getBoolean(KEY_TTS_REPLIES, true),
+            ttsTierMode = runCatching { TtsTierMode.valueOf(ttsTierName) }.getOrDefault(TtsTierMode.AUTO),
+            ttsVoiceName = prefs.getString(KEY_TTS_VOICE_NAME, "Kore")?.ifBlank { "Kore" } ?: "Kore",
+            ttsSpeed = prefs.getFloat(KEY_TTS_SPEED, 1.0f).coerceIn(0.6f, 1.8f),
+            ttsVolume = prefs.getFloat(KEY_TTS_VOLUME, 1.0f).coerceIn(0.1f, 1.0f),
             onboardingCompleted = prefs.getBoolean(KEY_ONBOARDING_DONE, false),
             routinesEnabled = prefs.getBoolean(KEY_ROUTINES_ENABLED, true),
             autoReplyEnabled = prefs.getBoolean(KEY_AUTO_REPLY_ENABLED, false),
@@ -242,12 +321,37 @@ class SecureKeyStore @Inject constructor(
             personality = runCatching { BabyPersonality.valueOf(personalityName) }.getOrDefault(BabyPersonality.FRIENDLY),
             dataSaverEnabled = prefs.getBoolean(KEY_DATA_SAVER, false),
             lastTaskSummary = prefs.getString(KEY_LAST_TASK_SUMMARY, "Tap Mic to speak with Baby")
-                ?: "Tap Mic to speak with Baby"
+                ?: "Tap Mic to speak with Baby",
+            emotionIntensity = runCatching { EmotionIntensity.valueOf(emotionIntensityName) }.getOrDefault(EmotionIntensity.SUBTLE),
+            orbFaceModeEnabled = prefs.getBoolean(KEY_ORB_FACE_MODE, false),
+            emotionalVoiceEnabled = prefs.getBoolean(KEY_EMOTIONAL_VOICE, true),
+            hapticsEnabled = prefs.getBoolean(KEY_HAPTICS_ENABLED, true),
+            understandMyMoodEnabled = prefs.getBoolean(KEY_UNDERSTAND_MY_MOOD, false),
+            callAssistantEnabled = prefs.getBoolean(KEY_CALL_ASSISTANT_ENABLED, false),
+            callAssistantMode = runCatching { CallAssistantMode.valueOf(callModeName) }.getOrDefault(CallAssistantMode.OFF),
+            unknownCallerPolicy = runCatching { UnknownCallerPolicy.valueOf(unknownPolicyName) }.getOrDefault(UnknownCallerPolicy.SILENCE),
+            callAssistantLevel2OptIn = prefs.getBoolean(KEY_CALL_ASSISTANT_LEVEL2, false),
+            callAssistantSaveAudio = prefs.getBoolean(KEY_CALL_ASSISTANT_SAVE_AUDIO, false),
+            callAssistantReplyTemplate = prefs.getString(
+                KEY_CALL_ASSISTANT_TEMPLATE,
+                "Hi, abhi main call nahi le pa raha/rahi. Please message bhej dein, jaldi call back karunga."
+            ) ?: "Hi, abhi main call nahi le pa raha/rahi. Please message bhej dein, jaldi call back karunga.",
+            callAssistantCountryWarningAck = prefs.getBoolean(KEY_CALL_COUNTRY_WARNING_ACK, false)
         )
     }
 
-    fun updateApiKeys(geminiKey: String, groqKey: String) {
+    fun updateApiKeys(geminiKey: String, groqKey: String, inceptionKey: String = _settings.value.inceptionApiKey) {
         prefs.edit()
+            .putString(KEY_GEMINI_API_KEY, geminiKey.trim())
+            .putString(KEY_GROQ_API_KEY, groqKey.trim())
+            .putString(KEY_INCEPTION_API_KEY, inceptionKey.trim())
+            .apply()
+        refresh()
+    }
+
+    fun updateAllApiKeys(inceptionKey: String, geminiKey: String, groqKey: String) {
+        prefs.edit()
+            .putString(KEY_INCEPTION_API_KEY, inceptionKey.trim())
             .putString(KEY_GEMINI_API_KEY, geminiKey.trim())
             .putString(KEY_GROQ_API_KEY, groqKey.trim())
             .apply()
@@ -257,11 +361,22 @@ class SecureKeyStore @Inject constructor(
     fun updateModelConfig(config: AiModelConfig) {
         val norm = config.normalized()
         prefs.edit()
+            .putString(KEY_MIND_MODEL, norm.mindModel)
+            .putString(KEY_GEMINI_MODEL, norm.geminiModel)
             .putString(KEY_GROQ_MODEL, norm.chatModel)
             .putString(KEY_GROQ_FAST_MODEL, norm.fastModel)
             .putString(KEY_WHISPER_MODEL, norm.sttModel)
-            .putString(KEY_GEMINI_MODEL, norm.geminiModel)
+            .putString(KEY_TTS_MODEL, norm.ttsModel)
+            .putString(KEY_TTS_PREMIUM_MODEL, norm.ttsPremiumModel)
+            .putString(KEY_INCEPTION_BASE_URL, norm.inceptionBaseUrl)
+            .putString(KEY_GROQ_BASE_URL, norm.groqBaseUrl)
+            .putString(KEY_GEMINI_BASE_URL, norm.geminiBaseUrl)
             .apply()
+        refresh()
+    }
+
+    fun updateMindModel(model: String) {
+        prefs.edit().putString(KEY_MIND_MODEL, model.trim().ifBlank { AiModelConfig.DEFAULT_MIND_MODEL }).apply()
         refresh()
     }
 
@@ -289,6 +404,11 @@ class SecureKeyStore @Inject constructor(
         refresh()
     }
 
+    fun updateTtsModel(model: String) {
+        prefs.edit().putString(KEY_TTS_MODEL, model.trim().ifBlank { AiModelConfig.DEFAULT_TTS_MODEL }).apply()
+        refresh()
+    }
+
     fun resetModelConfig() {
         updateModelConfig(AiModelConfig())
     }
@@ -313,6 +433,11 @@ class SecureKeyStore @Inject constructor(
         refresh()
     }
 
+    fun setWakeWordBatterySaver(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_WAKE_BATTERY_SAVER, enabled).apply()
+        refresh()
+    }
+
     fun setConfirmSensitiveActions(enabled: Boolean) {
         prefs.edit().putBoolean(KEY_CONFIRM_SENSITIVE, enabled).apply()
         refresh()
@@ -333,6 +458,26 @@ class SecureKeyStore @Inject constructor(
         refresh()
     }
 
+    fun setTtsTierMode(mode: TtsTierMode) {
+        prefs.edit().putString(KEY_TTS_TIER_MODE, mode.name).apply()
+        refresh()
+    }
+
+    fun setTtsVoiceName(voiceName: String) {
+        prefs.edit().putString(KEY_TTS_VOICE_NAME, voiceName.trim().ifBlank { "Kore" }).apply()
+        refresh()
+    }
+
+    fun setTtsSpeed(speed: Float) {
+        prefs.edit().putFloat(KEY_TTS_SPEED, speed.coerceIn(0.6f, 1.8f)).apply()
+        refresh()
+    }
+
+    fun setTtsVolume(volume: Float) {
+        prefs.edit().putFloat(KEY_TTS_VOLUME, volume.coerceIn(0.1f, 1.0f)).apply()
+        refresh()
+    }
+
     fun setOnboardingCompleted(completed: Boolean) {
         prefs.edit().putBoolean(KEY_ONBOARDING_DONE, completed).apply()
         refresh()
@@ -340,6 +485,7 @@ class SecureKeyStore @Inject constructor(
 
     fun clearApiKeys() {
         prefs.edit()
+            .remove(KEY_INCEPTION_API_KEY)
             .remove(KEY_GEMINI_API_KEY)
             .remove(KEY_GROQ_API_KEY)
             .apply()
@@ -348,6 +494,29 @@ class SecureKeyStore @Inject constructor(
 
     fun setBooleanPref(key: String, value: Boolean) {
         prefs.edit().putBoolean(key, value).apply()
+        refresh()
+    }
+
+    fun setEmotionIntensity(intensity: EmotionIntensity) {
+        prefs.edit().putString(KEY_EMOTION_INTENSITY, intensity.name).apply()
+        refresh()
+    }
+
+    fun setCallAssistantMode(mode: CallAssistantMode) {
+        prefs.edit()
+            .putString(KEY_CALL_ASSISTANT_MODE, mode.name)
+            .putBoolean(KEY_CALL_ASSISTANT_ENABLED, mode != CallAssistantMode.OFF)
+            .apply()
+        refresh()
+    }
+
+    fun setUnknownCallerPolicy(policy: UnknownCallerPolicy) {
+        prefs.edit().putString(KEY_UNKNOWN_CALLER_POLICY, policy.name).apply()
+        refresh()
+    }
+
+    fun setCallAssistantReplyTemplate(template: String) {
+        prefs.edit().putString(KEY_CALL_ASSISTANT_TEMPLATE, template.trim()).apply()
         refresh()
     }
 
@@ -476,20 +645,32 @@ class SecureKeyStore @Inject constructor(
 
     companion object {
         private const val PREFS_FILE = "baby_secure_keystore_prefs"
+        private const val KEY_INCEPTION_API_KEY = "inception_api_key"
         private const val KEY_GEMINI_API_KEY = "gemini_api_key"
         private const val KEY_GROQ_API_KEY = "groq_api_key"
+        private const val KEY_MIND_MODEL = "mind_model"
         private const val KEY_GEMINI_MODEL = "gemini_model"
         private const val KEY_GROQ_MODEL = "groq_model"
         private const val KEY_GROQ_FAST_MODEL = "groq_fast_model"
         private const val KEY_WHISPER_MODEL = "groq_whisper_model"
+        private const val KEY_TTS_MODEL = "gemini_tts_model"
+        private const val KEY_TTS_PREMIUM_MODEL = "gemini_tts_premium_model"
+        private const val KEY_INCEPTION_BASE_URL = "inception_base_url"
+        private const val KEY_GROQ_BASE_URL = "groq_base_url"
+        private const val KEY_GEMINI_BASE_URL = "gemini_base_url"
         private const val KEY_BRAIN = "preferred_brain"
         private const val KEY_AUTO_FALLBACK = "auto_fallback"
         private const val KEY_WAKE_WORD_ENABLED = "wake_word_enabled"
         private const val KEY_WAKE_SENSITIVITY = "wake_word_sensitivity"
+        private const val KEY_WAKE_BATTERY_SAVER = "wake_battery_saver"
         private const val KEY_CONFIRM_SENSITIVE = "confirm_sensitive"
         private const val KEY_LANGUAGE = "preferred_language"
         private const val KEY_FLOATING_BUBBLE = "floating_bubble"
         private const val KEY_TTS_REPLIES = "tts_replies"
+        private const val KEY_TTS_TIER_MODE = "tts_tier_mode"
+        private const val KEY_TTS_VOICE_NAME = "tts_voice_name"
+        private const val KEY_TTS_SPEED = "tts_speed"
+        private const val KEY_TTS_VOLUME = "tts_volume"
         private const val KEY_ONBOARDING_DONE = "onboarding_done"
 
         const val KEY_ROUTINES_ENABLED = "routines_enabled"
@@ -535,5 +716,21 @@ class SecureKeyStore @Inject constructor(
         const val KEY_PERSONALITY = "baby_personality"
         const val KEY_DATA_SAVER = "data_saver"
         const val KEY_LAST_TASK_SUMMARY = "last_task_summary"
+
+        // Emotion Layer keys
+        const val KEY_EMOTION_INTENSITY = "emotion_intensity"
+        const val KEY_ORB_FACE_MODE = "orb_face_mode"
+        const val KEY_EMOTIONAL_VOICE = "emotional_voice"
+        const val KEY_HAPTICS_ENABLED = "haptics_enabled"
+        const val KEY_UNDERSTAND_MY_MOOD = "understand_my_mood"
+
+        // Call Assistant keys
+        const val KEY_CALL_ASSISTANT_ENABLED = "call_assistant_enabled"
+        const val KEY_CALL_ASSISTANT_MODE = "call_assistant_mode"
+        const val KEY_UNKNOWN_CALLER_POLICY = "unknown_caller_policy"
+        const val KEY_CALL_ASSISTANT_LEVEL2 = "call_assistant_level2"
+        const val KEY_CALL_ASSISTANT_SAVE_AUDIO = "call_assistant_save_audio"
+        const val KEY_CALL_ASSISTANT_TEMPLATE = "call_assistant_template"
+        const val KEY_CALL_COUNTRY_WARNING_ACK = "call_country_warning_ack"
     }
 }

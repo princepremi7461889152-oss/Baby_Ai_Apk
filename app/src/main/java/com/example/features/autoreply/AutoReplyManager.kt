@@ -22,6 +22,8 @@ import com.example.data.remote.GeminiPart
 import com.example.data.remote.GroqApiService
 import com.example.data.remote.GroqChatRequest
 import com.example.data.remote.GroqMessage
+import com.example.data.remote.MercuryApiService
+import com.example.data.remote.MercuryChatRequest
 import com.example.domain.ai.AiResilienceHelper
 import com.example.domain.ai.AiResponseParser
 import com.example.features.actionlog.ActionLogRepository
@@ -40,8 +42,19 @@ class AutoReplyManager @Inject constructor(
     private val groqApi: GroqApiService,
     private val geminiApi: GeminiApiService,
     private val actionLog: ActionLogRepository,
-    private val permissionHelper: PermissionHelper
+    private val permissionHelper: PermissionHelper,
+    private val mercuryApi: MercuryApiService? = null
 ) {
+    constructor(
+        context: Context,
+        keyStore: SecureKeyStore,
+        ruleDao: AutoReplyRuleDao,
+        groqApi: GroqApiService,
+        geminiApi: GeminiApiService,
+        actionLog: ActionLogRepository,
+        permissionHelper: PermissionHelper
+    ) : this(context, keyStore, ruleDao, groqApi, geminiApi, actionLog, permissionHelper, null)
+
     val rules: Flow<List<AutoReplyContactRuleEntity>> = ruleDao.observeAll()
 
     suspend fun upsertContactRule(displayName: String, ruleType: String) {
@@ -210,7 +223,58 @@ class AutoReplyManager @Inject constructor(
             return template
         }
         val safeIncoming = SensitiveDataSanitizer.sanitizeForRemoteAi(incomingText.take(280))
+        val systemText = "You are Baby, an AI assistant. Generate only the short 1-sentence Hinglish auto-reply text matching the user's tone. Never reveal any model names."
         val prompt = "Mode: ${settings.autoReplyMode.label}. Base message: \"$template\". Sender: $sender wrote: \"$safeIncoming\". Write a short, polite 1-sentence Hinglish auto-reply."
+
+        if (mercuryApi != null && settings.inceptionApiKey.isNotBlank()) {
+            val mercText = AiResilienceHelper.executeMercuryChatWithRecovery(
+                mercuryApi = mercuryApi,
+                keyStore = keyStore,
+                key = settings.inceptionApiKey.trim(),
+                baseUrl = settings.modelConfig.inceptionBaseUrl,
+                initialModel = settings.modelConfig.mindModel,
+                requestBuilder = { modelId, stream ->
+                    MercuryChatRequest(
+                        model = modelId,
+                        messages = listOf(
+                            GroqMessage(role = "system", content = systemText),
+                            GroqMessage(role = "user", content = prompt)
+                        ),
+                        tools = null,
+                        toolChoice = null,
+                        reasoningEffort = "low",
+                        maxCompletionTokens = 160,
+                        stream = stream
+                    )
+                },
+                streamResponses = false
+            ).getOrNull()?.value?.choices?.firstOrNull()?.message?.content
+                ?.let { AiResponseParser.stripReasoning(it) }
+            if (!mercText.isNullOrBlank()) return mercText
+            if (!settings.autoFallbackEnabled) return template
+        }
+
+        if (settings.geminiApiKey.isNotBlank()) {
+            val gemText = AiResilienceHelper.executeGeminiWithRecovery(
+                geminiApi = geminiApi,
+                keyStore = keyStore,
+                key = settings.geminiApiKey.trim(),
+                initialModel = settings.modelConfig.geminiModel,
+                request = GeminiGenerateRequest(
+                    systemInstruction = GeminiContent(
+                        parts = listOf(GeminiPart(text = systemText))
+                    ),
+                    contents = listOf(GeminiContent(role = "user", parts = listOf(GeminiPart(text = prompt)))),
+                    generationConfig = com.example.data.remote.GeminiGenerationConfig(
+                        maxOutputTokens = 256,
+                        thinkingConfig = com.example.data.remote.GeminiThinkingConfig("low")
+                    )
+                )
+            ).getOrNull()?.value?.candidates?.firstOrNull()?.content?.parts
+                ?.let { AiResilienceHelper.extractGeminiVisibleText(it) }
+            if (!gemText.isNullOrBlank()) return gemText
+            if (!settings.autoFallbackEnabled) return template
+        }
 
         if (settings.groqApiKey.isNotBlank()) {
             val groqText = AiResilienceHelper.executeGroqChatWithRecovery(
@@ -223,7 +287,7 @@ class AutoReplyManager @Inject constructor(
                     GroqChatRequest(
                         model = modelId,
                         messages = listOf(
-                            GroqMessage(role = "system", content = "You are Baby. Generate only the short 1-sentence Hinglish auto-reply text."),
+                            GroqMessage(role = "system", content = systemText),
                             GroqMessage(role = "user", content = prompt)
                         ),
                         tools = null,
@@ -235,21 +299,6 @@ class AutoReplyManager @Inject constructor(
             if (!groqText.isNullOrBlank()) return groqText
         }
 
-        if (settings.autoFallbackEnabled && settings.geminiApiKey.isNotBlank()) {
-            val gemText = AiResilienceHelper.executeGeminiWithRetry(
-                geminiApi = geminiApi,
-                key = settings.geminiApiKey.trim(),
-                model = settings.modelConfig.geminiModel,
-                request = GeminiGenerateRequest(
-                    systemInstruction = GeminiContent(
-                        parts = listOf(GeminiPart(text = "You are Baby. Generate only the short 1-sentence Hinglish auto-reply text."))
-                    ),
-                    contents = listOf(GeminiContent(role = "user", parts = listOf(GeminiPart(text = prompt))))
-                )
-            ).getOrNull()?.candidates?.firstOrNull()?.content?.parts
-                ?.let { AiResilienceHelper.extractGeminiVisibleText(it) }
-            if (!gemText.isNullOrBlank()) return gemText
-        }
         return template
     }
 

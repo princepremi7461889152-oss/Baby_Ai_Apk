@@ -11,28 +11,44 @@ import com.example.data.remote.GeminiContent
 import com.example.data.remote.GeminiFunctionCall
 import com.example.data.remote.GeminiFunctionResponse
 import com.example.data.remote.GeminiGenerateRequest
+import com.example.data.remote.GeminiGenerationConfig
 import com.example.data.remote.GeminiInlineData
 import com.example.data.remote.GeminiPart
+import com.example.data.remote.GeminiThinkingConfig
+import com.example.data.remote.GeminiTool
 import com.example.data.remote.GroqApiService
 import com.example.data.remote.GroqChatRequest
+import com.example.data.remote.GroqChatResponse
 import com.example.data.remote.GroqFunctionCallPayload
 import com.example.data.remote.GroqMessage
+import com.example.data.remote.GroqTool
 import com.example.data.remote.GroqToolCall
+import com.example.data.remote.MercuryApiService
+import com.example.data.remote.MercuryChatRequest
 import com.example.domain.tools.ToolDefinitions
 import com.squareup.moshi.Moshi
 import com.squareup.moshi.Types
 import kotlinx.coroutines.delay
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MultipartBody
+import okhttp3.OkHttpClient
 import okhttp3.RequestBody.Companion.toRequestBody
+import retrofit2.Retrofit
+import retrofit2.converter.moshi.MoshiConverterFactory
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlin.random.Random
 
 enum class BrainType(val label: String) {
+    MERCURY("Mercury 3"),
     GROQ("Groq"),
     GEMINI("Gemini")
 }
+
+data class WebSourceLink(
+    val title: String,
+    val uri: String
+)
 
 data class AgentStepTurn(
     val role: String, // "user", "assistant", "tool"
@@ -54,6 +70,7 @@ data class AiPlanResult(
     val brainUsed: BrainType,
     val replyText: String?,
     val toolCalls: List<PlannedToolCall>,
+    val sources: List<WebSourceLink> = emptyList(),
     val fallbackNote: String? = null,
     val modelSwitchedNotice: String? = null
 )
@@ -68,9 +85,29 @@ data class WhisperTranscriptResult(
 class AiRouter @Inject constructor(
     private val geminiApi: GeminiApiService,
     private val groqApi: GroqApiService,
+    private val mercuryApi: MercuryApiService,
     private val keyStore: SecureKeyStore,
     private val moshi: Moshi
 ) {
+    // Secondary convenience constructor for legacy 4-arg test callers
+    constructor(
+        geminiApi: GeminiApiService,
+        groqApi: GroqApiService,
+        keyStore: SecureKeyStore,
+        moshi: Moshi
+    ) : this(
+        geminiApi = geminiApi,
+        groqApi = groqApi,
+        mercuryApi = Retrofit.Builder()
+            .baseUrl("https://api.inceptionlabs.ai/")
+            .client(OkHttpClient())
+            .addConverterFactory(MoshiConverterFactory.create(moshi))
+            .build()
+            .create(MercuryApiService::class.java),
+        keyStore = keyStore,
+        moshi = moshi
+    )
+
     private val mapType = Types.newParameterizedType(
         Map::class.java,
         String::class.java,
@@ -82,7 +119,11 @@ class AiRouter @Inject constructor(
     internal var sleeper: suspend (Long) -> Unit = { delay(it) }
     internal var jitterRatioProvider: () -> Double = { Random.nextDouble(0.0, 0.25) }
 
-    suspend fun transcribeAudio(wavBytes: ByteArray): Result<WhisperTranscriptResult> {
+    suspend fun transcribeAudio(
+        wavBytes: ByteArray,
+        languageHint: String = "hi",
+        hinglishPrompt: String = "Hey Baby, flashlight on karo, WhatsApp bhejo, alarm lagao, YouTube par gaana bajao, Hindi Hinglish English"
+    ): Result<WhisperTranscriptResult> {
         val settings = keyStore.settings.value
         val groqKey = settings.groqApiKey.trim()
         if (groqKey.isBlank()) {
@@ -99,7 +140,7 @@ class AiRouter @Inject constructor(
         }
 
         val initialModel = settings.modelConfig.sttModel
-        val firstRes = callWhisperOnce(groqKey, wavBytes, initialModel)
+        val firstRes = callWhisperOnce(groqKey, wavBytes, initialModel, languageHint, hinglishPrompt)
         if (firstRes.isSuccess) {
             val body = firstRes.getOrThrow()
             return Result.success(WhisperTranscriptResult(body.text.trim(), body.language))
@@ -114,6 +155,7 @@ class AiRouter @Inject constructor(
             val clean = SensitiveDataSanitizer.sanitizeError(fetchErr.message, groqKey)
             return Result.failure(
                 AiResilienceHelper.modelRecoveryExhaustedException(
+                    provider = "Groq Whisper",
                     failedModel = initialModel,
                     reason = clean,
                     origDetails = firstEx.failure.technicalDetails
@@ -124,6 +166,7 @@ class AiRouter @Inject constructor(
         val replacement = AiModelConfig.pickBestReplacement(liveIds, initialModel, GroqModelRole.STT)
             ?: return Result.failure(
                 AiResilienceHelper.modelRecoveryExhaustedException(
+                    provider = "Groq Whisper",
                     failedModel = initialModel,
                     reason = "Live list mein koi compatible Whisper model nahi mila",
                     origDetails = firstEx.failure.technicalDetails
@@ -132,7 +175,7 @@ class AiRouter @Inject constructor(
 
         AiResilienceHelper.saveReplacementModel(keyStore, GroqModelRole.STT, replacement)
 
-        val retryRes = callWhisperOnce(groqKey, wavBytes, replacement)
+        val retryRes = callWhisperOnce(groqKey, wavBytes, replacement, languageHint, hinglishPrompt)
         return retryRes.fold(
             onSuccess = { body ->
                 Result.success(
@@ -147,6 +190,7 @@ class AiRouter @Inject constructor(
                 val clean = SensitiveDataSanitizer.sanitizeError(retryErr.message, groqKey)
                 Result.failure(
                     AiResilienceHelper.modelRecoveryExhaustedException(
+                        provider = "Groq Whisper",
                         failedModel = "$initialModel -> $replacement",
                         reason = clean,
                         origDetails = (retryErr as? AiCallException)?.failure?.technicalDetails
@@ -159,7 +203,9 @@ class AiRouter @Inject constructor(
     private suspend fun callWhisperOnce(
         groqKey: String,
         wavBytes: ByteArray,
-        modelId: String
+        modelId: String,
+        languageHint: String,
+        hinglishPrompt: String
     ) = AiResilienceHelper.executeWithRetry(
         provider = "Groq Whisper",
         model = modelId,
@@ -174,11 +220,99 @@ class AiRouter @Inject constructor(
         )
         val modelBody = modelId.toRequestBody("text/plain".toMediaType())
         val formatBody = "verbose_json".toRequestBody("text/plain".toMediaType())
+        val langBody = languageHint.takeIf { it.isNotBlank() }?.toRequestBody("text/plain".toMediaType())
+        val promptBody = hinglishPrompt.takeIf { it.isNotBlank() }?.toRequestBody("text/plain".toMediaType())
         groqApi.transcribeAudio(
             bearerAuth = "Bearer $groqKey",
             file = filePart,
             model = modelBody,
-            responseFormat = formatBody
+            responseFormat = formatBody,
+            language = langBody,
+            prompt = promptBody
+        )
+    }
+
+    suspend fun searchWebWithGrounding(
+        query: String,
+        userLanguageHint: String? = "hinglish"
+    ): Result<AiPlanResult> {
+        val settings = keyStore.settings.value
+        val key = settings.geminiApiKey.trim()
+        val modelId = settings.modelConfig.geminiModel
+        val cleanQuery = SensitiveDataSanitizer.sanitizeForRemoteAi(query.trim())
+
+        if (key.isNotBlank()) {
+            val langGuide = when {
+                userLanguageHint.equals("english", ignoreCase = true) || userLanguageHint == "en" ->
+                    "Reply in short, friendly natural English (2-3 crisp sentences)."
+                userLanguageHint.equals("hindi", ignoreCase = true) || userLanguageHint == "hi" ->
+                    "Reply in short, friendly natural Hindi (2-3 crisp sentences)."
+                else -> settings.preferredLanguage.instruction
+            }
+            val sysPrompt = """
+                Your name is Baby. Answer the user's web search / live knowledge question concisely in 2-3 short sentences based on search results.
+                - $langGuide
+                - NEVER convert Hinglish or English words into Devanagari.
+                - NEVER say Gemini, Google, Mercury, Groq, or Llama; if asked, say you are Baby.
+            """.trimIndent()
+
+            val res = AiResilienceHelper.executeGeminiWithRecovery(
+                geminiApi = geminiApi,
+                keyStore = keyStore,
+                key = key,
+                initialModel = modelId,
+                request = GeminiGenerateRequest(
+                    systemInstruction = GeminiContent(parts = listOf(GeminiPart(text = sysPrompt))),
+                    contents = listOf(GeminiContent(role = "user", parts = listOf(GeminiPart(text = cleanQuery)))),
+                    tools = listOf(GeminiTool(googleSearch = emptyMap())),
+                    generationConfig = GeminiGenerationConfig(
+                        maxOutputTokens = 1024,
+                        thinkingConfig = GeminiThinkingConfig(thinkingLevel = "low")
+                    )
+                ),
+                sleeper = sleeper,
+                jitterRatioProvider = jitterRatioProvider
+            )
+            if (res.isSuccess) {
+                val attempt = res.getOrThrow()
+                val cand = attempt.value.candidates?.firstOrNull()
+                val visible = cand?.content?.parts?.let { AiResilienceHelper.extractGeminiVisibleText(it) }
+                val sources = cand?.groundingMetadata?.groundingChunks.orEmpty()
+                    .mapNotNull { chunk ->
+                        val web = chunk.web ?: return@mapNotNull null
+                        val uri = web.uri?.trim()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+                        WebSourceLink(
+                            title = web.title?.trim()?.ifBlank { uri } ?: uri,
+                            uri = uri
+                        )
+                    }
+                    .distinctBy { it.uri }
+                if (!visible.isNullOrBlank()) {
+                    return Result.success(
+                        AiPlanResult(
+                            brainUsed = BrainType.GEMINI,
+                            replyText = visible,
+                            toolCalls = emptyList(),
+                            sources = sources,
+                            modelSwitchedNotice = attempt.modelSwitchedNotice
+                        )
+                    )
+                }
+            } else if (!settings.autoFallbackEnabled || (!hasKeyFor(BrainType.MERCURY, settings) && !hasKeyFor(BrainType.GROQ, settings))) {
+                return Result.failure(res.exceptionOrNull() ?: IllegalStateException("Gemini search fail"))
+            }
+        }
+
+        // Fallback to Mercury / Groq if Gemini key missing or failed
+        val fallbackTurn = listOf(AgentStepTurn(role = "user", text = cleanQuery))
+        return planNextStep(
+            turns = fallbackTurn,
+            screenContext = null,
+            screenshotBase64 = null,
+            stepIndex = 0,
+            isLocked = false,
+            userLanguageHint = userLanguageHint,
+            includeTools = false
         )
     }
 
@@ -189,7 +323,9 @@ class AiRouter @Inject constructor(
         stepIndex: Int,
         isLocked: Boolean,
         userLanguageHint: String?,
-        memoryBlock: String? = null
+        memoryBlock: String? = null,
+        includeTools: Boolean = true,
+        onStreamingToken: ((String) -> Unit)? = null
     ): Result<AiPlanResult> {
         val settings = keyStore.settings.value
         if (!settings.hasAnyApiKey) {
@@ -198,22 +334,22 @@ class AiRouter @Inject constructor(
                     AiFailure(
                         provider = "AI",
                         model = "",
-                        userMessage = "Koi AI API key save nahi hai. Settings > API Keys mein Groq ya Gemini key daalo.",
-                        technicalDetails = "No Groq or Gemini API key saved in SecureKeyStore"
+                        userMessage = "Koi AI API key save nahi hai. Settings > API Keys mein Inception, Gemini ya Groq key daalo.",
+                        technicalDetails = "No Inception, Gemini, or Groq API key saved in SecureKeyStore"
                     )
                 )
             )
         }
 
         val effectiveScreenshot = if (settings.dataSaverEnabled) null else screenshotBase64
+        val userPrompt = turns.lastOrNull { it.role == "user" }?.text.orEmpty()
 
-        val primary = choosePrimaryBrain(
+        val orderedBrains = resolveBrainOrder(
             settings = settings,
             hasScreenshot = effectiveScreenshot != null,
             stepIndex = stepIndex,
-            userPrompt = turns.firstOrNull { it.role == "user" }?.text.orEmpty()
+            userPrompt = userPrompt
         )
-        val secondary = if (primary == BrainType.GROQ) BrainType.GEMINI else BrainType.GROQ
 
         val safeScreenContext = screenContext?.let { SensitiveDataSanitizer.sanitizeForRemoteAi(it) }
         val safeMemoryBlock = memoryBlock?.let { SensitiveDataSanitizer.sanitizeForRemoteAi(it) }
@@ -228,76 +364,146 @@ class AiRouter @Inject constructor(
             memoryBlock = safeMemoryBlock
         )
 
-        val firstAttempt = invokeBrain(primary, settings, systemPrompt, safeTurns, effectiveScreenshot)
+        val selectedGroqTools = if (includeTools) {
+            ToolDefinitions.selectRelevantTools(userPrompt, settings.dataSaverEnabled)
+        } else emptyList()
+        val selectedGeminiTools = if (includeTools) {
+            ToolDefinitions.selectRelevantGeminiTools(userPrompt, settings.dataSaverEnabled)
+        } else emptyList()
+
+        val primary = orderedBrains.first()
+        val firstAttempt = invokeBrain(
+            brain = primary,
+            settings = settings,
+            systemPrompt = systemPrompt,
+            turns = safeTurns,
+            screenshotBase64 = effectiveScreenshot,
+            stepIndex = stepIndex,
+            groqTools = selectedGroqTools.takeIf { it.isNotEmpty() },
+            geminiTools = selectedGeminiTools.takeIf { it.isNotEmpty() },
+            onStreamingToken = onStreamingToken
+        )
         if (firstAttempt.isSuccess) return firstAttempt
 
-        val firstException = firstAttempt.exceptionOrNull()
-        val firstFailure = (firstException as? AiCallException)?.failure
-        val firstFriendly = SensitiveDataSanitizer.sanitizeError(
-            firstFailure?.userMessage ?: firstException?.message ?: "Primary AI fail ho gaya",
-            settings.groqApiKey,
-            settings.geminiApiKey
-        )
+        val failures = mutableListOf<Pair<BrainType, AiFailure?>>()
+        val firstEx = firstAttempt.exceptionOrNull()
+        val firstFailure = (firstEx as? AiCallException)?.failure
+        failures += primary to firstFailure
 
-        if (settings.autoFallbackEnabled && hasKeyFor(secondary, settings)) {
-            val fallbackAttempt = invokeBrain(secondary, settings, systemPrompt, safeTurns, effectiveScreenshot)
-            if (fallbackAttempt.isSuccess) {
-                val plan = fallbackAttempt.getOrThrow()
-                return Result.success(
-                    plan.copy(
-                        fallbackNote = "Auto-switched from ${primary.label} (${firstFailure?.httpCode ?: "error"}) to ${secondary.label}"
-                    )
+        if (settings.autoFallbackEnabled) {
+            for (nextBrain in orderedBrains.drop(1)) {
+                val attempt = invokeBrain(
+                    brain = nextBrain,
+                    settings = settings,
+                    systemPrompt = systemPrompt,
+                    turns = safeTurns,
+                    screenshotBase64 = effectiveScreenshot,
+                    stepIndex = stepIndex,
+                    groqTools = selectedGroqTools.takeIf { it.isNotEmpty() },
+                    geminiTools = selectedGeminiTools.takeIf { it.isNotEmpty() },
+                    onStreamingToken = onStreamingToken
                 )
-            }
-            val secondException = fallbackAttempt.exceptionOrNull()
-            val secondFailure = (secondException as? AiCallException)?.failure
-            val secondFriendly = SensitiveDataSanitizer.sanitizeError(
-                secondFailure?.userMessage ?: secondException?.message ?: "Fallback AI fail ho gaya",
-                settings.groqApiKey,
-                settings.geminiApiKey
-            )
-            val combinedUserMsg = buildString {
-                if (firstFailure?.isOffline == true && secondFailure?.isOffline == true) {
-                    append("Internet connection nahi mil raha. Offline commands (flashlight, volume, alarm, open app) bina internet chalenge.")
-                } else {
-                    append("${primary.label}: $firstFriendly")
-                    append("\n${secondary.label}: $secondFriendly")
+                if (attempt.isSuccess) {
+                    val plan = attempt.getOrThrow()
+                    val codeLabel = firstFailure?.httpCode?.toString() ?: "error"
+                    return Result.success(
+                        plan.copy(
+                            fallbackNote = "Auto-switched from ${primary.label} ($codeLabel) to ${nextBrain.label}"
+                        )
+                    )
                 }
+                val ex = attempt.exceptionOrNull()
+                failures += nextBrain to (ex as? AiCallException)?.failure
             }
-            val combinedDetails = listOfNotNull(
-                firstFailure?.technicalDetails ?: firstFriendly,
-                secondFailure?.technicalDetails ?: secondFriendly
-            ).joinToString(" || ")
+        }
 
-            return Result.failure(
-                AiCallException(
-                    AiFailure(
-                        provider = "Groq + Gemini",
-                        model = "${settings.modelConfig.chatModel} / ${settings.modelConfig.geminiModel}",
-                        httpCode = secondFailure?.httpCode ?: firstFailure?.httpCode,
-                        isRetryable = false,
-                        isOffline = firstFailure?.isOffline == true && secondFailure?.isOffline == true,
-                        userMessage = combinedUserMsg,
-                        technicalDetails = combinedDetails
-                    )
+        if (failures.size == 1 && firstEx is AiCallException) {
+            return Result.failure(firstEx)
+        }
+
+        val allOffline = failures.all { it.second?.isOffline == true }
+        val combinedUserMsg = if (allOffline) {
+            "Internet connection nahi mil raha. Offline commands (flashlight, volume, alarm, open app) bina internet chalenge."
+        } else {
+            failures.joinToString("\n") { (b, f) ->
+                val friendly = SensitiveDataSanitizer.sanitizeError(
+                    f?.userMessage ?: "${b.label} fail ho gaya",
+                    settings.inceptionApiKey,
+                    settings.geminiApiKey,
+                    settings.groqApiKey
                 )
-            )
+                "${b.label}: $friendly"
+            }
         }
+        val combinedDetails = failures.mapNotNull { (_, f) -> f?.technicalDetails }.joinToString(" || ")
+        val lastFailure = failures.lastOrNull()?.second
 
-        if (firstException is AiCallException) {
-            return Result.failure(firstException)
-        }
         return Result.failure(
             AiCallException(
                 AiFailure(
-                    provider = primary.label,
-                    model = if (primary == BrainType.GROQ) settings.modelConfig.chatModel else settings.modelConfig.geminiModel,
-                    userMessage = firstFriendly,
-                    technicalDetails = firstFriendly
+                    provider = failures.joinToString(" + ") { it.first.label },
+                    model = "${settings.modelConfig.mindModel} / ${settings.modelConfig.geminiModel} / ${settings.modelConfig.chatModel}",
+                    httpCode = lastFailure?.httpCode ?: firstFailure?.httpCode,
+                    isRetryable = false,
+                    isOffline = allOffline,
+                    userMessage = combinedUserMsg,
+                    technicalDetails = combinedDetails.ifBlank { combinedUserMsg }
                 ),
-                cause = firstException
+                cause = firstEx
             )
         )
+    }
+
+    private fun resolveBrainOrder(
+        settings: BabySettings,
+        hasScreenshot: Boolean,
+        stepIndex: Int,
+        userPrompt: String
+    ): List<BrainType> {
+        val available = buildList {
+            if (hasKeyFor(BrainType.MERCURY, settings)) add(BrainType.MERCURY)
+            if (hasKeyFor(BrainType.GEMINI, settings)) add(BrainType.GEMINI)
+            if (hasKeyFor(BrainType.GROQ, settings)) add(BrainType.GROQ)
+        }
+        if (available.isEmpty()) return listOf(BrainType.MERCURY)
+
+        if (hasScreenshot && BrainType.GEMINI in available) {
+            return listOf(BrainType.GEMINI) + available.filter { it != BrainType.GEMINI }
+        }
+
+        val lower = userPrompt.lowercase()
+        val isSearchOrKnowledge = lower.contains("news") ||
+            lower.contains("weather") ||
+            lower.contains("mausam") ||
+            lower.contains("score") ||
+            lower.contains("price") ||
+            lower.contains("kitne baje") ||
+            lower.contains("live") ||
+            lower.contains("latest") ||
+            lower.contains("aaj ka") ||
+            lower.contains("google") ||
+            lower.contains("who is") ||
+            lower.contains("kaun hai")
+
+        val preferred = when (settings.preferredBrain) {
+            PreferredBrain.MERCURY_FIRST -> BrainType.MERCURY
+            PreferredBrain.GROQ_FIRST -> BrainType.GROQ
+            PreferredBrain.GEMINI_FIRST -> BrainType.GEMINI
+            PreferredBrain.AUTO -> when {
+                isSearchOrKnowledge && BrainType.GEMINI in available -> BrainType.GEMINI
+                BrainType.MERCURY in available -> BrainType.MERCURY
+                BrainType.GEMINI in available -> BrainType.GEMINI
+                else -> BrainType.GROQ
+            }
+        }
+
+        // Standard fallback order: Mercury -> Gemini -> Groq
+        val defaultChain = listOf(BrainType.MERCURY, BrainType.GEMINI, BrainType.GROQ).filter { it in available }
+        return if (preferred in available) {
+            listOf(preferred) + defaultChain.filter { it != preferred }
+        } else {
+            defaultChain
+        }
     }
 
     private fun sanitizeTurnsForRemoteAi(turns: List<AgentStepTurn>): List<AgentStepTurn> {
@@ -312,34 +518,8 @@ class AiRouter @Inject constructor(
         }
     }
 
-    private fun choosePrimaryBrain(
-        settings: BabySettings,
-        hasScreenshot: Boolean,
-        stepIndex: Int,
-        userPrompt: String
-    ): BrainType {
-        val hasGroq = settings.groqApiKey.isNotBlank()
-        val hasGemini = settings.geminiApiKey.isNotBlank()
-
-        if (!hasGroq && hasGemini) return BrainType.GEMINI
-        if (hasGroq && !hasGemini) return BrainType.GROQ
-
-        if (hasScreenshot) return BrainType.GEMINI
-
-        return when (settings.preferredBrain) {
-            PreferredBrain.GROQ_FIRST -> BrainType.GROQ
-            PreferredBrain.GEMINI_FIRST -> BrainType.GEMINI
-            PreferredBrain.AUTO -> {
-                val isComplex = stepIndex >= 2 ||
-                    userPrompt.length > 140 ||
-                    listOf("analyze", "summarize", "explain", "screenshot", "screen", "multi", "order", "book")
-                        .any { userPrompt.lowercase().contains(it) }
-                if (isComplex) BrainType.GEMINI else BrainType.GROQ
-            }
-        }
-    }
-
     private fun hasKeyFor(brain: BrainType, settings: BabySettings): Boolean = when (brain) {
+        BrainType.MERCURY -> settings.inceptionApiKey.isNotBlank()
         BrainType.GROQ -> settings.groqApiKey.isNotBlank()
         BrainType.GEMINI -> settings.geminiApiKey.isNotBlank()
     }
@@ -349,37 +529,22 @@ class AiRouter @Inject constructor(
         settings: BabySettings,
         systemPrompt: String,
         turns: List<AgentStepTurn>,
-        screenshotBase64: String?
+        screenshotBase64: String?,
+        stepIndex: Int,
+        groqTools: List<GroqTool>?,
+        geminiTools: List<GeminiTool>?,
+        onStreamingToken: ((String) -> Unit)?
     ): Result<AiPlanResult> {
         return when (brain) {
-            BrainType.GROQ -> callGroq(settings, systemPrompt, turns)
-            BrainType.GEMINI -> callGemini(settings, systemPrompt, turns, screenshotBase64)
+            BrainType.MERCURY -> callMercury(settings, systemPrompt, turns, stepIndex, groqTools, onStreamingToken)
+            BrainType.GROQ -> callGroq(settings, systemPrompt, turns, groqTools)
+            BrainType.GEMINI -> callGemini(settings, systemPrompt, turns, screenshotBase64, stepIndex, geminiTools)
         }
     }
 
-    private suspend fun callGroq(
-        settings: BabySettings,
-        systemPrompt: String,
-        turns: List<AgentStepTurn>
-    ): Result<AiPlanResult> {
-        val key = settings.groqApiKey.trim()
-        val initialModel = settings.modelConfig.chatModel
-        if (key.isBlank()) {
-            return Result.failure(
-                AiCallException(
-                    AiFailure(
-                        provider = "Groq",
-                        model = initialModel,
-                        userMessage = "Groq API key missing hai. Settings > API Keys check karo.",
-                        technicalDetails = "Groq API key missing"
-                    )
-                )
-            )
-        }
-
+    private fun buildOpenAiMessages(systemPrompt: String, turns: List<AgentStepTurn>): MutableList<GroqMessage> {
         val messages = mutableListOf<GroqMessage>()
         messages.add(GroqMessage(role = "system", content = systemPrompt))
-
         for (turn in turns) {
             when (turn.role) {
                 "user" -> messages.add(GroqMessage(role = "user", content = turn.text ?: ""))
@@ -420,8 +585,117 @@ class AiRouter @Inject constructor(
                 }
             }
         }
+        return messages
+    }
 
-        val tools = ToolDefinitions.toGroqTools()
+    private suspend fun callMercury(
+        settings: BabySettings,
+        systemPrompt: String,
+        turns: List<AgentStepTurn>,
+        stepIndex: Int,
+        tools: List<GroqTool>?,
+        onStreamingToken: ((String) -> Unit)?
+    ): Result<AiPlanResult> {
+        val key = settings.inceptionApiKey.trim()
+        val initialModel = settings.modelConfig.mindModel
+        val baseUrl = settings.modelConfig.inceptionBaseUrl
+        if (key.isBlank()) {
+            return Result.failure(
+                AiCallException(
+                    AiFailure(
+                        provider = "Mercury",
+                        model = initialModel,
+                        userMessage = "Inception API key missing hai. Settings > API Keys check karo.",
+                        technicalDetails = "Inception API key missing"
+                    )
+                )
+            )
+        }
+
+        val messages = buildOpenAiMessages(systemPrompt, turns)
+        val effort = if (stepIndex >= 2) "medium" else "low"
+
+        val res = AiResilienceHelper.executeMercuryChatWithRecovery(
+            mercuryApi = mercuryApi,
+            keyStore = keyStore,
+            key = key,
+            baseUrl = baseUrl,
+            initialModel = initialModel,
+            streamResponses = onStreamingToken != null,
+            onStreamingToken = onStreamingToken,
+            requestBuilder = { modelId, streamFlag ->
+                MercuryChatRequest(
+                    model = modelId,
+                    messages = messages,
+                    tools = tools,
+                    toolChoice = if (tools != null) "auto" else null,
+                    reasoningEffort = effort,
+                    stream = streamFlag
+                )
+            },
+            sleeper = sleeper,
+            jitterRatioProvider = jitterRatioProvider
+        )
+
+        if (res.isFailure) {
+            return Result.failure(res.exceptionOrNull() ?: IllegalStateException("Mercury request fail"))
+        }
+
+        val attempt = res.getOrThrow()
+        return parseOpenAiChoiceAndMaybeRepair(
+            brain = BrainType.MERCURY,
+            providerName = "Mercury",
+            modelUsed = attempt.modelUsed,
+            body = attempt.value,
+            modelSwitchedNotice = attempt.modelSwitchedNotice,
+            repairCall = { repairMessages ->
+                AiResilienceHelper.executeMercuryChatWithRecovery(
+                    mercuryApi = mercuryApi,
+                    keyStore = keyStore,
+                    key = key,
+                    baseUrl = baseUrl,
+                    initialModel = attempt.modelUsed,
+                    streamResponses = false,
+                    requestBuilder = { modelId, _ ->
+                        MercuryChatRequest(
+                            model = modelId,
+                            messages = repairMessages,
+                            tools = tools,
+                            toolChoice = if (tools != null) "auto" else null,
+                            reasoningEffort = "low",
+                            stream = false
+                        )
+                    },
+                    sleeper = sleeper,
+                    jitterRatioProvider = jitterRatioProvider
+                ).getOrNull()?.value
+            },
+            baseMessages = messages
+        )
+    }
+
+    private suspend fun callGroq(
+        settings: BabySettings,
+        systemPrompt: String,
+        turns: List<AgentStepTurn>,
+        tools: List<GroqTool>?
+    ): Result<AiPlanResult> {
+        val key = settings.groqApiKey.trim()
+        val initialModel = settings.modelConfig.chatModel
+        if (key.isBlank()) {
+            return Result.failure(
+                AiCallException(
+                    AiFailure(
+                        provider = "Groq",
+                        model = initialModel,
+                        userMessage = "Groq API key missing hai. Settings > API Keys check karo.",
+                        technicalDetails = "Groq API key missing"
+                    )
+                )
+            )
+        }
+
+        val messages = buildOpenAiMessages(systemPrompt, turns)
         val res = AiResilienceHelper.executeGroqChatWithRecovery(
             groqApi = groqApi,
             keyStore = keyStore,
@@ -433,7 +707,7 @@ class AiRouter @Inject constructor(
                     model = modelId,
                     messages = messages,
                     tools = tools,
-                    toolChoice = "auto"
+                    toolChoice = if (tools != null) "auto" else null
                 )
             },
             sleeper = sleeper,
@@ -445,18 +719,76 @@ class AiRouter @Inject constructor(
         }
 
         val attempt = res.getOrThrow()
-        val body = attempt.value
-        val msg = body.choices?.firstOrNull()?.message
+        return parseOpenAiChoiceAndMaybeRepair(
+            brain = BrainType.GROQ,
+            providerName = "Groq",
+            modelUsed = attempt.modelUsed,
+            body = attempt.value,
+            modelSwitchedNotice = attempt.modelSwitchedNotice,
+            repairCall = { repairMessages ->
+                AiResilienceHelper.executeGroqChatWithRecovery(
+                    groqApi = groqApi,
+                    keyStore = keyStore,
+                    key = key,
+                    initialModel = attempt.modelUsed,
+                    role = GroqModelRole.CHAT,
+                    requestBuilder = { modelId ->
+                        GroqChatRequest(
+                            model = modelId,
+                            messages = repairMessages,
+                            tools = tools,
+                            toolChoice = if (tools != null) "auto" else null
+                        )
+                    },
+                    sleeper = sleeper,
+                    jitterRatioProvider = jitterRatioProvider
+                ).getOrNull()?.value
+            },
+            baseMessages = messages
+        )
+    }
+
+    private suspend fun parseOpenAiChoiceAndMaybeRepair(
+        brain: BrainType,
+        providerName: String,
+        modelUsed: String,
+        body: GroqChatResponse,
+        modelSwitchedNotice: String?,
+        repairCall: suspend (List<GroqMessage>) -> GroqChatResponse?,
+        baseMessages: List<GroqMessage>
+    ): Result<AiPlanResult> {
+        var msg = body.choices?.firstOrNull()?.message
             ?: return Result.failure(
                 AiCallException(
                     AiFailure(
-                        provider = "Groq",
-                        model = attempt.modelUsed,
-                        userMessage = "Groq ne khali jawab bheja. Dobara try karo.",
-                        technicalDetails = "Empty choices in GroqChatResponse (${attempt.modelUsed})"
+                        provider = providerName,
+                        model = modelUsed,
+                        userMessage = "$providerName ne khali jawab bheja. Dobara try karo.",
+                        technicalDetails = "Empty choices in ${providerName}ChatResponse ($modelUsed)"
                     )
                 )
             )
+
+        val malformedTool = msg.toolCalls.orEmpty().firstOrNull { tc ->
+            AiResponseParser.hasMalformedToolJson(tc.function?.arguments)
+        }
+        if (malformedTool != null) {
+            val repairPrompt = buildList {
+                addAll(baseMessages)
+                add(msg)
+                add(
+                    GroqMessage(
+                        role = "user",
+                        content = "Your previous tool call for '${malformedTool.function?.name ?: "tool"}' had malformed JSON arguments. Retry the tool call ONCE with strictly valid JSON arguments only."
+                    )
+                )
+            }
+            val repairedBody = repairCall(repairPrompt)
+            val repairedMsg = repairedBody?.choices?.firstOrNull()?.message
+            if (repairedMsg != null && (!repairedMsg.toolCalls.isNullOrEmpty() || !repairedMsg.content.isNullOrBlank())) {
+                msg = repairedMsg
+            }
+        }
 
         val structuredToolCalls = msg.toolCalls.orEmpty()
             .mapNotNull { tc ->
@@ -466,7 +798,7 @@ class AiRouter @Inject constructor(
             }
             .mapIndexed { idx, (fnName, idAndArgs) ->
                 PlannedToolCall(
-                    id = idAndArgs.first ?: "groq_call_$idx",
+                    id = idAndArgs.first ?: "${providerName.lowercase()}_call_$idx",
                     name = fnName,
                     args = parseToolArgsSafely(idAndArgs.second)
                 )
@@ -483,10 +815,10 @@ class AiRouter @Inject constructor(
             return Result.failure(
                 AiCallException(
                     AiFailure(
-                        provider = "Groq",
-                        model = attempt.modelUsed,
-                        userMessage = "Groq model (${attempt.modelUsed}) ne koi useful jawab nahi diya. Retry karo ya model badlo.",
-                        technicalDetails = "Groq returned empty content & zero tool calls (${attempt.modelUsed})"
+                        provider = providerName,
+                        model = modelUsed,
+                        userMessage = "$providerName model ($modelUsed) ne koi useful jawab nahi diya. Retry karo ya Settings > AI Models check karo.",
+                        technicalDetails = "$providerName returned empty content & zero tool calls ($modelUsed)"
                     )
                 )
             )
@@ -494,10 +826,10 @@ class AiRouter @Inject constructor(
 
         return Result.success(
             AiPlanResult(
-                brainUsed = BrainType.GROQ,
+                brainUsed = brain,
                 replyText = replyText,
                 toolCalls = toolCalls,
-                modelSwitchedNotice = attempt.modelSwitchedNotice
+                modelSwitchedNotice = modelSwitchedNotice
             )
         )
     }
@@ -506,7 +838,9 @@ class AiRouter @Inject constructor(
         settings: BabySettings,
         systemPrompt: String,
         turns: List<AgentStepTurn>,
-        latestScreenshotBase64: String?
+        latestScreenshotBase64: String?,
+        stepIndex: Int,
+        geminiTools: List<GeminiTool>?
     ): Result<AiPlanResult> {
         val key = settings.geminiApiKey.trim()
         val modelId = settings.modelConfig.geminiModel
@@ -584,14 +918,20 @@ class AiRouter @Inject constructor(
             }
         }
 
-        val res = AiResilienceHelper.executeGeminiWithRetry(
+        val thinkingLevel = if (stepIndex >= 2) "medium" else "low"
+        val res = AiResilienceHelper.executeGeminiWithRecovery(
             geminiApi = geminiApi,
+            keyStore = keyStore,
             key = key,
-            model = modelId,
+            initialModel = modelId,
             request = GeminiGenerateRequest(
                 systemInstruction = GeminiContent(parts = listOf(GeminiPart(text = systemPrompt))),
                 contents = contents,
-                tools = ToolDefinitions.toGeminiTools()
+                tools = geminiTools,
+                generationConfig = GeminiGenerationConfig(
+                    maxOutputTokens = 1536,
+                    thinkingConfig = GeminiThinkingConfig(thinkingLevel = thinkingLevel)
+                )
             ),
             sleeper = sleeper,
             jitterRatioProvider = jitterRatioProvider
@@ -601,7 +941,8 @@ class AiRouter @Inject constructor(
             return Result.failure(res.exceptionOrNull() ?: IllegalStateException("Gemini request fail"))
         }
 
-        val body = res.getOrThrow()
+        val attempt = res.getOrThrow()
+        val body = attempt.value
         body.error?.let { errBody ->
             if (!errBody.message.isNullOrBlank()) {
                 val clean = SensitiveDataSanitizer.sanitizeError(errBody.message, key)
@@ -609,11 +950,11 @@ class AiRouter @Inject constructor(
                     AiCallException(
                         AiFailure(
                             provider = "Gemini",
-                            model = modelId,
+                            model = attempt.modelUsed,
                             httpCode = errBody.code,
                             errorCode = errBody.status,
                             userMessage = "Gemini error (${errBody.code ?: "API"}): Settings > AI Models ya API Key check karo.",
-                            technicalDetails = "Provider: Gemini | Model: $modelId | Reason: $clean"
+                            technicalDetails = "Provider: Gemini | Model: ${attempt.modelUsed} | Reason: $clean"
                         )
                     )
                 )
@@ -625,9 +966,9 @@ class AiRouter @Inject constructor(
                 AiCallException(
                     AiFailure(
                         provider = "Gemini",
-                        model = modelId,
+                        model = attempt.modelUsed,
                         userMessage = "Gemini ne khali jawab bheja. Dobara try karo.",
-                        technicalDetails = "Empty candidates in GeminiGenerateResponse ($modelId)"
+                        technicalDetails = "Empty candidates in GeminiGenerateResponse (${attempt.modelUsed})"
                     )
                 )
             )
@@ -642,6 +983,13 @@ class AiRouter @Inject constructor(
                     args = fc.args ?: emptyMap()
                 )
             }
+        val sources = firstCandidate.groundingMetadata?.groundingChunks.orEmpty()
+            .mapNotNull { chunk ->
+                val web = chunk.web ?: return@mapNotNull null
+                val uri = web.uri?.trim()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+                WebSourceLink(title = web.title?.trim()?.ifBlank { uri } ?: uri, uri = uri)
+            }
+            .distinctBy { it.uri }
 
         if (visibleReply == null && calls.isEmpty()) {
             val reason = firstCandidate.finishReason ?: "EMPTY"
@@ -649,9 +997,9 @@ class AiRouter @Inject constructor(
                 AiCallException(
                     AiFailure(
                         provider = "Gemini",
-                        model = modelId,
-                        userMessage = "Gemini model ($modelId) ne jawab nahi diya ($reason).",
-                        technicalDetails = "Provider: Gemini | Model: $modelId | Finish: $reason"
+                        model = attempt.modelUsed,
+                        userMessage = "Gemini model (${attempt.modelUsed}) ne jawab nahi diya ($reason).",
+                        technicalDetails = "Provider: Gemini | Model: ${attempt.modelUsed} | Finish: $reason"
                     )
                 )
             )
@@ -661,7 +1009,9 @@ class AiRouter @Inject constructor(
             AiPlanResult(
                 brainUsed = BrainType.GEMINI,
                 replyText = visibleReply,
-                toolCalls = calls
+                toolCalls = calls,
+                sources = sources,
+                modelSwitchedNotice = attempt.modelSwitchedNotice
             )
         )
     }
@@ -687,9 +1037,10 @@ class AiRouter @Inject constructor(
         }
 
         return buildString {
-            appendLine("Your name is Baby. You are a friendly Hinglish-speaking phone assistant. Reply in short, natural language. Use tools to act on the phone. Ask confirmation before sensitive actions.")
-            appendLine("IDENTITY & PERSONALITY:")
-            appendLine("- Always introduce yourself as Baby. NEVER mention Gemini, Llama, Groq, GPT-OSS, Qwen, Google, OpenAI, or any underlying model or API name.")
+            appendLine("Your name is Baby. You are a friendly Hinglish-speaking AI phone assistant. Reply in short, natural language. Use tools to act on the phone. Ask confirmation before sensitive actions.")
+            appendLine("IDENTITY & SCRIPT:")
+            appendLine("- Always introduce yourself as Baby. NEVER call yourself Gemini, Mercury, Llama, Groq, GPT-OSS, Qwen, Inception, or Google. If asked who you are, say you are an AI assistant named Baby.")
+            appendLine("- NEVER convert Hinglish or English words into Devanagari script. Match the user's Latin/Hinglish script.")
             appendLine("- Personality style: ${settings.personality.toneInstruction}")
             appendLine("- $langGuide")
             appendLine(
@@ -699,23 +1050,28 @@ class AiRouter @Inject constructor(
                     "- Keep replies concise (1-3 short sentences), warm, and actionable."
                 }
             )
+            if (settings.emotionIntensity != com.example.core.security.EmotionIntensity.OFF) {
+                appendLine("- Optional emotion tag: For final user replies (without tool calls), you may prefix with `[mood: calm|happy|empathetic|concerned|excited]` (hidden from user).")
+                if (settings.understandMyMoodEnabled) {
+                    appendLine("- Notice user mood from their text alone and respond with gentle warmth when they sound stressed or tired.")
+                }
+            }
             if (!memoryBlock.isNullOrBlank()) {
                 appendLine("RELEVANT SAVED MEMORIES (top matches):")
                 appendLine(memoryBlock)
             }
             appendLine("AGENT LOOP (Step ${stepIndex + 1}/15):")
             appendLine("- Observe -> Plan -> Act -> Verify. Use read_screen or take_screenshot when interacting with UI apps before tapping coordinates.")
-            appendLine("- SCREEN HELP: When user asks 'isko translate karo', 'isko summarize karo', or 'ye kya hai' about what is on the phone screen, ALWAYS call explain_screen(mode) so Baby reads the text tree first and uses screenshot only if needed (never if Data Saver is ON).")
-            appendLine("- CAMERA + VISION: When user points the camera or asks 'ye kya hai?' about a physical object / photo ('camera se dekho', 'mere samne ye kya hai', or when on Baby screen), call capture_and_describe(question).")
-            appendLine("- CLIPBOARD AI: When user asks to summarize, translate, or draft a reply for copied text/clipboard, call read_clipboard_and_process(mode).")
-            appendLine("- REMINDERS & PLACES: Use set_reminder (natural time or location), list_reminders, delete_reminder, snooze_reminder, or save_place (Home/Work).")
-            appendLine("- NOTIFICATIONS: Use summarize_notifications(scope) for Hinglish grouped summaries (people first, promos last).")
-            appendLine("- CUSTOM COMMANDS: When user says 'naya command banao...' (e.g. 'Movie mode -> DND on, brightness low, volume 40%, open Netflix'), call create_command. Use run_command, list_commands, delete_command as needed.")
-            appendLine("- MACRO RECORDING: When user says 'Macro record shuru karo', call start_macro_recording. When 'Macro save karo [name]', call stop_macro_recording. Replay with run_macro, list with list_macros, delete with delete_macro.")
+            appendLine("- SEARCH & PLAY: Use search_web(query) for web/live facts (e.g. weather, news, scores). Use search_in_app(app_name, query, auto_play) for searching inside YouTube, YouTube Music, Spotify, Instagram, Facebook, Amazon, Flipkart, Maps, Play Store, or Chrome.")
+            appendLine("- SCREEN HELP: When user asks 'isko translate karo', 'isko summarize karo', or 'ye kya hai' about the phone screen, call explain_screen(mode).")
+            appendLine("- CAMERA + VISION: When user asks 'camera se dekho' or 'mere samne ye kya hai', call capture_and_describe(question).")
+            appendLine("- CLIPBOARD AI: When user asks about copied text/clipboard, call read_clipboard_and_process(mode).")
+            appendLine("- REMINDERS & PLACES: Use set_reminder, list_reminders, delete_reminder, snooze_reminder, or save_place.")
+            appendLine("- NOTIFICATIONS: Use summarize_notifications(scope) for Hinglish grouped summaries.")
+            appendLine("- CUSTOM COMMANDS & MACROS: Use create_command/run_command and start_macro_recording/stop_macro_recording/run_macro as needed.")
             appendLine("- SAFETY: NEVER automate banking, UPI payment, password manager, or system security settings screens. Always use send_emergency_alert on 'Baby help'.")
-            appendLine("- If user wants to create a routine by voice (e.g. 'routine banao: jab main bolu ...'), call create_routine with non-sensitive steps only. Never put payments, delete, uninstall, or SMS/WhatsApp sends inside routines.")
-            appendLine("- Resolve nicknames (e.g. Mummy, Bhaiya) using RELEVANT SAVED MEMORIES or recall_memory; save preferences/facts/nicknames with save_memory(type, key, value) and remove with delete_memory(key).")
-            appendLine("- Device lock state: ${if (isLocked) "LOCKED (only non-UI tools like call_contact, set_alarm, set_timer, toggle_flashlight, set_volume, media_control, read_notifications, summarize_notifications, set_reminder, send_emergency_alert, speak can run; UI tools will be queued until unlock)" else "UNLOCKED"}.")
+            appendLine("- Resolve nicknames using RELEVANT SAVED MEMORIES or recall_memory; save preferences/facts/nicknames with save_memory.")
+            appendLine("- Device lock state: ${if (isLocked) "LOCKED (UI tools will be queued until unlock)" else "UNLOCKED"}.")
             if (!screenContext.isNullOrBlank()) {
                 appendLine("CURRENT SCREEN UI TREE:")
                 appendLine(screenContext.take(if (settings.dataSaverEnabled) 1400 else 2600))

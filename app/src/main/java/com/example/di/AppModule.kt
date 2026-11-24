@@ -9,19 +9,24 @@ import com.example.data.local.AutoReplyRuleDao
 import com.example.data.local.BabyDatabase
 import com.example.data.local.ChatDao
 import com.example.data.local.EmergencyContactDao
+import com.example.data.local.AppAliasDao
+import com.example.data.local.CallScreeningLogDao
 import com.example.data.local.MIGRATION_1_2
 import com.example.data.local.MIGRATION_2_3
 import com.example.data.local.MIGRATION_3_4
 import com.example.data.local.MIGRATION_4_5
+import com.example.data.local.MIGRATION_5_6
 import com.example.data.local.MacroDao
 import com.example.data.local.MemoryDao
 import com.example.data.local.QueuedTaskDao
 import com.example.data.local.ReminderDao
 import com.example.data.local.RoutineDao
 import com.example.data.local.SavedPlaceDao
+import com.example.data.local.SearchRecipeDao
 import com.example.data.local.TaskRunDao
 import com.example.data.remote.GeminiApiService
 import com.example.data.remote.GroqApiService
+import com.example.data.remote.MercuryApiService
 import com.squareup.moshi.Moshi
 import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
 import dagger.Module
@@ -29,7 +34,9 @@ import dagger.Provides
 import dagger.hilt.InstallIn
 import dagger.hilt.android.qualifiers.ApplicationContext
 import dagger.hilt.components.SingletonComponent
+import okhttp3.ConnectionPool
 import okhttp3.OkHttpClient
+import okhttp3.Protocol
 import okhttp3.logging.HttpLoggingInterceptor
 import retrofit2.Retrofit
 import retrofit2.converter.moshi.MoshiConverterFactory
@@ -60,12 +67,25 @@ object AppModule {
             redactHeader("x-goog-api-key")
         }
         return OkHttpClient.Builder()
+            .connectionPool(ConnectionPool(8, 5, TimeUnit.MINUTES))
+            .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1))
+            .retryOnConnectionFailure(true)
             .addInterceptor(logging)
             .connectTimeout(25, TimeUnit.SECONDS)
             .readTimeout(45, TimeUnit.SECONDS)
             .writeTimeout(45, TimeUnit.SECONDS)
             .build()
     }
+
+    @Provides
+    @Singleton
+    @Named("mercury")
+    fun provideMercuryRetrofit(okHttpClient: OkHttpClient, moshi: Moshi): Retrofit =
+        Retrofit.Builder()
+            .baseUrl("https://api.inceptionlabs.ai/")
+            .client(okHttpClient)
+            .addConverterFactory(MoshiConverterFactory.create(moshi))
+            .build()
 
     @Provides
     @Singleton
@@ -89,6 +109,11 @@ object AppModule {
 
     @Provides
     @Singleton
+    fun provideMercuryApiService(@Named("mercury") retrofit: Retrofit): MercuryApiService =
+        retrofit.create(MercuryApiService::class.java)
+
+    @Provides
+    @Singleton
     fun provideGeminiApiService(@Named("gemini") retrofit: Retrofit): GeminiApiService =
         retrofit.create(GeminiApiService::class.java)
 
@@ -104,7 +129,7 @@ object AppModule {
             context,
             BabyDatabase::class.java,
             "baby_assistant_db"
-        ).addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5).build()
+        ).addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6).build()
 
     @Provides
     fun provideChatDao(db: BabyDatabase): ChatDao = db.chatDao()
@@ -141,4 +166,17 @@ object AppModule {
 
     @Provides
     fun provideSavedPlaceDao(db: BabyDatabase): SavedPlaceDao = db.savedPlaceDao()
+
+    @Provides
+    fun provideAppAliasDao(db: BabyDatabase): AppAliasDao = db.appAliasDao()
+
+    @Provides
+    fun provideSearchRecipeDao(db: BabyDatabase): SearchRecipeDao = db.searchRecipeDao()
+
+    @Provides
+    fun provideCallScreeningLogDao(db: BabyDatabase): CallScreeningLogDao = db.callScreeningLogDao()
+
+    @Provides
+    @Singleton
+    fun provideKeywordSpotter(impl: com.example.voice.AcousticWakeSpotter): com.example.voice.KeywordSpotter = impl
 }

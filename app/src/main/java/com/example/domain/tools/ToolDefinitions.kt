@@ -139,9 +139,20 @@ object ToolDefinitions {
         ),
         ToolSpec(
             name = "search_web",
-            description = "Search the web using the phone browser.",
+            description = "Search the live web using Google Search grounding and answer concisely with sources.",
             properties = mapOf("query" to strProp("Search query")),
             required = listOf("query"),
+            requiresUnlockedScreen = false
+        ),
+        ToolSpec(
+            name = "search_in_app",
+            description = "Open an app (YouTube, YouTube Music, Spotify, Instagram, Facebook, Amazon, Flipkart, Maps, Play Store, Chrome), search a query inside it, and optionally play or open the first clean result.",
+            properties = mapOf(
+                "app_name" to strProp("Target app e.g. YouTube, Spotify, Maps, Amazon"),
+                "query" to strProp("Search query"),
+                "auto_play" to boolProp("True to play/open first clean result (skip ads/Shorts)")
+            ),
+            required = listOf("app_name", "query"),
             requiresUnlockedScreen = true
         ),
         ToolSpec(
@@ -546,6 +557,102 @@ object ToolDefinitions {
             else -> "Execute $name with ${args.entries.joinToString { "${it.key}=${it.value}" }}"
         }
     }
+
+    private val coreToolNames = setOf(
+        "open_app", "call_contact", "toggle_flashlight", "set_volume", "set_brightness",
+        "toggle_wifi", "toggle_bluetooth", "toggle_dnd", "set_alarm", "set_timer",
+        "media_control", "search_web", "search_in_app", "speak", "read_notifications"
+    )
+
+    private fun relevantSpecs(userPrompt: String, dataSaver: Boolean): List<ToolSpec> {
+        val lower = userPrompt.lowercase()
+        val selectedNames = LinkedHashSet(coreToolNames)
+
+        if (lower.contains("whatsapp") || lower.contains("sms") || lower.contains("message") ||
+            lower.contains("bhejo") || lower.contains("reply") || lower.contains("chat")
+        ) {
+            selectedNames += listOf("send_sms", "send_whatsapp", "reply_notification", "read_notifications")
+        }
+        if (lower.contains("screen") || lower.contains("tap") || lower.contains("click") ||
+            lower.contains("scroll") || lower.contains("swipe") || lower.contains("type") ||
+            lower.contains("translate") || lower.contains("explain") || lower.contains("summarize") ||
+            lower.contains("isko") || lower.contains("ye kya") || lower.contains("back") ||
+            lower.contains("home") || lower.contains("recents")
+        ) {
+            selectedNames += listOf(
+                "read_screen", "explain_screen", "tap", "long_press", "type_text",
+                "swipe", "scroll", "go_back", "go_home", "open_recents", "open_notifications"
+            )
+            if (!dataSaver) {
+                selectedNames += "take_screenshot"
+            }
+        }
+        if (lower.contains("camera") || lower.contains("photo") || lower.contains("samne") || lower.contains("dekho")) {
+            selectedNames += "capture_and_describe"
+        }
+        if (lower.contains("clipboard") || lower.contains("copy") || lower.contains("copied")) {
+            selectedNames += "read_clipboard_and_process"
+        }
+        if (lower.contains("remind") || lower.contains("yaad dila") || lower.contains("alarm") ||
+            lower.contains("baje") || lower.contains("place") || lower.contains("ghar") || lower.contains("office")
+        ) {
+            selectedNames += listOf("set_reminder", "list_reminders", "delete_reminder", "snooze_reminder", "save_place")
+        }
+        if (lower.contains("remember") || lower.contains("yaad rakh") || lower.contains("memory") ||
+            lower.contains("bhool") || lower.contains("mummy") || lower.contains("papa") || lower.contains("bhai")
+        ) {
+            selectedNames += listOf("save_memory", "recall_memory", "delete_memory")
+        }
+        if (lower.contains("routine") || lower.contains("morning") || lower.contains("night") || lower.contains("mode")) {
+            selectedNames += listOf(
+                "create_routine", "run_routine", "list_routines", "delete_routine",
+                "create_command", "run_command", "list_commands", "delete_command"
+            )
+        }
+        if (lower.contains("macro") || lower.contains("record") || lower.contains("chalao")) {
+            selectedNames += listOf(
+                "start_macro_recording", "stop_macro_recording", "run_macro", "list_macros", "delete_macro"
+            )
+        }
+        if (lower.contains("notif") || lower.contains("auto") || lower.contains("busy") ||
+            lower.contains("driving") || lower.contains("sleeping")
+        ) {
+            selectedNames += listOf("summarize_notifications", "set_auto_reply", "set_auto_reply_message", "read_notifications")
+        }
+        if (lower.contains("help") || lower.contains("sos") || lower.contains("emergency")) {
+            selectedNames += "send_emergency_alert"
+        }
+
+        // If prompt doesn't strongly match any narrow domain and dataSaver is OFF, still allow a bounded set
+        val specs = allTools.filter { spec ->
+            spec.name in selectedNames && (!dataSaver || spec.name != "take_screenshot")
+        }
+        return if (specs.isNotEmpty()) specs else allTools.filter { !dataSaver || it.name != "take_screenshot" }
+    }
+
+    fun selectRelevantTools(userPrompt: String, dataSaver: Boolean): List<GroqTool> =
+        relevantSpecs(userPrompt, dataSaver).map { spec ->
+            GroqTool(
+                type = "function",
+                function = GroqFunctionSpec(
+                    name = spec.name,
+                    description = spec.description,
+                    parameters = spec.parametersSchema()
+                )
+            )
+        }
+
+    fun selectRelevantGeminiTools(userPrompt: String, dataSaver: Boolean): List<GeminiTool> = listOf(
+        GeminiTool(
+            functionDeclarations = relevantSpecs(userPrompt, dataSaver).map { spec ->
+                GeminiFunctionDeclaration(
+                    name = spec.name,
+                    description = spec.description,
+                    parameters = spec.parametersSchema()
+                )
+            }
+        )
+    )
 
     fun toGroqTools(): List<GroqTool> = allTools.map { spec ->
         GroqTool(

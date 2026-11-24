@@ -42,7 +42,9 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.testTag
@@ -65,25 +67,35 @@ import com.example.features.widget.BabyWidgetProvider
 import com.example.service.BabyQuickSettingsTileService
 import com.example.ui.components.FullScreenVoiceOverlay
 import com.example.ui.navigation.ActionsRoute
+import com.example.ui.navigation.CallAssistantRoute
 import com.example.ui.navigation.ChatRoute
+import com.example.ui.navigation.CompareModelsRoute
 import com.example.ui.navigation.HistoryRoute
+import com.example.ui.navigation.LatencyDebugRoute
 import com.example.ui.navigation.MemoryRoute
 import com.example.ui.navigation.MoreRoute
 import com.example.ui.navigation.OnboardingRoute
 import com.example.ui.navigation.PermissionsRoute
+import com.example.ui.navigation.RecipeTestRoute
 import com.example.ui.navigation.RemindersRoute
 import com.example.ui.navigation.RoutinesRoute
 import com.example.ui.navigation.SettingsRoute
+import com.example.ui.navigation.WakeWordTestRoute
 import com.example.ui.screens.ActionsScreen
+import com.example.ui.screens.CallAssistantScreen
 import com.example.ui.screens.ChatScreen
+import com.example.ui.screens.CompareModelsScreen
 import com.example.ui.screens.HistoryScreen
+import com.example.ui.screens.LatencyDebugScreen
 import com.example.ui.screens.MemoryScreen
 import com.example.ui.screens.MoreScreen
 import com.example.ui.screens.OnboardingScreen
 import com.example.ui.screens.PermissionsScreen
+import com.example.ui.screens.RecipeTestScreen
 import com.example.ui.screens.RemindersScreen
 import com.example.ui.screens.RoutinesScreen
 import com.example.ui.screens.SettingsScreen
+import com.example.ui.screens.WakeWordTestScreen
 import com.example.ui.theme.BabyMotionTokens
 import com.example.ui.theme.BabyTheme
 import com.example.ui.theme.rememberReducedMotionEnabled
@@ -196,12 +208,27 @@ fun BabyAppRoot(
     val permissions by viewModel.permissions.collectAsStateWithLifecycle()
     val voiceOverlayOpen by viewModel.voiceOverlayOpen.collectAsStateWithLifecycle()
     val isRefreshing by viewModel.isRefreshing.collectAsStateWithLifecycle()
+    val inceptionKeyTest by viewModel.inceptionKeyTest.collectAsStateWithLifecycle()
     val groqKeyTest by viewModel.groqKeyTest.collectAsStateWithLifecycle()
     val geminiKeyTest by viewModel.geminiKeyTest.collectAsStateWithLifecycle()
+    val liveMercuryModels by viewModel.liveMercuryModels.collectAsStateWithLifecycle()
+    val liveGeminiModels by viewModel.liveGeminiModels.collectAsStateWithLifecycle()
     val liveGroqModels by viewModel.liveGroqModels.collectAsStateWithLifecycle()
     val liveModelsLoading by viewModel.liveModelsLoading.collectAsStateWithLifecycle()
     val liveModelsError by viewModel.liveModelsError.collectAsStateWithLifecycle()
     val modelsTestState by viewModel.modelsTestState.collectAsStateWithLifecycle()
+    val compareState by viewModel.compareState.collectAsStateWithLifecycle()
+    val latencyRecords by viewModel.latencyRecords.collectAsStateWithLifecycle()
+    val appAliases by viewModel.appAliases.collectAsStateWithLifecycle()
+    val installedApps by viewModel.installedApps.collectAsStateWithLifecycle()
+    val appLaunchAttempts by viewModel.appLaunchAttempts.collectAsStateWithLifecycle()
+    val micPipelineState by viewModel.micPipelineState.collectAsStateWithLifecycle()
+    val wakeRmsLevel by viewModel.wakeRmsLevel.collectAsStateWithLifecycle()
+    val wakeScore by viewModel.wakeScore.collectAsStateWithLifecycle()
+    val watchdogRestarts by viewModel.watchdogRestarts.collectAsStateWithLifecycle()
+    val watchdogLogs by viewModel.watchdogLogs.collectAsStateWithLifecycle()
+    val searchRecipes by viewModel.searchRecipes.collectAsStateWithLifecycle()
+    val recipeTestOutput by viewModel.recipeTestOutput.collectAsStateWithLifecycle()
 
     val routines by extrasViewModel.routines.collectAsStateWithLifecycle()
     val memories by extrasViewModel.memories.collectAsStateWithLifecycle()
@@ -218,6 +245,7 @@ fun BabyAppRoot(
     val allowedApps by extrasViewModel.allowedApps.collectAsStateWithLifecycle()
     val emergencyContacts by extrasViewModel.emergencyContacts.collectAsStateWithLifecycle()
     val emergencyCountdown by extrasViewModel.emergencyCountdown.collectAsStateWithLifecycle()
+    val callScreeningLogs by extrasViewModel.callScreeningLogs.collectAsStateWithLifecycle()
     val statusToast by extrasViewModel.statusToast.collectAsStateWithLifecycle()
 
     val snackbarHostState = remember { SnackbarHostState() }
@@ -247,11 +275,14 @@ fun BabyAppRoot(
             oemGuide = viewModel.oemGuide,
             permissionHelper = viewModel.permissionHelper,
             initialStep = uiPrefs.onboardingStep,
+            inceptionKeyTest = inceptionKeyTest,
             groqKeyTest = groqKeyTest,
             geminiKeyTest = geminiKeyTest,
             onStepChange = viewModel::setOnboardingStep,
             onRefreshPermissions = viewModel::refreshPermissions,
             onSaveKeys = viewModel::saveApiKeys,
+            onSaveAllKeys = viewModel::saveAllApiKeys,
+            onTestInceptionKey = viewModel::testInceptionKey,
             onTestGroqKey = viewModel::testGroqKey,
             onTestGeminiKey = viewModel::testGeminiKey,
             onWakeWordToggle = viewModel::setWakeWordEnabled,
@@ -383,11 +414,14 @@ fun BabyAppRoot(
                             oemGuide = viewModel.oemGuide,
                             permissionHelper = viewModel.permissionHelper,
                             initialStep = uiPrefs.onboardingStep,
+                            inceptionKeyTest = inceptionKeyTest,
                             groqKeyTest = groqKeyTest,
                             geminiKeyTest = geminiKeyTest,
                             onStepChange = viewModel::setOnboardingStep,
                             onRefreshPermissions = viewModel::refreshPermissions,
                             onSaveKeys = viewModel::saveApiKeys,
+                            onSaveAllKeys = viewModel::saveAllApiKeys,
+                            onTestInceptionKey = viewModel::testInceptionKey,
                             onTestGroqKey = viewModel::testGroqKey,
                             onTestGeminiKey = viewModel::testGeminiKey,
                             onWakeWordToggle = viewModel::setWakeWordEnabled,
@@ -509,7 +543,12 @@ fun BabyAppRoot(
                             onOpenMemory = { navController.navigate(MemoryRoute) },
                             onExportActionLogsShare = extrasViewModel::exportActionLog,
                             onExportActionLogsToUri = extrasViewModel::exportActionLogToUri,
-                            onReopenOnboarding = viewModel::reopenOnboarding
+                            onReopenOnboarding = viewModel::reopenOnboarding,
+                            onOpenCompareModels = { navController.navigate(CompareModelsRoute) },
+                            onOpenLatencyDebug = { navController.navigate(LatencyDebugRoute) },
+                            onOpenWakeLab = { navController.navigate(WakeWordTestRoute) },
+                            onOpenRecipes = { navController.navigate(RecipeTestRoute) },
+                            onOpenCallAssistant = { navController.navigate(CallAssistantRoute) }
                         )
                     }
                     composable<RoutinesRoute> { entry ->
@@ -572,8 +611,11 @@ fun BabyAppRoot(
                             permissionHelper = viewModel.permissionHelper,
                             initialSection = args.initialSection,
                             uiPrefs = uiPrefs,
+                            inceptionKeyTest = inceptionKeyTest,
                             groqKeyTest = groqKeyTest,
                             geminiKeyTest = geminiKeyTest,
+                            liveMercuryModels = liveMercuryModels,
+                            liveGeminiModels = liveGeminiModels,
                             liveGroqModels = liveGroqModels,
                             liveModelsLoading = liveModelsLoading,
                             liveModelsError = liveModelsError,
@@ -581,6 +623,8 @@ fun BabyAppRoot(
                             onBack = { navController.popBackStack() },
                             onRefreshPermissions = viewModel::refreshPermissions,
                             onSaveKeys = viewModel::saveApiKeys,
+                            onSaveAllKeys = viewModel::saveAllApiKeys,
+                            onTestInceptionKey = viewModel::testInceptionKey,
                             onTestGroqKey = viewModel::testGroqKey,
                             onTestGeminiKey = viewModel::testGeminiKey,
                             onClearKeys = viewModel::clearApiKeys,
@@ -592,9 +636,17 @@ fun BabyAppRoot(
                             onSaveModelConfig = viewModel::updateModelConfig,
                             onResetModelConfig = viewModel::resetModelConfig,
                             onRefreshLiveGroqModels = { key -> viewModel.refreshLiveGroqModels(key) },
+                            onRefreshAllLiveModels = { inc, gem, grq -> viewModel.refreshAllLiveModels(inc, gem, grq) },
+                            onTestSingleRole = { role, cfg, inc, gem, grq ->
+                                viewModel.testSingleRole(role, cfg, inc, gem, grq)
+                            },
                             onTestAllModels = { cfg, gKey, gemKey ->
                                 viewModel.testAllAiModels(cfg, gKey, gemKey)
                             },
+                            onTestAllRoles = { cfg, inc, gem, grq ->
+                                viewModel.testAllAiModels(cfg, grq, gem, inc)
+                            },
+                            onOpenCompareModels = { navController.navigate(CompareModelsRoute) },
                             onPreferredBrainChange = viewModel::updatePreferredBrain,
                             onAutoFallbackChange = viewModel::setAutoFallback,
                             onWakeWordToggle = viewModel::setWakeWordEnabled,
@@ -630,7 +682,15 @@ fun BabyAppRoot(
                             onAddEmergencyContact = extrasViewModel::addEmergencyContact,
                             onDeleteEmergencyContact = extrasViewModel::deleteEmergencyContact,
                             onTriggerSos = extrasViewModel::triggerEmergencyNow,
-                            onOpenMemory = { navController.navigate(MemoryRoute) }
+                            onOpenMemory = { navController.navigate(MemoryRoute) },
+                            onWakeBatterySaverToggle = viewModel::setWakeWordBatterySaver,
+                            onTtsTierModeChange = viewModel::setTtsTierMode,
+                            onTtsVoiceNameChange = viewModel::setTtsVoiceName,
+                            onTtsSpeedChange = viewModel::setTtsSpeed,
+                            onTtsVolumeChange = viewModel::setTtsVolume,
+                            onPreviewVoice = viewModel::previewTtsVoice,
+                            onOpenWakeLab = { navController.navigate(WakeWordTestRoute) },
+                            onEmotionIntensityChange = extrasViewModel::setEmotionIntensity
                         )
                     }
                     composable<MemoryRoute> {
@@ -653,6 +713,67 @@ fun BabyAppRoot(
                             onBack = { navController.popBackStack() }
                         )
                     }
+                    composable<CompareModelsRoute> {
+                        CompareModelsScreen(
+                            state = compareState,
+                            onRunBenchmark = viewModel::runCompareBenchmark,
+                            onBack = { navController.popBackStack() }
+                        )
+                    }
+                    composable<LatencyDebugRoute> {
+                        LatencyDebugScreen(
+                            records = latencyRecords,
+                            aliases = appAliases,
+                            installedApps = installedApps,
+                            launchAttempts = appLaunchAttempts,
+                            onBack = { navController.popBackStack() },
+                            onClearLatency = viewModel::clearLatencyRecords,
+                            onRefreshApps = viewModel::refreshInstalledAppsIndex,
+                            onSaveAlias = viewModel::saveAppAlias,
+                            onDeleteAlias = viewModel::deleteAppAlias
+                        )
+                    }
+                    composable<WakeWordTestRoute> {
+                        WakeWordTestScreen(
+                            settings = settings,
+                            micState = micPipelineState,
+                            rmsLevel = wakeRmsLevel,
+                            wakeScore = wakeScore,
+                            spotterName = viewModel.spotterEngineName,
+                            watchdogRestarts = watchdogRestarts,
+                            watchdogLogs = watchdogLogs,
+                            onBack = { navController.popBackStack() },
+                            onToggleWakeWord = viewModel::setWakeWordEnabled,
+                            onSensitivityChange = viewModel::setWakeWordSensitivity,
+                            onBatterySaverToggle = viewModel::setWakeWordBatterySaver,
+                            onTestWakeTrigger = viewModel::triggerTestWake
+                        )
+                    }
+                    composable<RecipeTestRoute> {
+                        RecipeTestScreen(
+                            recipes = searchRecipes,
+                            lastRunOutput = recipeTestOutput,
+                            onBack = { navController.popBackStack() },
+                            onSaveRecipeJson = viewModel::saveSearchRecipeJson,
+                            onResetRecipe = viewModel::resetSearchRecipe,
+                            onRunSearchPlayCommand = viewModel::runSearchPlayTest
+                        )
+                    }
+                    composable<CallAssistantRoute> {
+                        var hasRole by remember { mutableStateOf(viewModel.permissionHelper.isCallScreeningRoleHeld()) }
+                        CallAssistantScreen(
+                            settings = settings,
+                            logs = callScreeningLogs,
+                            isCallScreeningRoleHeld = hasRole,
+                            onBack = { navController.popBackStack() },
+                            onModeChange = extrasViewModel::setCallAssistantMode,
+                            onPolicyChange = extrasViewModel::setUnknownCallerPolicy,
+                            onTogglePref = extrasViewModel::setFeatureToggle,
+                            onSaveReplyTemplate = extrasViewModel::setCallAssistantReplyTemplate,
+                            onClearLogs = extrasViewModel::clearCallScreeningLogs,
+                            onRefreshRole = { hasRole = viewModel.permissionHelper.isCallScreeningRoleHeld() }
+                        )
+                    }
                 }
             }
         }
@@ -667,6 +788,9 @@ fun BabyAppRoot(
                 messages.lastOrNull()?.content.orEmpty()
             },
             isOffline = isOffline,
+            faceModeEnabled = settings.orbFaceModeEnabled,
+            emotionIntensity = settings.emotionIntensity,
+            hapticsEnabled = settings.hapticsEnabled,
             onTapOrb = viewModel::interruptOrStopVoice,
             onStopTask = { viewModel.stopCurrentTask("Voice overlay STOP") },
             onDismiss = viewModel::closeVoiceOverlay

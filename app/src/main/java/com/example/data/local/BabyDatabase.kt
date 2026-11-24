@@ -16,9 +16,12 @@ import androidx.room.RoomDatabase
         MacroEntity::class,
         AllowedAppEntity::class,
         EmergencyContactEntity::class,
-        SavedPlaceEntity::class
+        SavedPlaceEntity::class,
+        AppAliasEntity::class,
+        SearchRecipeEntity::class,
+        CallScreeningLogEntity::class
     ],
-    version = 5,
+    version = 6,
     exportSchema = false
 )
 abstract class BabyDatabase : RoomDatabase() {
@@ -34,4 +37,7 @@ abstract class BabyDatabase : RoomDatabase() {
     abstract fun allowedAppDao(): AllowedAppDao
     abstract fun emergencyContactDao(): EmergencyContactDao
     abstract fun savedPlaceDao(): SavedPlaceDao
+    abstract fun appAliasDao(): AppAliasDao
+    abstract fun searchRecipeDao(): SearchRecipeDao
+    abstract fun callScreeningLogDao(): CallScreeningLogDao
 }

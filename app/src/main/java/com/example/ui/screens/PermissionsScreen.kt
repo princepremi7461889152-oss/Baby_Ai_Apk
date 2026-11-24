@@ -36,6 +36,7 @@ import androidx.compose.material.icons.filled.NotificationsActive
 import androidx.compose.material.icons.filled.Phone
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.WarningAmber
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -47,6 +48,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
@@ -101,6 +103,7 @@ fun PermissionsScreen(
     val context = LocalContext.current
     val activity = context as? Activity
     var deniedFeedback by remember { mutableStateOf<String?>(null) }
+    var pendingRationale by remember { mutableStateOf<PermissionChecklistItem?>(null) }
 
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
@@ -412,7 +415,7 @@ fun PermissionsScreen(
                                 if (!item.granted) {
                                     Spacer(Modifier.width(8.dp))
                                     Button(
-                                        onClick = item.onFix,
+                                        onClick = { pendingRationale = item },
                                         modifier = Modifier
                                             .minimumInteractiveComponentSize()
                                             .testTag("fix_perm_${item.id}")
@@ -455,6 +458,48 @@ fun PermissionsScreen(
                 }
             }
         }
+    }
+
+    pendingRationale?.let { item ->
+        AlertDialog(
+            onDismissRequest = { pendingRationale = null },
+            modifier = Modifier.testTag("permission_rationale_dialog"),
+            icon = { Icon(item.icon, contentDescription = null, tint = MaterialTheme.colorScheme.primary) },
+            title = { Text("${item.title} Kyun Chahiye?") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        text = item.reason.withDevanagariFallback(),
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                    Text(
+                        text = "Privacy: Baby aapka data bina permission kahin upload nahi karti. Aap Android Settings mein kabhi bhi isse OFF kar sakte ho.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val action = item.onFix
+                        pendingRationale = null
+                        action()
+                    },
+                    modifier = Modifier.testTag("rationale_confirm_btn")
+                ) {
+                    Text(if (item.permanentlyDenied) "Open App Settings" else "Continue")
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = { pendingRationale = null },
+                    modifier = Modifier.testTag("rationale_dismiss_btn")
+                ) {
+                    Text("Not Now")
+                }
+            }
+        )
     }
 }
 

@@ -8,7 +8,7 @@ package com.example.core.security
 object SensitiveDataSanitizer {
 
     private val GEMINI_KEY_REGEX = Regex("""AIza[0-9A-Za-z\-_]{20,}""")
-    private val GROQ_OR_OPENAI_KEY_REGEX = Regex("""\b(?:gsk[_-]|sk-)[0-9A-Za-z\-_]{16,}\b""")
+    private val GROQ_OR_OPENAI_KEY_REGEX = Regex("""\b(?:gsk[_-]|sk-|inc[_-])[0-9A-Za-z\-_]{14,}\b""")
     private val BEARER_TOKEN_REGEX = Regex("""(?i)\bBearer\s+[A-Za-z0-9\-._~+/]+=*""")
 
     private val OTP_AFTER_LABEL_REGEX = Regex(

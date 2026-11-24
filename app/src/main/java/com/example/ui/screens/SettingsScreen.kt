@@ -89,6 +89,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.example.core.security.AiModelConfig
+import com.example.core.security.AiRole
 import com.example.core.security.AppLanguage
 import com.example.core.security.AutoReplyMode
 import com.example.core.security.BabyPersonality
@@ -124,8 +125,11 @@ fun SettingsScreen(
     permissionHelper: PermissionHelper?,
     initialSection: String = "",
     uiPrefs: BabyUiPreferences = BabyUiPreferences(),
+    inceptionKeyTest: KeyTestResult = KeyTestResult.Idle,
     groqKeyTest: KeyTestResult = KeyTestResult.Idle,
     geminiKeyTest: KeyTestResult = KeyTestResult.Idle,
+    liveMercuryModels: List<String> = emptyList(),
+    liveGeminiModels: List<String> = emptyList(),
     liveGroqModels: List<String> = emptyList(),
     liveModelsLoading: Boolean = false,
     liveModelsError: String? = null,
@@ -133,6 +137,8 @@ fun SettingsScreen(
     onBack: (() -> Unit)? = null,
     onRefreshPermissions: () -> Unit,
     onSaveKeys: (String, String) -> Unit,
+    onSaveAllKeys: (String, String, String) -> Unit = { _, gem, grq -> onSaveKeys(gem, grq) },
+    onTestInceptionKey: (String) -> Unit = {},
     onTestGroqKey: (String) -> Unit = {},
     onTestGeminiKey: (String) -> Unit = {},
     onClearKeys: () -> Unit,
@@ -144,7 +150,11 @@ fun SettingsScreen(
     onSaveModelConfig: (AiModelConfig) -> Unit = {},
     onResetModelConfig: () -> Unit = {},
     onRefreshLiveGroqModels: (String) -> Unit = {},
+    onRefreshAllLiveModels: (String, String, String) -> Unit = { _, _, grq -> onRefreshLiveGroqModels(grq) },
+    onTestSingleRole: (AiRole, AiModelConfig, String, String, String) -> Unit = { _, _, _, _, _ -> },
     onTestAllModels: (AiModelConfig, String, String) -> Unit = { _, _, _ -> },
+    onTestAllRoles: (AiModelConfig, String, String, String) -> Unit = { cfg, _, gem, grq -> onTestAllModels(cfg, grq, gem) },
+    onOpenCompareModels: () -> Unit = {},
     onPreferredBrainChange: (PreferredBrain) -> Unit,
     onAutoFallbackChange: (Boolean) -> Unit,
     onWakeWordToggle: (Boolean) -> Unit,
@@ -177,7 +187,15 @@ fun SettingsScreen(
     onAddEmergencyContact: (String, String) -> Unit = { _, _ -> },
     onDeleteEmergencyContact: (Long) -> Unit = {},
     onTriggerSos: () -> Unit = {},
-    onOpenMemory: () -> Unit = {}
+    onOpenMemory: () -> Unit = {},
+    onWakeBatterySaverToggle: (Boolean) -> Unit = {},
+    onTtsTierModeChange: (com.example.core.security.TtsTierMode) -> Unit = {},
+    onTtsVoiceNameChange: (String) -> Unit = {},
+    onTtsSpeedChange: (Float) -> Unit = {},
+    onTtsVolumeChange: (Float) -> Unit = {},
+    onPreviewVoice: () -> Unit = {},
+    onOpenWakeLab: () -> Unit = {},
+    onEmotionIntensityChange: (com.example.core.security.EmotionIntensity) -> Unit = {}
 ) {
     val spacing = BabyThemeTokens.spacing
     val ext = BabyThemeTokens.colors
@@ -186,6 +204,7 @@ fun SettingsScreen(
     val listState = rememberLazyListState()
 
     var searchQuery by remember { mutableStateOf("") }
+    var inceptionInput by remember(settings.inceptionApiKey) { mutableStateOf(settings.inceptionApiKey) }
     var geminiInput by remember(settings.geminiApiKey) { mutableStateOf(settings.geminiApiKey) }
     var groqInput by remember(settings.groqApiKey) { mutableStateOf(settings.groqApiKey) }
     var showKeys by remember { mutableStateOf(false) }
@@ -211,10 +230,10 @@ fun SettingsScreen(
         return keywords.any { it.contains(q, ignoreCase = true) }
     }
 
-    val showAppearance = matches("appearance", "theme", "dark", "light", "amoled", "material you", "dynamic color", "sound", "cue", "beep")
-    val showKeysSection = matches("api", "key", "groq", "gemini", "keystore", "paste", "test")
-    val showAiSection = matches("ai", "brain", "routing", "model", "whisper", "fallback", "gemini", "groq", "gpt-oss", "qwen", "stt")
-    val showVoiceSection = matches("wake", "voice", "hey baby", "sensitivity", "language", "hinglish", "hindi", "english", "tts", "bubble", "overlay", "confirm")
+    val showAppearance = matches("appearance", "theme", "dark", "light", "amoled", "material you", "dynamic color", "sound", "cue", "beep", "emotion", "mood", "orb", "face", "haptic", "feeling")
+    val showKeysSection = matches("api", "key", "inception", "mercury", "groq", "gemini", "keystore", "paste", "test")
+    val showAiSection = matches("ai", "brain", "routing", "model", "mercury", "whisper", "tts", "fallback", "gemini", "groq", "gpt-oss", "qwen", "stt", "compare")
+    val showVoiceSection = matches("wake", "voice", "hey baby", "sensitivity", "language", "hinglish", "hindi", "english", "tts", "bubble", "overlay", "confirm", "emotion")
     val showPermissionsSection = matches("permission", "mic", "accessibility", "notification", "battery", "autostart", "oem", "dnd", "brightness")
     val showFeaturesSection = matches("module", "personality", "memory", "data saver", "offline", "routine", "command", "macro", "reminder", "location", "clipboard", "camera", "screen help", "retention", "audit")
     val showAutoReplySection = matches("auto reply", "autoreply", "whatsapp", "sms", "busy", "driving", "sleeping", "schedule", "contact")
@@ -362,6 +381,63 @@ fun SettingsScreen(
                                 onCheckedChange = onSoundCuesChange,
                                 testTag = "sound_cues_switch"
                             )
+
+                            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+
+                            Text("Emotion Intensity (Orb & Voice Tone)", style = MaterialTheme.typography.titleSmall)
+                            FlowRow(
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                com.example.core.security.EmotionIntensity.entries.forEach { level ->
+                                    FilterChip(
+                                        selected = settings.emotionIntensity == level,
+                                        onClick = { onEmotionIntensityChange(level) },
+                                        label = { Text(level.label) },
+                                        modifier = Modifier.testTag("emotion_intensity_${level.name.lowercase()}")
+                                    )
+                                }
+                            }
+
+                            SettingsSwitchRow(
+                                title = "Orb Face Mode (Minimal Eyes & Smile)",
+                                subtitle = "Default OFF: Bade Orb mein subtle aankhen aur smile dikhegi.",
+                                checked = settings.orbFaceModeEnabled,
+                                onCheckedChange = {
+                                    onFeatureToggle(com.example.core.security.SecureKeyStore.KEY_ORB_FACE_MODE, it)
+                                },
+                                testTag = "orb_face_mode_switch"
+                            )
+
+                            SettingsSwitchRow(
+                                title = "Emotional Voice Modulation (Gemini TTS)",
+                                subtitle = "Mood ke hisaab se Gemini TTS tone adjust hota hai (Android TTS normal rehta hai).",
+                                checked = settings.emotionalVoiceEnabled,
+                                onCheckedChange = {
+                                    onFeatureToggle(com.example.core.security.SecureKeyStore.KEY_EMOTIONAL_VOICE, it)
+                                },
+                                testTag = "emotional_voice_switch"
+                            )
+
+                            SettingsSwitchRow(
+                                title = "Haptic Tap & Voice Vibrations",
+                                subtitle = "Mic press aur card taps par gentle vibration.",
+                                checked = settings.hapticsEnabled,
+                                onCheckedChange = {
+                                    onFeatureToggle(com.example.core.security.SecureKeyStore.KEY_HAPTICS_ENABLED, it)
+                                },
+                                testTag = "haptics_enabled_switch"
+                            )
+
+                            SettingsSwitchRow(
+                                title = "Understand My Mood (Text Only)",
+                                subtitle = "Default OFF: Sirf aapke text words se mood samajhti hai — koi voice stress analysis nahi.",
+                                checked = settings.understandMyMoodEnabled,
+                                onCheckedChange = {
+                                    onFeatureToggle(com.example.core.security.SecureKeyStore.KEY_UNDERSTAND_MY_MOOD, it)
+                                },
+                                testTag = "understand_mood_switch"
+                            )
                         }
                     }
                 }
@@ -369,13 +445,14 @@ fun SettingsScreen(
                 // 1. Encrypted API Keys
                 if (showKeysSection) {
                     item(key = "sec_keys") {
+                        val hasInc = settings.inceptionApiKey.isNotBlank()
                         val hasGroq = settings.groqApiKey.isNotBlank()
                         val hasGemini = settings.geminiApiKey.isNotBlank()
-                        val keysSummary = when {
-                            hasGroq && hasGemini -> "Groq & Gemini ready"
-                            hasGroq -> "Groq ready • Gemini missing"
-                            hasGemini -> "Gemini ready • Groq missing"
-                            else -> "No keys configured"
+                        val configuredCount = listOf(hasInc, hasGemini, hasGroq).count { it }
+                        val keysSummary = when (configuredCount) {
+                            3 -> "Mercury, Gemini & Groq ready"
+                            0 -> "No keys configured"
+                            else -> "$configuredCount/3 keys ready"
                         }
                         SectionCard(
                             icon = Icons.Default.Key,
@@ -388,6 +465,43 @@ fun SettingsScreen(
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                             OutlinedTextField(
+                                value = inceptionInput,
+                                onValueChange = {
+                                    inceptionInput = it
+                                    savedBanner = false
+                                },
+                                label = { Text("Inception API Key (Mercury 3 MIND)") },
+                                placeholder = { Text("Paste Inception key") },
+                                visualTransformation = if (showKeys) VisualTransformation.None else PasswordVisualTransformation(),
+                                trailingIcon = {
+                                    Row {
+                                        IconButton(onClick = {
+                                            clipboard.getText()?.text?.trim()?.let { inceptionInput = it }
+                                        }) {
+                                            Icon(Icons.Default.ContentPaste, contentDescription = "Paste Inception key")
+                                        }
+                                        IconButton(onClick = { showKeys = !showKeys }) {
+                                            Icon(
+                                                if (showKeys) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                                                contentDescription = "Toggle key visibility"
+                                            )
+                                        }
+                                    }
+                                },
+                                singleLine = true,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .testTag("settings_inception_key_input")
+                            )
+                            KeyHealthRow(
+                                label = "Test Mercury",
+                                status = inceptionKeyTest,
+                                onTest = { onTestInceptionKey(inceptionInput) },
+                                linkText = "Get Inception Key",
+                                onOpenLink = { uriHandler.openUri("https://platform.inceptionlabs.ai/") }
+                            )
+
+                            OutlinedTextField(
                                 value = groqInput,
                                 onValueChange = {
                                     groqInput = it
@@ -397,18 +511,10 @@ fun SettingsScreen(
                                 placeholder = { Text("gsk_...") },
                                 visualTransformation = if (showKeys) VisualTransformation.None else PasswordVisualTransformation(),
                                 trailingIcon = {
-                                    Row {
-                                        IconButton(onClick = {
-                                            clipboard.getText()?.text?.trim()?.let { groqInput = it }
-                                        }) {
-                                            Icon(Icons.Default.ContentPaste, contentDescription = "Paste Groq key")
-                                        }
-                                        IconButton(onClick = { showKeys = !showKeys }) {
-                                            Icon(
-                                                if (showKeys) Icons.Default.VisibilityOff else Icons.Default.Visibility,
-                                                contentDescription = "Toggle key visibility"
-                                            )
-                                        }
+                                    IconButton(onClick = {
+                                        clipboard.getText()?.text?.trim()?.let { groqInput = it }
+                                    }) {
+                                        Icon(Icons.Default.ContentPaste, contentDescription = "Paste Groq key")
                                     }
                                 },
                                 singleLine = true,
@@ -460,7 +566,7 @@ fun SettingsScreen(
                             ) {
                                 Button(
                                     onClick = {
-                                        onSaveKeys(geminiInput, groqInput)
+                                        onSaveAllKeys(inceptionInput, geminiInput, groqInput)
                                         savedBanner = true
                                     },
                                     modifier = Modifier
@@ -495,12 +601,40 @@ fun SettingsScreen(
                 if (showAiSection) {
                     item(key = "sec_ai") {
                         val cfg = settings.modelConfig
+                        var mindModelInput by remember(cfg.mindModel) { mutableStateOf(cfg.mindModel) }
+                        var geminiModelInput by remember(cfg.geminiModel) { mutableStateOf(cfg.geminiModel) }
                         var chatModelInput by remember(cfg.chatModel) { mutableStateOf(cfg.chatModel) }
                         var fastModelInput by remember(cfg.fastModel) { mutableStateOf(cfg.fastModel) }
                         var sttModelInput by remember(cfg.sttModel) { mutableStateOf(cfg.sttModel) }
-                        var geminiModelInput by remember(cfg.geminiModel) { mutableStateOf(cfg.geminiModel) }
+                        var ttsModelInput by remember(cfg.ttsModel) { mutableStateOf(cfg.ttsModel) }
+                        var inceptionBaseUrlInput by remember(cfg.inceptionBaseUrl) { mutableStateOf(cfg.inceptionBaseUrl) }
+                        var geminiBaseUrlInput by remember(cfg.geminiBaseUrl) { mutableStateOf(cfg.geminiBaseUrl) }
+                        var groqBaseUrlInput by remember(cfg.groqBaseUrl) { mutableStateOf(cfg.groqBaseUrl) }
+                        var showAdvancedBaseUrls by remember { mutableStateOf(false) }
                         var modelsSavedNotice by remember { mutableStateOf(false) }
 
+                        fun buildEditedConfig(): AiModelConfig = AiModelConfig(
+                            mindModel = mindModelInput,
+                            geminiModel = geminiModelInput,
+                            chatModel = chatModelInput,
+                            fastModel = fastModelInput,
+                            sttModel = sttModelInput,
+                            ttsModel = ttsModelInput,
+                            ttsPremiumModel = cfg.ttsPremiumModel,
+                            inceptionBaseUrl = inceptionBaseUrlInput,
+                            groqBaseUrl = groqBaseUrlInput,
+                            geminiBaseUrl = geminiBaseUrlInput
+                        ).normalized()
+
+                        val mindOptions = remember(liveMercuryModels) {
+                            (liveMercuryModels + AiModelConfig.MERCURY_PRESETS).distinct()
+                        }
+                        val geminiOptions = remember(liveGeminiModels) {
+                            (liveGeminiModels.filter { !it.contains("tts", ignoreCase = true) } + AiModelConfig.GEMINI_PRESETS).distinct()
+                        }
+                        val ttsOptions = remember(liveGeminiModels) {
+                            (liveGeminiModels.filter { it.contains("tts", ignoreCase = true) } + AiModelConfig.GEMINI_TTS_PRESETS).distinct()
+                        }
                         val chatOptions = remember(liveGroqModels) {
                             (liveGroqModels.filter { AiModelConfig.isChatCapableModel(it) } + AiModelConfig.GROQ_CHAT_PRESETS)
                                 .distinct()
@@ -517,7 +651,7 @@ fun SettingsScreen(
                         SectionCard(
                             icon = Icons.Default.Memory,
                             title = "AI Models & Brain Routing",
-                            summary = "${settings.preferredBrain.label} • ${cfg.chatModel}"
+                            summary = "${settings.preferredBrain.label} • ${cfg.mindModel}"
                         ) {
                             Text("Preferred Routing", style = MaterialTheme.typography.titleSmall)
                             FlowRow(
@@ -540,22 +674,27 @@ fun SettingsScreen(
                                 horizontalArrangement = Arrangement.SpaceBetween,
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
-                                Text("Groq Live Model List", style = MaterialTheme.typography.titleSmall)
-                                OutlinedButton(
-                                    onClick = { onRefreshLiveGroqModels(groqInput) },
-                                    enabled = !liveModelsLoading,
-                                    modifier = Modifier
-                                        .minimumInteractiveComponentSize()
-                                        .testTag("load_live_groq_models_button")
-                                ) {
-                                    if (liveModelsLoading) {
-                                        CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp)
-                                        Spacer(Modifier.width(6.dp))
-                                    } else {
-                                        Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
-                                        Spacer(Modifier.width(6.dp))
+                                Text("Live Model Lists", style = MaterialTheme.typography.titleSmall)
+                                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                    OutlinedButton(
+                                        onClick = {
+                                            onRefreshAllLiveModels(inceptionInput, geminiInput, groqInput)
+                                        },
+                                        enabled = !liveModelsLoading,
+                                        modifier = Modifier
+                                            .minimumInteractiveComponentSize()
+                                            .testTag("load_live_groq_models_button")
+                                    ) {
+                                        if (liveModelsLoading) {
+                                            CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp)
+                                            Spacer(Modifier.width(6.dp))
+                                        } else {
+                                            Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
+                                            Spacer(Modifier.width(6.dp))
+                                        }
+                                        val totalLive = liveMercuryModels.size + liveGeminiModels.size + liveGroqModels.size
+                                        Text(if (totalLive == 0) "Load Live Models" else "Refresh ($totalLive)")
                                     }
-                                    Text(if (liveGroqModels.isEmpty()) "Load Live Models" else "Refresh (${liveGroqModels.size})")
                                 }
                             }
                             if (!liveModelsError.isNullOrBlank()) {
@@ -567,7 +706,92 @@ fun SettingsScreen(
                             }
 
                             ModelSelectorField(
-                                label = "Groq Chat & Tools Model",
+                                label = "MIND (Inception Mercury)",
+                                value = mindModelInput,
+                                options = mindOptions,
+                                onValueChange = {
+                                    mindModelInput = it
+                                    modelsSavedNotice = false
+                                },
+                                onSelectOption = {
+                                    mindModelInput = it
+                                    onSaveModelConfig(buildEditedConfig())
+                                    modelsSavedNotice = true
+                                },
+                                onTestRole = {
+                                    onTestSingleRole(AiRole.MIND, buildEditedConfig(), inceptionInput, geminiInput, groqInput)
+                                },
+                                testButtonTag = "test_role_mind_btn",
+                                testTag = "settings_mind_model_input",
+                                dropdownTag = "settings_mind_model_dropdown"
+                            )
+
+                            ModelSelectorField(
+                                label = "Vision & Search (Gemini Flash)",
+                                value = geminiModelInput,
+                                options = geminiOptions,
+                                onValueChange = {
+                                    geminiModelInput = it
+                                    modelsSavedNotice = false
+                                },
+                                onSelectOption = {
+                                    geminiModelInput = it
+                                    onGeminiModelChange(it)
+                                    onSaveModelConfig(buildEditedConfig())
+                                    modelsSavedNotice = true
+                                },
+                                onTestRole = {
+                                    onTestSingleRole(AiRole.VISION_SEARCH, buildEditedConfig(), inceptionInput, geminiInput, groqInput)
+                                },
+                                testButtonTag = "test_role_vision_btn",
+                                testTag = "settings_gemini_model_input",
+                                dropdownTag = "settings_gemini_model_dropdown"
+                            )
+
+                            ModelSelectorField(
+                                label = "Speech-to-Text (Groq Whisper STT)",
+                                value = sttModelInput,
+                                options = sttOptions,
+                                onValueChange = {
+                                    sttModelInput = it
+                                    modelsSavedNotice = false
+                                },
+                                onSelectOption = {
+                                    sttModelInput = it
+                                    onSaveModelConfig(buildEditedConfig())
+                                    modelsSavedNotice = true
+                                },
+                                onTestRole = {
+                                    onTestSingleRole(AiRole.STT, buildEditedConfig(), inceptionInput, geminiInput, groqInput)
+                                },
+                                testButtonTag = "test_role_stt_btn",
+                                testTag = "settings_stt_model_input",
+                                dropdownTag = "settings_stt_model_dropdown"
+                            )
+
+                            ModelSelectorField(
+                                label = "Voice TTS (Gemini TTS)",
+                                value = ttsModelInput,
+                                options = ttsOptions,
+                                onValueChange = {
+                                    ttsModelInput = it
+                                    modelsSavedNotice = false
+                                },
+                                onSelectOption = {
+                                    ttsModelInput = it
+                                    onSaveModelConfig(buildEditedConfig())
+                                    modelsSavedNotice = true
+                                },
+                                onTestRole = {
+                                    onTestSingleRole(AiRole.TTS, buildEditedConfig(), inceptionInput, geminiInput, groqInput)
+                                },
+                                testButtonTag = "test_role_tts_btn",
+                                testTag = "settings_tts_model_input",
+                                dropdownTag = "settings_tts_model_dropdown"
+                            )
+
+                            ModelSelectorField(
+                                label = "Fallback Chat & Tools (Groq)",
                                 value = chatModelInput,
                                 options = chatOptions,
                                 onValueChange = {
@@ -577,11 +801,13 @@ fun SettingsScreen(
                                 onSelectOption = {
                                     chatModelInput = it
                                     onGroqModelChange(it)
-                                    onSaveModelConfig(
-                                        AiModelConfig(chatModelInput, fastModelInput, sttModelInput, geminiModelInput)
-                                    )
+                                    onSaveModelConfig(buildEditedConfig())
                                     modelsSavedNotice = true
                                 },
+                                onTestRole = {
+                                    onTestSingleRole(AiRole.FALLBACK_CHAT, buildEditedConfig(), inceptionInput, geminiInput, groqInput)
+                                },
+                                testButtonTag = "test_role_fallback_btn",
                                 testTag = "settings_chat_model_input",
                                 dropdownTag = "settings_chat_model_dropdown"
                             )
@@ -596,53 +822,39 @@ fun SettingsScreen(
                                 },
                                 onSelectOption = {
                                     fastModelInput = it
-                                    onSaveModelConfig(
-                                        AiModelConfig(chatModelInput, fastModelInput, sttModelInput, geminiModelInput)
-                                    )
+                                    onSaveModelConfig(buildEditedConfig())
                                     modelsSavedNotice = true
                                 },
                                 testTag = "settings_fast_model_input",
                                 dropdownTag = "settings_fast_model_dropdown"
                             )
 
-                            ModelSelectorField(
-                                label = "Groq Speech-to-Text (STT) Model",
-                                value = sttModelInput,
-                                options = sttOptions,
-                                onValueChange = {
-                                    sttModelInput = it
-                                    modelsSavedNotice = false
-                                },
-                                onSelectOption = {
-                                    sttModelInput = it
-                                    onSaveModelConfig(
-                                        AiModelConfig(chatModelInput, fastModelInput, sttModelInput, geminiModelInput)
-                                    )
-                                    modelsSavedNotice = true
-                                },
-                                testTag = "settings_stt_model_input",
-                                dropdownTag = "settings_stt_model_dropdown"
-                            )
-
-                            ModelSelectorField(
-                                label = "Gemini Flash / Vision Model",
-                                value = geminiModelInput,
-                                options = AiModelConfig.GEMINI_PRESETS,
-                                onValueChange = {
-                                    geminiModelInput = it
-                                    modelsSavedNotice = false
-                                },
-                                onSelectOption = {
-                                    geminiModelInput = it
-                                    onGeminiModelChange(it)
-                                    onSaveModelConfig(
-                                        AiModelConfig(chatModelInput, fastModelInput, sttModelInput, geminiModelInput)
-                                    )
-                                    modelsSavedNotice = true
-                                },
-                                testTag = "settings_gemini_model_input",
-                                dropdownTag = "settings_gemini_model_dropdown"
-                            )
+                            TextButton(onClick = { showAdvancedBaseUrls = !showAdvancedBaseUrls }) {
+                                Text(if (showAdvancedBaseUrls) "Hide Provider Base URLs" else "Edit Provider Base URLs")
+                            }
+                            if (showAdvancedBaseUrls) {
+                                OutlinedTextField(
+                                    value = inceptionBaseUrlInput,
+                                    onValueChange = { inceptionBaseUrlInput = it; modelsSavedNotice = false },
+                                    label = { Text("Inception Base URL") },
+                                    singleLine = true,
+                                    modifier = Modifier.fillMaxWidth()
+                                )
+                                OutlinedTextField(
+                                    value = geminiBaseUrlInput,
+                                    onValueChange = { geminiBaseUrlInput = it; modelsSavedNotice = false },
+                                    label = { Text("Gemini Base URL") },
+                                    singleLine = true,
+                                    modifier = Modifier.fillMaxWidth()
+                                )
+                                OutlinedTextField(
+                                    value = groqBaseUrlInput,
+                                    onValueChange = { groqBaseUrlInput = it; modelsSavedNotice = false },
+                                    label = { Text("Groq Base URL") },
+                                    singleLine = true,
+                                    modifier = Modifier.fillMaxWidth()
+                                )
+                            }
 
                             FlowRow(
                                 horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -651,12 +863,7 @@ fun SettingsScreen(
                             ) {
                                 Button(
                                     onClick = {
-                                        val updated = AiModelConfig(
-                                            chatModel = chatModelInput,
-                                            fastModel = fastModelInput,
-                                            sttModel = sttModelInput,
-                                            geminiModel = geminiModelInput
-                                        ).normalized()
+                                        val updated = buildEditedConfig()
                                         onGroqModelChange(updated.chatModel)
                                         onGeminiModelChange(updated.geminiModel)
                                         onSaveModelConfig(updated)
@@ -671,13 +878,7 @@ fun SettingsScreen(
 
                                 OutlinedButton(
                                     onClick = {
-                                        val current = AiModelConfig(
-                                            chatModel = chatModelInput,
-                                            fastModel = fastModelInput,
-                                            sttModel = sttModelInput,
-                                            geminiModel = geminiModelInput
-                                        ).normalized()
-                                        onTestAllModels(current, groqInput, geminiInput)
+                                        onTestAllRoles(buildEditedConfig(), inceptionInput, geminiInput, groqInput)
                                     },
                                     enabled = !modelsTestState.isTesting,
                                     modifier = Modifier
@@ -689,6 +890,15 @@ fun SettingsScreen(
                                         Spacer(Modifier.width(6.dp))
                                     }
                                     Text("Test models")
+                                }
+
+                                OutlinedButton(
+                                    onClick = onOpenCompareModels,
+                                    modifier = Modifier
+                                        .minimumInteractiveComponentSize()
+                                        .testTag("open_compare_models_btn")
+                                ) {
+                                    Text("Compare Models (30)")
                                 }
 
                                 TextButton(
@@ -751,7 +961,7 @@ fun SettingsScreen(
 
                             SettingsSwitchRow(
                                 title = "Auto-Fallback on Error / Rate Limit",
-                                subtitle = "Agar Groq ya Gemini fail ho toh doosre brain par switch kare.",
+                                subtitle = "Agar primary brain fail ho toh next brain (Mercury -> Gemini -> Groq) par switch kare.",
                                 checked = settings.autoFallbackEnabled,
                                 onCheckedChange = onAutoFallbackChange
                             )
@@ -800,6 +1010,24 @@ fun SettingsScreen(
                                 )
                             }
 
+                            SettingsSwitchRow(
+                                title = "Battery-Saver Wake Duty Cycle",
+                                subtitle = "Quiet rooms mein audio polling thoda throttle karta hai.",
+                                checked = settings.wakeWordBatterySaver,
+                                onCheckedChange = onWakeBatterySaverToggle,
+                                testTag = "wake_battery_saver_settings_switch"
+                            )
+
+                            OutlinedButton(
+                                onClick = onOpenWakeLab,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .minimumInteractiveComponentSize()
+                                    .testTag("open_wake_lab_btn")
+                            ) {
+                                Text("Open Wake Word & Mic Lab")
+                            }
+
                             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
 
                             Text("Default Language", style = MaterialTheme.typography.titleSmall)
@@ -817,10 +1045,72 @@ fun SettingsScreen(
 
                             SettingsSwitchRow(
                                 title = "Speak Replies Aloud (TTS)",
-                                subtitle = "Baby jawab bol kar sunayegi (matched language).",
+                                subtitle = "Short replies Android TTS se aur lambi replies Gemini TTS se (1.5s fallback).",
                                 checked = settings.ttsRepliesEnabled,
                                 onCheckedChange = onTtsRepliesToggle
                             )
+
+                            if (settings.ttsRepliesEnabled) {
+                                Text("TTS Tier Mode", style = MaterialTheme.typography.titleSmall)
+                                FlowRow(
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    com.example.core.security.TtsTierMode.entries.forEach { mode ->
+                                        FilterChip(
+                                            selected = settings.ttsTierMode == mode,
+                                            onClick = { onTtsTierModeChange(mode) },
+                                            label = { Text(mode.label) }
+                                        )
+                                    }
+                                }
+
+                                Text("Gemini Voice", style = MaterialTheme.typography.titleSmall)
+                                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    AiModelConfig.GEMINI_TTS_VOICES.forEach { voice ->
+                                        FilterChip(
+                                            selected = settings.ttsVoiceName == voice,
+                                            onClick = { onTtsVoiceNameChange(voice) },
+                                            label = { Text(voice) }
+                                        )
+                                    }
+                                }
+
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Text("Speech Speed", style = MaterialTheme.typography.titleSmall)
+                                    Text("${String.format("%.2f", settings.ttsSpeed)}x", style = MaterialTheme.typography.labelMedium)
+                                }
+                                Slider(
+                                    value = settings.ttsSpeed,
+                                    onValueChange = onTtsSpeedChange,
+                                    valueRange = 0.6f..1.8f
+                                )
+
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Text("Speech Volume", style = MaterialTheme.typography.titleSmall)
+                                    Text("${(settings.ttsVolume * 100).roundToInt()}%", style = MaterialTheme.typography.labelMedium)
+                                }
+                                Slider(
+                                    value = settings.ttsVolume,
+                                    onValueChange = onTtsVolumeChange,
+                                    valueRange = 0.1f..1.0f
+                                )
+
+                                OutlinedButton(
+                                    onClick = onPreviewVoice,
+                                    modifier = Modifier
+                                        .minimumInteractiveComponentSize()
+                                        .testTag("preview_tts_voice_btn")
+                                ) {
+                                    Text("Preview Voice")
+                                }
+                            }
 
                             SettingsSwitchRow(
                                 title = "Confirm Sensitive Actions",
@@ -1167,43 +1457,61 @@ private fun ModelSelectorField(
     options: List<String>,
     onValueChange: (String) -> Unit,
     onSelectOption: (String) -> Unit,
+    onTestRole: (() -> Unit)? = null,
+    testButtonTag: String? = null,
     testTag: String,
     dropdownTag: String
 ) {
     var expanded by remember { mutableStateOf(false) }
-    Box(modifier = Modifier.fillMaxWidth()) {
-        OutlinedTextField(
-            value = value,
-            onValueChange = onValueChange,
-            label = { Text(label) },
-            singleLine = true,
-            trailingIcon = {
-                IconButton(
-                    onClick = { expanded = true },
-                    modifier = Modifier.testTag(dropdownTag)
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.ArrowDropDown,
-                        contentDescription = "Choose $label"
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        Box(modifier = Modifier.weight(1f)) {
+            OutlinedTextField(
+                value = value,
+                onValueChange = onValueChange,
+                label = { Text(label) },
+                singleLine = true,
+                trailingIcon = {
+                    IconButton(
+                        onClick = { expanded = true },
+                        modifier = Modifier.testTag(dropdownTag)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.ArrowDropDown,
+                            contentDescription = "Choose $label"
+                        )
+                    }
+                },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag(testTag)
+            )
+            DropdownMenu(
+                expanded = expanded,
+                onDismissRequest = { expanded = false }
+            ) {
+                options.forEach { option ->
+                    DropdownMenuItem(
+                        text = { Text(option) },
+                        onClick = {
+                            expanded = false
+                            onSelectOption(option)
+                        }
                     )
                 }
-            },
-            modifier = Modifier
-                .fillMaxWidth()
-                .testTag(testTag)
-        )
-        DropdownMenu(
-            expanded = expanded,
-            onDismissRequest = { expanded = false }
-        ) {
-            options.forEach { option ->
-                DropdownMenuItem(
-                    text = { Text(option) },
-                    onClick = {
-                        expanded = false
-                        onSelectOption(option)
-                    }
-                )
+            }
+        }
+        if (onTestRole != null) {
+            OutlinedButton(
+                onClick = onTestRole,
+                modifier = Modifier
+                    .minimumInteractiveComponentSize()
+                    .let { if (testButtonTag != null) it.testTag(testButtonTag) else it }
+            ) {
+                Text("Test")
             }
         }
     }

@@ -63,15 +63,18 @@ fun isSystemReducedMotion(context: Context): Boolean {
 }
 
 object BabyHaptics {
-    fun tap(haptic: HapticFeedback) {
+    fun tap(haptic: HapticFeedback, enabled: Boolean = true) {
+        if (!enabled) return
         runCatching { haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove) }
     }
 
-    fun voiceStart(haptic: HapticFeedback) {
+    fun voiceStart(haptic: HapticFeedback, enabled: Boolean = true) {
+        if (!enabled) return
         runCatching { haptic.performHapticFeedback(HapticFeedbackType.LongPress) }
     }
 
-    fun voiceStop(haptic: HapticFeedback) {
+    fun voiceStop(haptic: HapticFeedback, enabled: Boolean = true) {
+        if (!enabled) return
         runCatching { haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove) }
     }
 }

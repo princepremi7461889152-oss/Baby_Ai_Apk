@@ -236,6 +236,15 @@ class BabyForegroundService : Service() {
                 beginVoiceCapture(source)
             }
         }
+
+        serviceScope.launch {
+            wakeWordDetector.pipelineState.collect { micState ->
+                if (micState == com.example.voice.MicPipelineState.MIC_BUSY) {
+                    floatingBubbleController.updateStatus("Mic busy...", orchestrator.state.value.isRunning)
+                }
+                updateNotification()
+            }
+        }
     }
 
     private fun startWakeWordLoop() {
@@ -260,8 +269,10 @@ class BabyForegroundService : Service() {
             acquireTransientWakeLock(60_000L)
             try {
                 wakeWordDetector.pauseForRecording()
-                ttsManager.speak("Haan bolo", "hinglish")
-                delay(650L)
+                if (source != "wake_word") {
+                    ttsManager.speak("Haan bolo", "hinglish")
+                    delay(650L)
+                }
 
                 val started = audioRecorderManager.startRecording(
                     maxDurationMs = 14_000L,
@@ -374,8 +385,10 @@ class BabyForegroundService : Service() {
             }
         }
 
+        val micState = wakeWordDetector.pipelineState.value
         val bodyText = when {
             exec.isRunning -> "Step ${exec.currentStep}/${exec.maxSteps}: ${exec.statusText}"
+            micState == com.example.voice.MicPipelineState.MIC_BUSY -> "Mic busy — auto retry chal raha hai"
             exec.queuedCount > 0 -> "${exec.queuedCount} task queued for unlock"
             autoReplyBanner != null -> "$autoReplyBanner • Say \"Hey Baby\" anytime"
             settings.wakeWordEnabled -> "Say \"Hey Baby\" or \"Baby\" anytime"

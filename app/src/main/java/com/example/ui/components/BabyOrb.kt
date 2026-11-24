@@ -34,9 +34,11 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.semantics.Role
@@ -44,6 +46,8 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import com.example.core.security.EmotionIntensity
+import com.example.ui.theme.BabyMood
 import com.example.ui.theme.BabyMotionTokens
 import com.example.ui.theme.BabyThemeTokens
 import com.example.ui.theme.rememberReducedMotionEnabled
@@ -63,19 +67,43 @@ fun BabyOrb(
     amplitude: Float = 0f,
     size: Dp = 64.dp,
     showIcon: Boolean = true,
+    mood: BabyMood = BabyMood.CALM,
+    faceModeEnabled: Boolean = false,
+    emotionIntensity: EmotionIntensity = EmotionIntensity.SUBTLE,
     onClick: (() -> Unit)? = null,
     contentDesc: String? = null,
     modifier: Modifier = Modifier
 ) {
     val reducedMotion = rememberReducedMotionEnabled()
     val ext = BabyThemeTokens.colors
+    val effectiveMood = if (emotionIntensity == EmotionIntensity.OFF) BabyMood.CALM else mood
+
+    val moodPrimary = when (effectiveMood) {
+        BabyMood.CALM -> ext.orbPrimary
+        BabyMood.HAPPY -> Color(0xFFFF9F43)
+        BabyMood.EXCITED -> Color(0xFFFF6B6B)
+        BabyMood.THINKING -> Color(0xFF6366F1)
+        BabyMood.EMPATHETIC -> Color(0xFFA78BFA)
+        BabyMood.CONCERNED -> Color(0xFFF59E0B)
+        BabyMood.ALERT -> Color(0xFFDC2626) // Steady warm crimson (no strobe/flash)
+    }
+
+    val moodSecondary = when (effectiveMood) {
+        BabyMood.CALM -> ext.orbSecondary
+        BabyMood.HAPPY -> Color(0xFF2DD4BF)
+        BabyMood.EXCITED -> Color(0xFFFBBF24)
+        BabyMood.THINKING -> ext.orbSecondary
+        BabyMood.EMPATHETIC -> Color(0xFF38BDF8)
+        BabyMood.CONCERNED -> Color(0xFFFB7185)
+        BabyMood.ALERT -> Color(0xFFF59E0B)
+    }
 
     val primaryColor by animateColorAsState(
         targetValue = when (state) {
-            BabyOrbState.IDLE -> ext.orbPrimary
-            BabyOrbState.LISTENING -> ext.orbPrimary
-            BabyOrbState.THINKING -> ext.orbSecondary
-            BabyOrbState.SPEAKING -> ext.success
+            BabyOrbState.IDLE -> moodPrimary
+            BabyOrbState.LISTENING -> if (effectiveMood == BabyMood.ALERT) moodPrimary else ext.orbPrimary
+            BabyOrbState.THINKING -> moodSecondary
+            BabyOrbState.SPEAKING -> if (effectiveMood == BabyMood.CALM) ext.success else moodPrimary
             BabyOrbState.ERROR -> ext.orbError
         },
         animationSpec = BabyMotionTokens.standardTween(reducedMotion),
@@ -83,10 +111,10 @@ fun BabyOrb(
     )
     val secondaryColor by animateColorAsState(
         targetValue = when (state) {
-            BabyOrbState.IDLE -> ext.orbSecondary
-            BabyOrbState.LISTENING -> ext.orbSecondary
-            BabyOrbState.THINKING -> ext.orbPrimary
-            BabyOrbState.SPEAKING -> ext.orbSecondary
+            BabyOrbState.IDLE -> moodSecondary
+            BabyOrbState.LISTENING -> moodSecondary
+            BabyOrbState.THINKING -> moodPrimary
+            BabyOrbState.SPEAKING -> moodSecondary
             BabyOrbState.ERROR -> MaterialTheme.colorScheme.errorContainer
         },
         animationSpec = BabyMotionTokens.standardTween(reducedMotion),
@@ -96,21 +124,27 @@ fun BabyOrb(
     val springAmplitude by animateFloatAsState(
         targetValue = when (state) {
             BabyOrbState.LISTENING -> amplitude.coerceIn(0.08f, 1f)
-            BabyOrbState.SPEAKING -> 0.45f
+            BabyOrbState.SPEAKING -> if (effectiveMood == BabyMood.EXCITED) 0.56f else 0.45f
             BabyOrbState.THINKING -> 0.28f
             BabyOrbState.ERROR -> 0.15f
-            BabyOrbState.IDLE -> 0.05f
+            BabyOrbState.IDLE -> if (effectiveMood == BabyMood.EXCITED) 0.16f else 0.05f
         },
         animationSpec = BabyMotionTokens.orbSpring(reducedMotion),
         label = "orbSpringAmp"
     )
 
     val infinite = rememberInfiniteTransition(label = "orbInfinite")
+    val breathDuration = when {
+        reducedMotion -> 12000
+        effectiveMood == BabyMood.ALERT -> 3200 // Steady calm glow for safety, never rapid flash
+        emotionIntensity == EmotionIntensity.EXPRESSIVE && effectiveMood == BabyMood.EXCITED -> 1600
+        else -> 2400
+    }
     val breath by infinite.animateFloat(
         initialValue = 0f,
         targetValue = 1f,
         animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = if (reducedMotion) 12000 else 2400),
+            animation = tween(durationMillis = breathDuration),
             repeatMode = RepeatMode.Reverse
         ),
         label = "orbBreath"
@@ -125,7 +159,8 @@ fun BabyOrb(
         label = "orbSpin"
     )
 
-    val activePulse = if (reducedMotion) 0f else breath
+    val activePulse = if (reducedMotion || effectiveMood == BabyMood.ALERT) 0f else breath
+    val drawFace = faceModeEnabled && size >= 64.dp && state != BabyOrbState.ERROR
 
     val baseModifier = modifier
         .size(size)
@@ -186,7 +221,7 @@ fun BabyOrb(
             // Specular depth highlight
             drawCircle(
                 brush = Brush.radialGradient(
-                    colors = listOf(Color.White.copy(alpha = 0.28f), Color.Transparent),
+                    colors = listOf(Color.White.copy(alpha = 0.26f), Color.Transparent),
                     center = Offset(center.x - coreRadius * 0.32f, center.y - coreRadius * 0.35f),
                     radius = coreRadius * 0.65f
                 ),
@@ -194,7 +229,10 @@ fun BabyOrb(
                 center = center
             )
 
-            if ((state == BabyOrbState.THINKING || state == BabyOrbState.LISTENING || state == BabyOrbState.SPEAKING) && !reducedMotion) {
+            if ((state == BabyOrbState.THINKING || state == BabyOrbState.LISTENING || state == BabyOrbState.SPEAKING) &&
+                !reducedMotion &&
+                effectiveMood != BabyMood.ALERT
+            ) {
                 rotate(degrees = rotation, pivot = center) {
                     val ringRadius = coreRadius + (radius - coreRadius) * 0.45f
                     drawArc(
@@ -209,14 +247,24 @@ fun BabyOrb(
                         sweepAngle = 220f,
                         useCenter = false,
                         topLeft = Offset(center.x - ringRadius, center.y - ringRadius),
-                        size = androidx.compose.ui.geometry.Size(ringRadius * 2f, ringRadius * 2f),
+                        size = Size(ringRadius * 2f, ringRadius * 2f),
                         style = Stroke(width = (radius * 0.06f).coerceAtLeast(2.5f), cap = StrokeCap.Round)
                     )
                 }
             }
+
+            if (drawFace) {
+                drawMinimalOrbFace(
+                    center = center,
+                    coreRadius = coreRadius,
+                    state = state,
+                    mood = effectiveMood,
+                    breath = activePulse
+                )
+            }
         }
 
-        if (showIcon) {
+        if (showIcon && !drawFace) {
             val icon = when (state) {
                 BabyOrbState.IDLE -> Icons.Default.Mic
                 BabyOrbState.LISTENING -> Icons.Default.GraphicEq
@@ -229,6 +277,87 @@ fun BabyOrb(
                 contentDescription = null,
                 tint = Color.White,
                 modifier = Modifier.size((size.value * 0.36f).dp)
+            )
+        }
+    }
+}
+
+private fun DrawScope.drawMinimalOrbFace(
+    center: Offset,
+    coreRadius: Float,
+    state: BabyOrbState,
+    mood: BabyMood,
+    breath: Float
+) {
+    val eyeOffsetX = coreRadius * 0.28f
+    val eyeOffsetY = -coreRadius * 0.12f
+    val glanceX = if (state == BabyOrbState.THINKING || mood == BabyMood.THINKING) {
+        (breath - 0.5f) * coreRadius * 0.14f
+    } else 0f
+    val eyeRadius = (coreRadius * 0.085f).coerceAtLeast(2.4f)
+    val strokeW = (coreRadius * 0.075f).coerceAtLeast(2.2f)
+    val faceColor = Color.White.copy(alpha = 0.94f)
+
+    // Eyes
+    if (mood == BabyMood.HAPPY || mood == BabyMood.EXCITED) {
+        // Gentle happy curved eyes or bright eyes
+        drawCircle(faceColor, radius = eyeRadius, center = Offset(center.x - eyeOffsetX + glanceX, center.y + eyeOffsetY))
+        drawCircle(faceColor, radius = eyeRadius, center = Offset(center.x + eyeOffsetX + glanceX, center.y + eyeOffsetY))
+    } else if (mood == BabyMood.EMPATHETIC) {
+        // Soft reassuring oval eyes
+        drawCircle(faceColor, radius = eyeRadius * 0.95f, center = Offset(center.x - eyeOffsetX, center.y + eyeOffsetY))
+        drawCircle(faceColor, radius = eyeRadius * 0.95f, center = Offset(center.x + eyeOffsetX, center.y + eyeOffsetY))
+    } else {
+        drawCircle(faceColor, radius = eyeRadius, center = Offset(center.x - eyeOffsetX + glanceX, center.y + eyeOffsetY))
+        drawCircle(faceColor, radius = eyeRadius, center = Offset(center.x + eyeOffsetX + glanceX, center.y + eyeOffsetY))
+    }
+
+    // Mouth arc
+    val mouthWidth = coreRadius * 0.44f
+    val mouthY = center.y + coreRadius * 0.22f
+    when {
+        state == BabyOrbState.SPEAKING -> {
+            val openH = (coreRadius * (0.14f + breath * 0.08f)).coerceAtLeast(3f)
+            drawArc(
+                color = faceColor,
+                startAngle = 0f,
+                sweepAngle = 180f,
+                useCenter = false,
+                topLeft = Offset(center.x - mouthWidth / 2f, mouthY - openH / 2f),
+                size = Size(mouthWidth, openH),
+                style = Stroke(width = strokeW, cap = StrokeCap.Round)
+            )
+        }
+        mood == BabyMood.HAPPY || mood == BabyMood.EXCITED || mood == BabyMood.EMPATHETIC -> {
+            drawArc(
+                color = faceColor,
+                startAngle = 12f,
+                sweepAngle = 156f,
+                useCenter = false,
+                topLeft = Offset(center.x - mouthWidth / 2f, mouthY - coreRadius * 0.14f),
+                size = Size(mouthWidth, coreRadius * 0.28f),
+                style = Stroke(width = strokeW, cap = StrokeCap.Round)
+            )
+        }
+        mood == BabyMood.CONCERNED || mood == BabyMood.ALERT -> {
+            drawLine(
+                color = faceColor,
+                start = Offset(center.x - mouthWidth * 0.35f, mouthY),
+                end = Offset(center.x + mouthWidth * 0.35f, mouthY),
+                strokeWidth = strokeW,
+                cap = StrokeCap.Round
+            )
+        }
+        else -> {
+            // Calm gentle smile
+            drawArc(
+                color = faceColor,
+                startAngle = 20f,
+                sweepAngle = 140f,
+                useCenter = false,
+                topLeft = Offset(center.x - mouthWidth * 0.45f, mouthY - coreRadius * 0.09f),
+                size = Size(mouthWidth * 0.9f, coreRadius * 0.18f),
+                style = Stroke(width = strokeW, cap = StrokeCap.Round)
             )
         }
     }

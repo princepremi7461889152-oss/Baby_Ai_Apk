@@ -9,10 +9,13 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.core.security.AutoReplyMode
 import com.example.core.security.BabyPersonality
+import com.example.core.security.CallAssistantMode
 import com.example.core.security.SecureKeyStore
+import com.example.core.security.UnknownCallerPolicy
 import com.example.data.local.ActionLogEntity
 import com.example.data.local.AllowedAppEntity
 import com.example.data.local.AutoReplyContactRuleEntity
+import com.example.data.local.CallScreeningLogEntity
 import com.example.data.local.EmergencyContactEntity
 import com.example.data.local.MacroEntity
 import com.example.data.local.MemoryEntity
@@ -22,6 +25,7 @@ import com.example.data.local.SavedPlaceEntity
 import com.example.domain.ai.AgentOrchestrator
 import com.example.features.actionlog.ActionLogRepository
 import com.example.features.autoreply.AutoReplyManager
+import com.example.features.calls.CallAssistantManager
 import com.example.features.macros.MacroManager
 import com.example.features.macros.MacroStep
 import com.example.features.memory.MemoryManager
@@ -63,7 +67,8 @@ class BabyExtrasViewModel @Inject constructor(
     private val macroManager: MacroManager,
     private val autoReplyManager: AutoReplyManager,
     private val notificationSummaryManager: NotificationSummaryManager,
-    private val safetyManager: SafetyManager
+    private val safetyManager: SafetyManager,
+    private val callAssistantManager: CallAssistantManager
 ) : ViewModel() {
 
     init {
@@ -130,6 +135,9 @@ class BabyExtrasViewModel @Inject constructor(
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     val emergencyCountdown: StateFlow<EmergencyCountdownState> = safetyManager.emergencyCountdown
+
+    val callScreeningLogs: StateFlow<List<CallScreeningLogEntity>> = callAssistantManager.screeningLogs
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     private val _statusToast = MutableStateFlow<String?>(null)
     val statusToast: StateFlow<String?> = _statusToast.asStateFlow()
@@ -419,6 +427,10 @@ class BabyExtrasViewModel @Inject constructor(
         keyStore.setPersonality(personality)
     }
 
+    fun setEmotionIntensity(intensity: com.example.core.security.EmotionIntensity) {
+        keyStore.setEmotionIntensity(intensity)
+    }
+
     fun addAllowedApp(appNameOrPackage: String) {
         val clean = appNameOrPackage.trim()
         if (clean.isBlank()) return
@@ -456,5 +468,28 @@ class BabyExtrasViewModel @Inject constructor(
 
     fun cancelEmergencyCountdown() {
         safetyManager.cancelEmergencyCountdown("Cancelled from SOS screen button")
+    }
+
+    // ---- Call Assistant ----
+    fun setCallAssistantMode(mode: CallAssistantMode) {
+        keyStore.setCallAssistantMode(mode)
+        _statusToast.value = "Call Assistant mode: ${mode.label}"
+    }
+
+    fun setUnknownCallerPolicy(policy: UnknownCallerPolicy) {
+        keyStore.setUnknownCallerPolicy(policy)
+        _statusToast.value = "Unknown caller policy: ${policy.label}"
+    }
+
+    fun setCallAssistantReplyTemplate(template: String) {
+        keyStore.setCallAssistantReplyTemplate(template)
+        _statusToast.value = "Call reply template saved"
+    }
+
+    fun clearCallScreeningLogs() {
+        viewModelScope.launch {
+            callAssistantManager.clearLogs()
+            _statusToast.value = "Call screening logs cleared"
+        }
     }
 }

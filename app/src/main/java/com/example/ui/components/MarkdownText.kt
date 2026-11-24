@@ -19,11 +19,15 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.LinkAnnotation
 import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.TextLinkStyles
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextDecoration
+import androidx.compose.ui.text.withLink
 import androidx.compose.ui.unit.dp
 import com.example.ui.theme.NotoSansDevanagariFamily
 
@@ -38,6 +42,7 @@ fun BabyMarkdownText(
     val blocks = remember(markdown) { parseMarkdownBlocks(markdown) }
     val codeBg = MaterialTheme.colorScheme.surface.copy(alpha = 0.72f)
     val inlineCodeBg = MaterialTheme.colorScheme.outline.copy(alpha = 0.25f)
+    val linkColor = MaterialTheme.colorScheme.primary
 
     val content: @Composable () -> Unit = {
         Column(
@@ -62,7 +67,7 @@ fun BabyMarkdownText(
                     }
                     is MdBlock.Heading -> {
                         Text(
-                            text = parseInlineMarkdown(block.text, inlineCodeBg),
+                            text = parseInlineMarkdown(block.text, inlineCodeBg, linkColor),
                             style = when (block.level) {
                                 1 -> MaterialTheme.typography.titleLarge
                                 2 -> MaterialTheme.typography.titleMedium
@@ -80,7 +85,7 @@ fun BabyMarkdownText(
                             )
                             Spacer(Modifier.width(6.dp))
                             Text(
-                                text = parseInlineMarkdown(block.text, inlineCodeBg),
+                                text = parseInlineMarkdown(block.text, inlineCodeBg, linkColor),
                                 style = style,
                                 color = color,
                                 modifier = Modifier.weight(1f)
@@ -89,7 +94,7 @@ fun BabyMarkdownText(
                     }
                     is MdBlock.Paragraph -> {
                         Text(
-                            text = parseInlineMarkdown(block.text, inlineCodeBg),
+                            text = parseInlineMarkdown(block.text, inlineCodeBg, linkColor),
                             style = style,
                             color = color
                         )
@@ -182,11 +187,39 @@ private fun parseMarkdownBlocks(raw: String): List<MdBlock> {
     return if (out.isEmpty()) listOf(MdBlock.Paragraph(raw)) else out
 }
 
-private fun parseInlineMarkdown(input: String, codeBg: Color): AnnotatedString {
+private fun parseInlineMarkdown(input: String, codeBg: Color, linkColor: Color): AnnotatedString {
     return buildAnnotatedString {
         var i = 0
         while (i < input.length) {
             when {
+                input[i] == '[' -> {
+                    val closeBracket = input.indexOf(']', i + 1)
+                    if (closeBracket > i + 1 && closeBracket + 1 < input.length && input[closeBracket + 1] == '(') {
+                        val closeParen = input.indexOf(')', closeBracket + 2)
+                        val label = input.substring(i + 1, closeBracket)
+                        val url = if (closeParen > closeBracket + 2) input.substring(closeBracket + 2, closeParen).trim() else ""
+                        if (closeParen > closeBracket + 2 && (url.startsWith("https://") || url.startsWith("http://"))) {
+                            withLink(
+                                LinkAnnotation.Url(
+                                    url = url,
+                                    styles = TextLinkStyles(
+                                        style = SpanStyle(
+                                            color = linkColor,
+                                            textDecoration = TextDecoration.Underline,
+                                            fontWeight = FontWeight.Medium
+                                        )
+                                    )
+                                )
+                            ) {
+                                append(label)
+                            }
+                            i = closeParen + 1
+                            continue
+                        }
+                    }
+                    append('[')
+                    i++
+                }
                 input.startsWith("**", i) -> {
                     val end = input.indexOf("**", i + 2)
                     if (end > i + 2) {

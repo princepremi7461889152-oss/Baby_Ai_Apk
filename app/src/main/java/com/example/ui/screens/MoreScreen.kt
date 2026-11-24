@@ -24,6 +24,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Alarm
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Bolt
+import androidx.compose.material.icons.filled.Call
 import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.Download
@@ -90,7 +91,12 @@ fun MoreScreen(
     onOpenMemory: () -> Unit,
     onExportActionLogsShare: () -> Unit,
     onExportActionLogsToUri: (Uri) -> Unit,
-    onReopenOnboarding: () -> Unit
+    onReopenOnboarding: () -> Unit,
+    onOpenCompareModels: () -> Unit = {},
+    onOpenLatencyDebug: () -> Unit = {},
+    onOpenWakeLab: () -> Unit = {},
+    onOpenRecipes: () -> Unit = {},
+    onOpenCallAssistant: () -> Unit = {}
 ) {
     val spacing = BabyThemeTokens.spacing
     val ext = BabyThemeTokens.colors
@@ -120,14 +126,29 @@ fun MoreScreen(
 
     val allSearchIndex = remember(settings, emergencyContactsCount, permGranted) {
         listOf(
-            GlobalSearchDestination("API Keys (Groq & Gemini)", "Encrypted keystore setup & live test", "api key groq gemini paste") {
+            GlobalSearchDestination("API Keys (Inception, Gemini & Groq)", "Encrypted keystore setup & live test", "api key inception mercury groq gemini paste") {
                 onOpenSettings("keys")
             },
             GlobalSearchDestination("Appearance & Theme", "Dark, Light, AMOLED black, Dynamic Color, sound cues", "theme dark light amoled dynamic color sound") {
                 onOpenSettings("appearance")
             },
-            GlobalSearchDestination("AI Brain Routing & Models", "Auto, Groq, Gemini, Llama, Whisper, fallback", "ai brain model routing llama whisper fallback") {
+            GlobalSearchDestination("AI Brain Routing & Models", "Mercury 3, Gemini 3.8 Flash, Whisper, TTS, fallback", "ai brain model routing mercury whisper tts fallback") {
                 onOpenSettings("ai")
+            },
+            GlobalSearchDestination("Compare AI Models (30 Commands)", "Hinglish benchmark across Mercury 3, Gemini, Groq", "compare benchmark 30 models latency accuracy") {
+                onOpenCompareModels()
+            },
+            GlobalSearchDestination("Speed Debug & App Aliases", "Latency breakdown (STT/LLM/Tool/TTS) & custom app aliases", "speed latency debug fast path app aliases fuzzy") {
+                onOpenLatencyDebug()
+            },
+            GlobalSearchDestination("Wake Word & Mic Lab", "Live RMS meter, wake score, battery saver & watchdog logs", "wake word mic lab rms watchdog battery pre roll") {
+                onOpenWakeLab()
+            },
+            GlobalSearchDestination("Search & Play Recipes", "10 editable app JSON recipes (YouTube, Spotify, Amazon, Maps...)", "search play recipe youtube spotify amazon maps instagram") {
+                onOpenRecipes()
+            },
+            GlobalSearchDestination("Call Assistant & Spam Shield", "Screen unknown calls, VIP & repeat-ring overrides, Level 2 opt-in", "call assistant screening spam scam vip repeat caller") {
+                onOpenCallAssistant()
             },
             GlobalSearchDestination("Wake Word & Voice", "\"Hey Baby\", \"Baby\", sensitivity, TTS, floating bubble", "wake word sensitivity voice tts bubble language") {
                 onOpenSettings("voice")
@@ -316,6 +337,61 @@ fun MoreScreen(
                             badgePositive = settings.hasAnyApiKey,
                             testTag = "more_open_settings",
                             onClick = { onOpenSettings("") }
+                        )
+                    }
+                    item {
+                        MoreRowCard(
+                            icon = Icons.Default.Bolt,
+                            title = "Compare AI Models",
+                            subtitle = "Run 30 Hinglish commands • Pass/Fail, Latency & Accuracy",
+                            badge = "Benchmark",
+                            badgePositive = true,
+                            testTag = "more_open_compare_models",
+                            onClick = onOpenCompareModels
+                        )
+                    }
+                    item {
+                        MoreRowCard(
+                            icon = Icons.Default.Bolt,
+                            title = "Speed Debug & App Aliases",
+                            subtitle = "Fast-path / LLM / TTS latency & Hinglish app aliases",
+                            badge = "Speed",
+                            badgePositive = true,
+                            testTag = "more_open_latency_debug",
+                            onClick = onOpenLatencyDebug
+                        )
+                    }
+                    item {
+                        MoreRowCard(
+                            icon = Icons.Default.AutoAwesome,
+                            title = "Wake Word & Mic Lab",
+                            subtitle = "Live RMS meter, wake confidence & watchdog diagnostics",
+                            badge = if (settings.wakeWordEnabled) "Active" else "Off",
+                            badgePositive = settings.wakeWordEnabled,
+                            testTag = "more_open_wake_lab",
+                            onClick = onOpenWakeLab
+                        )
+                    }
+                    item {
+                        MoreRowCard(
+                            icon = Icons.Default.Search,
+                            title = "Search & Play Recipes",
+                            subtitle = "10 editable app recipes (YouTube, Spotify, Amazon, Maps...)",
+                            badge = "10 Apps",
+                            badgePositive = true,
+                            testTag = "more_open_recipes",
+                            onClick = onOpenRecipes
+                        )
+                    }
+                    item {
+                        MoreRowCard(
+                            icon = Icons.Default.Call,
+                            title = "Call Assistant & Spam Shield",
+                            subtitle = "Unknown caller policy, VIP bypass, repeat-ring & scam filter",
+                            badge = if (settings.callAssistantEnabled) settings.callAssistantMode.label else "Off",
+                            badgePositive = settings.callAssistantEnabled,
+                            testTag = "more_open_call_assistant",
+                            onClick = onOpenCallAssistant
                         )
                     }
                     item {

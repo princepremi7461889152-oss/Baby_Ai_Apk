@@ -4,9 +4,10 @@ import com.squareup.moshi.JsonAdapter
 import org.json.JSONObject
 
 /**
- * Normalizes outputs from gpt-oss-120b, gpt-oss-20b, qwen3.6-27b, Llama, and Gemini models:
+ * Normalizes outputs from Mercury 3, Gemini 3.8 Flash, gpt-oss-120b, and qwen3.6-27b:
  * - Strips thinking/reasoning tags (<think>, <thinking>, <reasoning>, <thought>, Harmony channels)
  * - Safely parses tool_calls and inline <tool_call> blocks without crashing on malformed JSON
+ * - Detects malformed JSON tool arguments so AiRouter can re-ask once with a repair prompt
  */
 object AiResponseParser {
 
@@ -31,7 +32,6 @@ object AiResponseParser {
         if (raw.isNullOrBlank()) return null
         var text = raw.trim()
 
-        // GPT-OSS Harmony format: <|channel|>analysis<|message|>...<|end|><|start|>assistant<|channel|>final<|message|>Answer
         val finalMarker = "<|channel|>final<|message|>"
         val finalIdx = text.lastIndexOf(finalMarker, ignoreCase = true)
         if (finalIdx >= 0) {
@@ -47,6 +47,27 @@ object AiResponseParser {
         text = INLINE_TOOL_CALL_REGEX.replace(text, "")
 
         return text.trim().takeIf { it.isNotEmpty() }
+    }
+
+    /**
+     * Strips unclosed thinking tags in partial streaming chunks so live UI never flashes chain-of-thought.
+     */
+    fun stripReasoningForStreaming(rawAccumulated: String): String {
+        if (rawAccumulated.isBlank()) return ""
+        var text = rawAccumulated
+        val finalMarker = "<|channel|>final<|message|>"
+        val finalIdx = text.lastIndexOf(finalMarker, ignoreCase = true)
+        if (finalIdx >= 0) {
+            text = text.substring(finalIdx + finalMarker.length)
+        } else {
+            text = HARMONY_ANALYSIS_REGEX.replace(text, "")
+        }
+        text = THOUGHT_BLOCK_REGEX.replace(text, "")
+        text = BRACKET_THOUGHT_REGEX.replace(text, "")
+        text = UNCLOSED_THOUGHT_REGEX.replace(text, "")
+        text = INLINE_TOOL_CALL_REGEX.replace(text, "")
+        text = HARMONY_SPECIAL_TOKEN_REGEX.replace(text, " ")
+        return text.trimStart()
     }
 
     fun extractInlineToolCalls(
@@ -79,40 +100,28 @@ object AiResponseParser {
         return results
     }
 
+    fun hasMalformedToolJson(rawJson: String?): Boolean {
+        if (rawJson.isNullOrBlank()) return false
+        val cleaned = unwrapMarkdownAndEscapedString(rawJson)
+        if (cleaned.isBlank() || cleaned == "{}") return false
+        val candidate = extractBracedJson(cleaned) ?: return true
+        return runCatching {
+            JSONObject(candidate)
+            false
+        }.getOrDefault(true)
+    }
+
     fun parseToolArgsSafely(
         rawJson: String?,
         mapAdapter: JsonAdapter<Map<String, Any?>>
     ): Map<String, Any?> {
         if (rawJson.isNullOrBlank()) return emptyMap()
-        var cleaned = rawJson.trim()
-            .removePrefix("```json")
-            .removePrefix("```JSON")
-            .removePrefix("```")
-            .removeSuffix("```")
-            .trim()
-
-        // Handle double-encoded JSON strings sometimes returned by OpenAI-compatible endpoints
-        if (cleaned.startsWith("\"") && cleaned.endsWith("\"") && cleaned.length >= 2) {
-            val unwrapped = runCatching {
-                JSONObject("{\"v\":$cleaned}").optString("v", "")
-            }.getOrNull()
-            if (!unwrapped.isNullOrBlank()) {
-                cleaned = unwrapped.trim()
-            }
-        }
-
-        val jsonCandidate = if (cleaned.startsWith("{")) {
-            cleaned
-        } else {
-            val start = cleaned.indexOf('{')
-            val end = cleaned.lastIndexOf('}')
-            if (start >= 0 && end > start) cleaned.substring(start, end + 1) else return emptyMap()
-        }
+        val cleaned = unwrapMarkdownAndEscapedString(rawJson)
+        val jsonCandidate = extractBracedJson(cleaned) ?: return emptyMap()
 
         return runCatching {
             mapAdapter.fromJson(jsonCandidate).orEmpty()
         }.getOrElse {
-            // Fallback lenient parse with org.json if Moshi choked on trailing whitespace/comments
             runCatching {
                 val obj = JSONObject(jsonCandidate)
                 val map = linkedMapOf<String, Any?>()
@@ -125,5 +134,31 @@ object AiResponseParser {
                 map
             }.getOrDefault(emptyMap())
         }
+    }
+
+    private fun unwrapMarkdownAndEscapedString(rawJson: String): String {
+        var cleaned = rawJson.trim()
+            .removePrefix("```json")
+            .removePrefix("```JSON")
+            .removePrefix("```")
+            .removeSuffix("```")
+            .trim()
+
+        if (cleaned.startsWith("\"") && cleaned.endsWith("\"") && cleaned.length >= 2) {
+            val unwrapped = runCatching {
+                JSONObject("{\"v\":$cleaned}").optString("v", "")
+            }.getOrNull()
+            if (!unwrapped.isNullOrBlank()) {
+                cleaned = unwrapped.trim()
+            }
+        }
+        return cleaned
+    }
+
+    private fun extractBracedJson(cleaned: String): String? {
+        if (cleaned.startsWith("{")) return cleaned
+        val start = cleaned.indexOf('{')
+        val end = cleaned.lastIndexOf('}')
+        return if (start >= 0 && end > start) cleaned.substring(start, end + 1) else null
     }
 }

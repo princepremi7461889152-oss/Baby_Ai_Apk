@@ -135,7 +135,11 @@ class ClipboardAiManager @Inject constructor(
                 systemInstruction = GeminiContent(
                     parts = listOf(GeminiPart(text = "You are Baby, a friendly Hinglish phone assistant."))
                 ),
-                contents = listOf(GeminiContent(role = "user", parts = listOf(GeminiPart(text = prompt))))
+                contents = listOf(GeminiContent(role = "user", parts = listOf(GeminiPart(text = prompt)))),
+                generationConfig = com.example.data.remote.GeminiGenerationConfig(
+                    maxOutputTokens = 1024,
+                    thinkingConfig = com.example.data.remote.GeminiThinkingConfig("low")
+                )
             )
         ).getOrNull()?.candidates?.firstOrNull()?.content?.parts
             ?.let { AiResilienceHelper.extractGeminiVisibleText(it) }

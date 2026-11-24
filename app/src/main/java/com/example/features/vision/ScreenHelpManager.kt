@@ -146,7 +146,11 @@ class ScreenHelpManager @Inject constructor(
                     systemInstruction = GeminiContent(
                         parts = listOf(GeminiPart(text = "You are Baby. Answer concisely in friendly Hinglish."))
                     ),
-                    contents = listOf(GeminiContent(role = "user", parts = listOf(GeminiPart(text = userContent))))
+                    contents = listOf(GeminiContent(role = "user", parts = listOf(GeminiPart(text = userContent)))),
+                    generationConfig = com.example.data.remote.GeminiGenerationConfig(
+                        maxOutputTokens = 1024,
+                        thinkingConfig = com.example.data.remote.GeminiThinkingConfig("low")
+                    )
                 )
             ).getOrNull()?.candidates?.firstOrNull()?.content?.parts
                 ?.let { AiResilienceHelper.extractGeminiVisibleText(it) }
@@ -177,6 +181,10 @@ class ScreenHelpManager @Inject constructor(
                             GeminiPart(inlineData = GeminiInlineData("image/jpeg", jpegBase64))
                         )
                     )
+                ),
+                generationConfig = com.example.data.remote.GeminiGenerationConfig(
+                    maxOutputTokens = 1024,
+                    thinkingConfig = com.example.data.remote.GeminiThinkingConfig("low")
                 )
             )
         ).getOrNull()?.candidates?.firstOrNull()?.content?.parts

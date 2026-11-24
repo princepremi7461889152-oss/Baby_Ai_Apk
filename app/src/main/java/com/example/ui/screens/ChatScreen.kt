@@ -601,8 +601,10 @@ fun ChatScreen(
                         CompactGreetingAndQuickCommands(
                             quickCommands = uiPrefs.orderedQuickCommands,
                             permissions = permissions,
+                            settings = settings,
+                            activeMood = agentState.activeMood,
                             onSendCommand = { cmd ->
-                                BabyHaptics.tap(haptic)
+                                BabyHaptics.tap(haptic, settings.hapticsEnabled)
                                 onSendCommand(cmd)
                             },
                             onLongPressCommand = { item -> editingQuickCommand = item },
@@ -630,13 +632,39 @@ fun ChatScreen(
                                     msg = msg,
                                     isLatestAssistant = isLatestAssistant,
                                     reducedMotion = reducedMotion,
+                                    hapticsEnabled = settings.hapticsEnabled,
                                     onRegenerate = { onRegenerateMessage(msg.id) },
                                     onSpeak = { onSpeakMessage(msg.content) },
                                     modifier = Modifier.animateItem()
                                 )
                             }
 
-                            if (agentState.isRunning) {
+                            if (agentState.isRunning && agentState.streamingReply.isNotBlank()) {
+                                item(key = "streaming_bubble", contentType = "streaming") {
+                                    Surface(
+                                        color = MaterialTheme.colorScheme.surfaceVariant,
+                                        contentColor = MaterialTheme.colorScheme.onSurface,
+                                        shape = RoundedCornerShape(20.dp, 20.dp, 20.dp, 4.dp),
+                                        modifier = Modifier
+                                            .widthIn(max = 330.dp)
+                                            .testTag("streaming_assistant_bubble")
+                                    ) {
+                                        Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+                                            BabyMarkdownText(
+                                                markdown = agentState.streamingReply,
+                                                color = MaterialTheme.colorScheme.onSurface,
+                                                style = MaterialTheme.typography.bodyLarge
+                                            )
+                                            Spacer(Modifier.height(4.dp))
+                                            Text(
+                                                text = "Baby • typing...",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.secondary
+                                            )
+                                        }
+                                    }
+                                }
+                            } else if (agentState.isRunning) {
                                 item(key = "typing_indicator", contentType = "typing") {
                                     TypingIndicatorBubble(reducedMotion = reducedMotion)
                                 }
@@ -712,7 +740,7 @@ fun ChatScreen(
                             .pointerInput(permissions.recordAudio) {
                                 detectTapGestures(
                                     onTap = {
-                                        BabyHaptics.tap(haptic)
+                                        BabyHaptics.tap(haptic, settings.hapticsEnabled)
                                         if (permissions.recordAudio) {
                                             onToggleVoice()
                                         } else {
@@ -720,7 +748,7 @@ fun ChatScreen(
                                         }
                                     },
                                     onLongPress = {
-                                        BabyHaptics.voiceStart(haptic)
+                                        BabyHaptics.voiceStart(haptic, settings.hapticsEnabled)
                                         if (permissions.recordAudio) {
                                             onStartHoldToTalk()
                                         } else {
@@ -730,7 +758,7 @@ fun ChatScreen(
                                     onPress = {
                                         val released = tryAwaitRelease()
                                         if (released && isRecording) {
-                                            BabyHaptics.voiceStop(haptic)
+                                            BabyHaptics.voiceStop(haptic, settings.hapticsEnabled)
                                             onStopHoldToTalk()
                                         }
                                     }
@@ -742,10 +770,14 @@ fun ChatScreen(
                             state = when {
                                 isRecording -> BabyOrbState.LISTENING
                                 agentState.isRunning -> BabyOrbState.THINKING
+                                isTtsSpeaking -> BabyOrbState.SPEAKING
                                 else -> BabyOrbState.IDLE
                             },
                             amplitude = micAmplitude,
                             size = 52.dp,
+                            mood = agentState.activeMood,
+                            faceModeEnabled = settings.orbFaceModeEnabled,
+                            emotionIntensity = settings.emotionIntensity,
                             contentDesc = if (isRecording) "Stop voice recording" else "Tap to toggle mic or hold to talk"
                         )
                     }
@@ -799,7 +831,7 @@ fun ChatScreen(
                     IconButton(
                         onClick = {
                             if (inputText.isNotBlank()) {
-                                BabyHaptics.tap(haptic)
+                                BabyHaptics.tap(haptic, settings.hapticsEnabled)
                                 onSendCommand(inputText)
                                 inputText = ""
                             }
@@ -863,6 +895,8 @@ fun ChatScreen(
 private fun CompactGreetingAndQuickCommands(
     quickCommands: List<QuickCommandItem>,
     permissions: PermissionSnapshot,
+    settings: BabySettings,
+    activeMood: com.example.ui.theme.BabyMood,
     onSendCommand: (String) -> Unit,
     onLongPressCommand: (QuickCommandItem) -> Unit,
     onOpenPermissions: () -> Unit
@@ -893,8 +927,11 @@ private fun CompactGreetingAndQuickCommands(
                 ) {
                     BabyOrb(
                         state = BabyOrbState.IDLE,
-                        size = if (compactHeight) 44.dp else 56.dp,
+                        size = if (compactHeight) 44.dp else 64.dp,
                         showIcon = true,
+                        mood = activeMood,
+                        faceModeEnabled = settings.orbFaceModeEnabled,
+                        emotionIntensity = settings.emotionIntensity,
                         contentDesc = "Baby companion orb"
                     )
                     Column(
@@ -1020,6 +1057,7 @@ private fun ChatBubbleItem(
     msg: ChatMessageEntity,
     isLatestAssistant: Boolean,
     reducedMotion: Boolean,
+    hapticsEnabled: Boolean = true,
     onRegenerate: () -> Unit,
     onSpeak: () -> Unit,
     modifier: Modifier = Modifier
@@ -1052,7 +1090,7 @@ private fun ChatBubbleItem(
                             .combinedClickable(
                                 onClick = { showTimestamp = !showTimestamp },
                                 onLongClick = {
-                                    BabyHaptics.tap(haptic)
+                                    BabyHaptics.tap(haptic, hapticsEnabled)
                                     showMenu = true
                                 }
                             )
@@ -1219,7 +1257,7 @@ private fun ChatBubbleItem(
                             .combinedClickable(
                                 onClick = { showTimestamp = !showTimestamp },
                                 onLongClick = {
-                                    BabyHaptics.tap(haptic)
+                                    BabyHaptics.tap(haptic, hapticsEnabled)
                                     showMenu = true
                                 }
                             )

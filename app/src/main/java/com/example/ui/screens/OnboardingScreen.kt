@@ -45,6 +45,7 @@ import androidx.compose.material.icons.filled.NotificationsActive
 import androidx.compose.material.icons.filled.Phone
 import androidx.compose.material.icons.filled.RadioButtonUnchecked
 import androidx.compose.material.icons.filled.Verified
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -110,11 +111,14 @@ fun OnboardingScreen(
     oemGuide: OemAutostartGuide,
     permissionHelper: PermissionHelper?,
     initialStep: Int = 0,
+    inceptionKeyTest: KeyTestResult = KeyTestResult.Idle,
     groqKeyTest: KeyTestResult = KeyTestResult.Idle,
     geminiKeyTest: KeyTestResult = KeyTestResult.Idle,
     onStepChange: (Int) -> Unit = {},
     onRefreshPermissions: () -> Unit,
     onSaveKeys: (String, String) -> Unit,
+    onSaveAllKeys: (String, String, String) -> Unit = { _, gem, grq -> onSaveKeys(gem, grq) },
+    onTestInceptionKey: (String) -> Unit = {},
     onTestGroqKey: (String) -> Unit = {},
     onTestGeminiKey: (String) -> Unit = {},
     onWakeWordToggle: (Boolean) -> Unit = {},
@@ -126,6 +130,7 @@ fun OnboardingScreen(
 ) {
     val totalSteps = 5
     val step = initialStep.coerceIn(0, totalSteps - 1)
+    var inceptionInput by remember(settings.inceptionApiKey) { mutableStateOf(settings.inceptionApiKey) }
     var geminiInput by remember(settings.geminiApiKey) { mutableStateOf(settings.geminiApiKey) }
     var groqInput by remember(settings.groqApiKey) { mutableStateOf(settings.groqApiKey) }
     var sampleExecuted by remember { mutableStateOf(false) }
@@ -150,6 +155,7 @@ fun OnboardingScreen(
     val context = LocalContext.current
     val activity = context as? Activity
     var onboardingPermNotice by remember { mutableStateOf<String?>(null) }
+    var pendingPermRationale by remember { mutableStateOf<Triple<String, String, () -> Unit>?>(null) }
 
     val runtimePermLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -216,7 +222,7 @@ fun OnboardingScreen(
                     )
                     TextButton(
                         onClick = {
-                            onSaveKeys(geminiInput, groqInput)
+                            onSaveAllKeys(inceptionInput, geminiInput, groqInput)
                             onFinishOnboarding()
                         },
                         modifier = Modifier
@@ -283,10 +289,55 @@ fun OnboardingScreen(
                             1 -> {
                                 Text("Add Your AI Brain Keys", style = MaterialTheme.typography.headlineMedium)
                                 Text(
-                                    text = "Groq (fast tools + Whisper voice) aur Gemini (vision + deep tasks) paste karo. Keys device par Keystore encrypted rehti hain.",
+                                    text = "Inception Mercury (fast MIND), Gemini (vision & web search), aur Groq (Whisper voice + fallback) paste karo. Keys Keystore mein encrypted rehti hain.",
                                     style = MaterialTheme.typography.bodyMedium,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
+
+                                OutlinedTextField(
+                                    value = inceptionInput,
+                                    onValueChange = { inceptionInput = it },
+                                    label = { Text("Inception API Key (Mercury 3 MIND)") },
+                                    placeholder = { Text("Paste Inception key") },
+                                    visualTransformation = PasswordVisualTransformation(),
+                                    trailingIcon = {
+                                        IconButton(onClick = {
+                                            clipboard.getText()?.text?.trim()?.let { inceptionInput = it }
+                                        }) {
+                                            Icon(Icons.Default.ContentPaste, contentDescription = "Paste Inception key")
+                                        }
+                                    },
+                                    singleLine = true,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .testTag("onboarding_inception_key_input")
+                                )
+
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    OutlinedButton(
+                                        onClick = { onTestInceptionKey(inceptionInput) },
+                                        enabled = inceptionInput.isNotBlank() && inceptionKeyTest != KeyTestResult.Testing,
+                                        modifier = Modifier.testTag("test_inception_key_btn")
+                                    ) {
+                                        if (inceptionKeyTest == KeyTestResult.Testing) {
+                                            CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp)
+                                            Spacer(Modifier.width(6.dp))
+                                        }
+                                        Text("Test Mercury")
+                                    }
+                                    TextButton(onClick = {
+                                        runCatching { uriHandler.openUri("https://platform.inceptionlabs.ai/") }
+                                    }) {
+                                        Text("Get Inception Key")
+                                        Spacer(Modifier.width(4.dp))
+                                        Icon(Icons.AutoMirrored.Filled.OpenInNew, contentDescription = null, modifier = Modifier.size(14.dp))
+                                    }
+                                }
+                                KeyTestStatusLine(inceptionKeyTest)
 
                                 OutlinedTextField(
                                     value = groqInput,
@@ -421,7 +472,12 @@ fun OnboardingScreen(
                                     granted = permissions.recordAudio,
                                     buttonLabel = if (micPermanent) "Open App Settings" else "Grant Mic",
                                     testTag = "grant_mic_button",
-                                    onClick = { requestOnboardingRuntimePerms(arrayOf(Manifest.permission.RECORD_AUDIO)) }
+                                    onClick = {
+                                        pendingPermRationale = Triple(
+                                            "Microphone Permission",
+                                            "\"Hey Baby\" wake word aur voice commands sunne ke liye mic access zaroori hai. Audio sirf aapke wake word bolne par capture hota hai."
+                                        ) { requestOnboardingRuntimePerms(arrayOf(Manifest.permission.RECORD_AUDIO)) }
+                                    }
                                 )
                                 PermissionStepCard(
                                     icon = Icons.Default.NotificationsActive,
@@ -436,9 +492,15 @@ fun OnboardingScreen(
                                     testTag = "grant_notif_button",
                                     onClick = {
                                         if (!permissions.postNotifications && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                                            requestOnboardingRuntimePerms(arrayOf(Manifest.permission.POST_NOTIFICATIONS))
+                                            pendingPermRationale = Triple(
+                                                "Notification Bar Permission",
+                                                "Background listening notification aur quick Stop button dikhane ke liye zaroori hai."
+                                            ) { requestOnboardingRuntimePerms(arrayOf(Manifest.permission.POST_NOTIFICATIONS)) }
                                         } else {
-                                            permissionHelper?.openNotificationListenerSettings()
+                                            pendingPermRationale = Triple(
+                                                "Notification Reader Access",
+                                                "Notifications summarize karne aur Smart Auto-Reply bhejne ke liye. OTP/Bank notifications default se masked rehti hain."
+                                            ) { permissionHelper?.openNotificationListenerSettings() }
                                         }
                                     }
                                 )
@@ -449,7 +511,12 @@ fun OnboardingScreen(
                                     granted = permissions.accessibility,
                                     buttonLabel = "Open Accessibility",
                                     testTag = "open_accessibility_button",
-                                    onClick = { permissionHelper?.openAccessibilitySettings() }
+                                    onClick = {
+                                        pendingPermRationale = Triple(
+                                            "Accessibility Service",
+                                            "Apps open karne, screen read/scroll karne aur search-and-play automate karne ke liye. Banking/UPI passwords kabhi read nahi hote."
+                                        ) { permissionHelper?.openAccessibilitySettings() }
+                                    }
                                 )
                                 PermissionStepCard(
                                     icon = Icons.Default.Phone,
@@ -458,7 +525,12 @@ fun OnboardingScreen(
                                     granted = permissions.callPhone && permissions.readContacts && permissions.sendSms,
                                     buttonLabel = if (phonePermanent) "Open App Settings" else "Grant Phone Access",
                                     testTag = "grant_phone_button",
-                                    onClick = { requestOnboardingRuntimePerms(phonePerms) }
+                                    onClick = {
+                                        pendingPermRationale = Triple(
+                                            "Calls, Contacts & SMS",
+                                            "Voice se call lagane, contact name match karne, aur missed call/SOS SMS bhejne ke liye."
+                                        ) { requestOnboardingRuntimePerms(phonePerms) }
+                                    }
                                 )
                                 PermissionStepCard(
                                     icon = Icons.Default.BatteryChargingFull,
@@ -467,7 +539,12 @@ fun OnboardingScreen(
                                     granted = permissions.batteryOptimizationIgnored,
                                     buttonLabel = "Disable Optimization",
                                     testTag = "grant_battery_button",
-                                    onClick = { permissionHelper?.requestIgnoreBatteryOptimizations() }
+                                    onClick = {
+                                        pendingPermRationale = Triple(
+                                            "Ignore Battery Optimization",
+                                            "Screen off ya lock hone par OS Baby ki background service band na kare — isliye battery optimization exempt karna helpful hai."
+                                        ) { permissionHelper?.requestIgnoreBatteryOptimizations() }
+                                    }
                                 )
                                 PermissionStepCard(
                                     icon = Icons.Default.BubbleChart,
@@ -476,7 +553,12 @@ fun OnboardingScreen(
                                     granted = permissions.overlayBubble,
                                     buttonLabel = "Allow Overlay",
                                     testTag = "grant_overlay_button",
-                                    onClick = { permissionHelper?.openOverlaySettings() }
+                                    onClick = {
+                                        pendingPermRationale = Triple(
+                                            "Floating Bubble Overlay",
+                                            "Kisi bhi app ke upar Baby ka draggable mic bubble, Stop button aur quick menu dikhane ke liye."
+                                        ) { permissionHelper?.openOverlaySettings() }
+                                    }
                                 )
                             }
 
@@ -579,7 +661,9 @@ fun OnboardingScreen(
                                     ) {
                                         BabyOrb(
                                             state = if (sampleExecuted) BabyOrbState.SPEAKING else BabyOrbState.IDLE,
-                                            size = 96.dp
+                                            size = 96.dp,
+                                            faceModeEnabled = settings.orbFaceModeEnabled,
+                                            emotionIntensity = settings.emotionIntensity
                                         )
                                         Text(
                                             text = "Bolo: \"Hey Baby, flashlight on karo\"",
@@ -588,7 +672,7 @@ fun OnboardingScreen(
                                         Button(
                                             onClick = {
                                                 sampleExecuted = true
-                                                onSaveKeys(geminiInput, groqInput)
+                                                onSaveAllKeys(inceptionInput, geminiInput, groqInput)
                                                 onTrySampleCommand("Flashlight on karo")
                                                 onFinishOnboarding()
                                             },
@@ -632,12 +716,12 @@ fun OnboardingScreen(
                     Button(
                         onClick = {
                             if (step == 1) {
-                                onSaveKeys(geminiInput, groqInput)
+                                onSaveAllKeys(inceptionInput, geminiInput, groqInput)
                             }
                             if (step < totalSteps - 1) {
                                 onStepChange(step + 1)
                             } else {
-                                onSaveKeys(geminiInput, groqInput)
+                                onSaveAllKeys(inceptionInput, geminiInput, groqInput)
                                 onFinishOnboarding()
                             }
                         },
@@ -652,6 +736,27 @@ fun OnboardingScreen(
                 }
             }
         }
+    }
+
+    pendingPermRationale?.let { (title, body, proceed) ->
+        AlertDialog(
+            onDismissRequest = { pendingPermRationale = null },
+            title = { Text(title) },
+            text = { Text(body.withDevanagariFallback(), style = MaterialTheme.typography.bodyMedium) },
+            confirmButton = {
+                Button(onClick = {
+                    pendingPermRationale = null
+                    proceed()
+                }) {
+                    Text("Allow / Open")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingPermRationale = null }) {
+                    Text("Skip")
+                }
+            }
+        )
     }
 }
 

@@ -57,7 +57,9 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import com.example.R
+import com.example.core.security.EmotionIntensity
 import com.example.domain.ai.AgentExecutionState
+import com.example.ui.theme.BabyMood
 import com.example.ui.theme.BabyMotionTokens
 import com.example.ui.theme.BabyThemeTokens
 import com.example.ui.theme.rememberReducedMotionEnabled
@@ -73,6 +75,9 @@ fun FullScreenVoiceOverlay(
     agentState: AgentExecutionState,
     transcriptOrReply: String,
     isOffline: Boolean,
+    faceModeEnabled: Boolean = false,
+    emotionIntensity: EmotionIntensity = EmotionIntensity.SUBTLE,
+    hapticsEnabled: Boolean = true,
     onTapOrb: () -> Unit,
     onStopTask: () -> Unit,
     onDismiss: () -> Unit
@@ -175,8 +180,11 @@ fun FullScreenVoiceOverlay(
                                 color = MaterialTheme.colorScheme.surfaceVariant,
                                 shape = RoundedCornerShape(spacing.chipRadius)
                             ) {
+                                val moodBadge = if (emotionIntensity != EmotionIntensity.OFF && agentState.activeMood != BabyMood.CALM) {
+                                    " • ${agentState.activeMood.label}"
+                                } else ""
                                 Text(
-                                    text = agentState.activeBrain?.label ?: "Baby Voice Mode",
+                                    text = (agentState.activeBrain?.label ?: "Baby Voice Mode") + moodBadge,
                                     style = MaterialTheme.typography.labelMedium,
                                     color = MaterialTheme.colorScheme.secondary,
                                     modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
@@ -208,8 +216,13 @@ fun FullScreenVoiceOverlay(
                             state = orbState,
                             amplitude = micAmplitude,
                             size = 188.dp,
+                            mood = agentState.activeMood,
+                            faceModeEnabled = faceModeEnabled,
+                            emotionIntensity = emotionIntensity,
                             onClick = {
-                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                if (hapticsEnabled) {
+                                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                }
                                 onTapOrb()
                             },
                             contentDesc = "Voice mode orb, $stateLabel. Tap to interrupt or toggle.",

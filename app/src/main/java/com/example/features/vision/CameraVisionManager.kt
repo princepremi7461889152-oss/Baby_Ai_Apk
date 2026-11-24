@@ -76,6 +76,10 @@ class CameraVisionManager @Inject constructor(
                                 GeminiPart(inlineData = GeminiInlineData("image/jpeg", photoData))
                             )
                         )
+                    ),
+                    generationConfig = com.example.data.remote.GeminiGenerationConfig(
+                        maxOutputTokens = 1024,
+                        thinkingConfig = com.example.data.remote.GeminiThinkingConfig("low")
                     )
                 )
             )

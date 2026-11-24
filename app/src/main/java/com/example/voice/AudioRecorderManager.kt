@@ -14,15 +14,22 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.io.ByteArrayOutputStream
-import java.io.DataOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlin.math.sqrt
 
+/**
+ * Unified voice capture facade backed by [MicPipelineManager] so only ONE 16 kHz AudioRecord
+ * instance holds the microphone, seamlessly prepending the 1s pre-roll buffer when active.
+ */
 @Singleton
-class AudioRecorderManager @Inject constructor() {
+class AudioRecorderManager @Inject constructor(
+    private val micPipeline: MicPipelineManager?
+) {
+    // Legacy zero-arg constructor for unit tests
+    constructor() : this(null)
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val stateLock = Any()
@@ -30,11 +37,13 @@ class AudioRecorderManager @Inject constructor() {
     private var audioRecord: AudioRecord? = null
     private val pcmBuffer = ByteArrayOutputStream()
 
-    private val _isRecording = MutableStateFlow(false)
-    val isRecording: StateFlow<Boolean> = _isRecording.asStateFlow()
+    private val fallbackIsRecording = MutableStateFlow(false)
+    val isRecording: StateFlow<Boolean>
+        get() = micPipeline?.isCapturing ?: fallbackIsRecording.asStateFlow()
 
-    private val _amplitude = MutableStateFlow(0f)
-    val amplitude: StateFlow<Float> = _amplitude.asStateFlow()
+    private val fallbackAmplitude = MutableStateFlow(0f)
+    val amplitude: StateFlow<Float>
+        get() = micPipeline?.amplitude ?: fallbackAmplitude.asStateFlow()
 
     @SuppressLint("MissingPermission")
     fun startRecording(
@@ -42,8 +51,17 @@ class AudioRecorderManager @Inject constructor() {
         autoSilenceStop: Boolean = true,
         onSilenceDetected: (() -> Unit)? = null
     ): Boolean {
+        if (micPipeline != null) {
+            return micPipeline.beginCommandCapture(
+                maxDurationMs = maxDurationMs,
+                autoSilenceStop = autoSilenceStop,
+                includePreRoll = true,
+                onSilenceDetected = onSilenceDetected
+            )
+        }
+
         synchronized(stateLock) {
-            if (_isRecording.value) return false
+            if (fallbackIsRecording.value) return false
             val sampleRate = 16_000
             val minBuf = AudioRecord.getMinBufferSize(
                 sampleRate,
@@ -75,7 +93,7 @@ class AudioRecorderManager @Inject constructor() {
                 audioRecord = null
                 return false
             }
-            _isRecording.value = true
+            fallbackIsRecording.value = true
 
             recordingJob = scope.launch {
                 val buf = ShortArray(1024)
@@ -84,7 +102,7 @@ class AudioRecorderManager @Inject constructor() {
                 var lastSpeechMs = startTime
                 var consecutiveErrors = 0
 
-                while (isActive && _isRecording.value) {
+                while (isActive && fallbackIsRecording.value) {
                     val read = recorder.read(buf, 0, buf.size)
                     if (read > 0) {
                         consecutiveErrors = 0
@@ -95,12 +113,9 @@ class AudioRecorderManager @Inject constructor() {
                             byteBuf.putShort(s)
                             sumSq += s.toDouble() * s.toDouble()
                         }
-                        synchronized(pcmBuffer) {
-                            pcmBuffer.write(byteBuf.array())
-                        }
+                        synchronized(pcmBuffer) { pcmBuffer.write(byteBuf.array()) }
                         val rms = sqrt(sumSq / read).toFloat()
-                        val normalized = (rms / 6500f).coerceIn(0f, 1f)
-                        _amplitude.value = normalized
+                        fallbackAmplitude.value = (rms / 6500f).coerceIn(0f, 1f)
 
                         val now = System.currentTimeMillis()
                         if (rms > 650f) {
@@ -133,69 +148,45 @@ class AudioRecorderManager @Inject constructor() {
         }
     }
 
-    fun stopAndBuildWav(): ByteArray? = synchronized(stateLock) {
-        _isRecording.value = false
-        _amplitude.value = 0f
-        recordingJob?.cancel()
-        recordingJob = null
-        runCatching {
-            audioRecord?.stop()
-            audioRecord?.release()
+    fun stopAndBuildWav(): ByteArray? {
+        if (micPipeline != null) {
+            return micPipeline.finishCaptureAndBuildWav()
         }
-        audioRecord = null
+        return synchronized(stateLock) {
+            fallbackIsRecording.value = false
+            fallbackAmplitude.value = 0f
+            recordingJob?.cancel()
+            recordingJob = null
+            runCatching {
+                audioRecord?.stop()
+                audioRecord?.release()
+            }
+            audioRecord = null
 
-        val pcmBytes = synchronized(pcmBuffer) {
-            pcmBuffer.toByteArray().also { pcmBuffer.reset() }
+            val pcmBytes = synchronized(pcmBuffer) {
+                pcmBuffer.toByteArray().also { pcmBuffer.reset() }
+            }
+            if (pcmBytes.size < 3200) return null
+            MicPipelineManager.wrapPcmAsWav(pcmBytes, sampleRate = 16_000, channels = 1, bitsPerSample = 16)
         }
-        if (pcmBytes.size < 3200) return null
-        return wrapPcmAsWav(pcmBytes, sampleRate = 16_000, channels = 1, bitsPerSample = 16)
     }
 
-    fun cancel() = synchronized(stateLock) {
-        _isRecording.value = false
-        _amplitude.value = 0f
-        recordingJob?.cancel()
-        recordingJob = null
-        runCatching {
-            audioRecord?.stop()
-            audioRecord?.release()
+    fun cancel() {
+        if (micPipeline != null) {
+            micPipeline.cancelCapture()
+            return
         }
-        audioRecord = null
-        synchronized(pcmBuffer) { pcmBuffer.reset() }
+        synchronized(stateLock) {
+            fallbackIsRecording.value = false
+            fallbackAmplitude.value = 0f
+            recordingJob?.cancel()
+            recordingJob = null
+            runCatching {
+                audioRecord?.stop()
+                audioRecord?.release()
+            }
+            audioRecord = null
+            synchronized(pcmBuffer) { pcmBuffer.reset() }
+        }
     }
-
-    private fun wrapPcmAsWav(
-        pcmData: ByteArray,
-        sampleRate: Int,
-        channels: Int,
-        bitsPerSample: Int
-    ): ByteArray {
-        val out = ByteArrayOutputStream(44 + pcmData.size)
-        val dos = DataOutputStream(out)
-        val byteRate = sampleRate * channels * bitsPerSample / 8
-        val blockAlign = channels * bitsPerSample / 8
-
-        dos.writeBytes("RIFF")
-        dos.write(intToLittleEndian(36 + pcmData.size))
-        dos.writeBytes("WAVE")
-        dos.writeBytes("fmt ")
-        dos.write(intToLittleEndian(16))
-        dos.write(shortToLittleEndian(1))
-        dos.write(shortToLittleEndian(channels.toShort()))
-        dos.write(intToLittleEndian(sampleRate))
-        dos.write(intToLittleEndian(byteRate))
-        dos.write(shortToLittleEndian(blockAlign.toShort()))
-        dos.write(shortToLittleEndian(bitsPerSample.toShort()))
-        dos.writeBytes("data")
-        dos.write(intToLittleEndian(pcmData.size))
-        dos.write(pcmData)
-        dos.flush()
-        return out.toByteArray()
-    }
-
-    private fun intToLittleEndian(value: Int): ByteArray =
-        ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(value).array()
-
-    private fun shortToLittleEndian(value: Short): ByteArray =
-        ByteBuffer.allocate(2).order(ByteOrder.LITTLE_ENDIAN).putShort(value).array()
 }

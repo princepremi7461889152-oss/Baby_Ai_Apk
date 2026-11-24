@@ -451,6 +451,172 @@ class BabyAccessibilityService : AccessibilityService() {
         return ok
     }
 
+    /**
+     * Semantic search helper (zero hardcoded coordinates):
+     * 1. Focuses an editable field directly if visible, otherwise taps a search icon matching [searchHints].
+     * 2. Types [query] into the editable field and attempts IME enter / Submit.
+     */
+    suspend fun performSemanticSearchInput(
+        searchHints: List<String>,
+        query: String
+    ): Boolean {
+        val root = rootInActiveWindow ?: return false
+        var editable = findEditableNode(root)
+        if (editable == null) {
+            val searchBtn = findBestHintNode(root, searchHints, skipLabels = emptyList())
+            val tapped = searchBtn != null && tryClickNodeOrParent(searchBtn)
+            @Suppress("DEPRECATION")
+            searchBtn?.recycle()
+            @Suppress("DEPRECATION")
+            root.recycle()
+            if (!tapped) return false
+            kotlinx.coroutines.delay(550L)
+            val rootAfter = rootInActiveWindow ?: return false
+            editable = findEditableNode(rootAfter)
+            if (editable == null) {
+                @Suppress("DEPRECATION")
+                rootAfter.recycle()
+                return false
+            }
+            val ok = fillAndSubmitNode(editable, query)
+            @Suppress("DEPRECATION")
+            editable.recycle()
+            @Suppress("DEPRECATION")
+            rootAfter.recycle()
+            return ok
+        } else {
+            val ok = fillAndSubmitNode(editable, query)
+            @Suppress("DEPRECATION")
+            editable.recycle()
+            @Suppress("DEPRECATION")
+            root.recycle()
+            return ok
+        }
+    }
+
+    private fun fillAndSubmitNode(node: AccessibilityNodeInfo, query: String): Boolean {
+        node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+        val args = Bundle().apply {
+            putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, query)
+        }
+        val typed = node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+        if (!typed) return false
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            node.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id)
+        }
+        return true
+    }
+
+    /**
+     * Finds and taps the first clean clickable result matching optional [resultHints] while
+     * explicitly skipping nodes/ancestors containing any [skipLabels] (e.g., "Ad", "Sponsored", "Shorts").
+     */
+    suspend fun tapFirstCleanResultNode(
+        query: String,
+        resultHints: List<String>,
+        skipLabels: List<String>
+    ): String? {
+        val root = rootInActiveWindow ?: return null
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(root)
+        val queryTokens = query.lowercase().split(Regex("\\s+")).filter { it.length >= 3 }
+        var fallbackNode: AccessibilityNodeInfo? = null
+        var matchedNode: AccessibilityNodeInfo? = null
+        var matchedTitle = ""
+
+        while (queue.isNotEmpty()) {
+            val node = queue.removeFirst()
+            for (i in 0 until node.childCount) {
+                node.getChild(i)?.let { queue.add(it) }
+            }
+            if (node === root || node.isEditable) continue
+
+            val text = node.text?.toString()?.trim().orEmpty()
+            val desc = node.contentDescription?.toString()?.trim().orEmpty()
+            val combined = "$text $desc".trim()
+            val lower = combined.lowercase()
+
+            if (combined.isBlank() || lower.length < 4) continue
+            if (skipLabels.any { skip -> lower == skip.lowercase() || lower.contains(" ${skip.lowercase()} ") || lower.startsWith("${skip.lowercase()} ") || lower.contains("sponsored") || lower.contains("shorts") }) {
+                continue
+            }
+            if (hasAncestorMatchingSkipLabel(node, skipLabels)) continue
+
+            val rect = Rect()
+            node.getBoundsInScreen(rect)
+            // Ignore top toolbar/status area (< 12% height) so we don't tap search bar or tabs
+            val dm = resources.displayMetrics
+            if (rect.top < (dm.heightPixels * 0.14f).toInt() || rect.width() <= 0 || rect.height() <= 0) continue
+
+            val hasQueryToken = queryTokens.any { lower.contains(it) }
+            val hasHint = resultHints.any { h -> lower.contains(h.lowercase()) }
+            if (node.isClickable || hasQueryToken || hasHint) {
+                if (hasQueryToken && matchedNode == null) {
+                    matchedNode = node
+                    matchedTitle = combined.take(70)
+                } else if (fallbackNode == null && (node.isClickable || hasHint) && combined.length >= 6) {
+                    fallbackNode = node
+                    if (matchedTitle.isEmpty()) matchedTitle = combined.take(70)
+                }
+            }
+        }
+
+        val target = matchedNode ?: fallbackNode
+        val tapped = if (target != null) {
+            if (!tryClickNodeOrParent(target)) {
+                val r = Rect()
+                target.getBoundsInScreen(r)
+                if (r.width() > 0 && r.height() > 0) tap(r.centerX().toFloat(), r.centerY().toFloat()) else false
+            } else true
+        } else false
+
+        @Suppress("DEPRECATION")
+        root.recycle()
+        return if (tapped) matchedTitle.ifBlank { "Result item" } else null
+    }
+
+    private fun hasAncestorMatchingSkipLabel(node: AccessibilityNodeInfo, skipLabels: List<String>): Boolean {
+        if (skipLabels.isEmpty()) return false
+        var cur = node.parent
+        var hops = 0
+        while (cur != null && hops < 4) {
+            val txt = "${cur.text?.toString().orEmpty()} ${cur.contentDescription?.toString().orEmpty()}".lowercase()
+            if (skipLabels.any { txt.contains(it.lowercase()) }) {
+                @Suppress("DEPRECATION")
+                cur.recycle()
+                return true
+            }
+            val next = cur.parent
+            @Suppress("DEPRECATION")
+            cur.recycle()
+            cur = next
+            hops++
+        }
+        return false
+    }
+
+    private fun findBestHintNode(
+        root: AccessibilityNodeInfo,
+        hints: List<String>,
+        skipLabels: List<String>
+    ): AccessibilityNodeInfo? {
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(root)
+        while (queue.isNotEmpty()) {
+            val n = queue.removeFirst()
+            for (i in 0 until n.childCount) {
+                n.getChild(i)?.let { queue.add(it) }
+            }
+            if (n === root) continue
+            val text = "${n.text?.toString().orEmpty()} ${n.contentDescription?.toString().orEmpty()} ${n.viewIdResourceName.orEmpty()}".lowercase()
+            if (skipLabels.any { text.contains(it.lowercase()) }) continue
+            if (hints.any { h -> text.contains(h.lowercase()) }) {
+                return n
+            }
+        }
+        return null
+    }
+
     private fun findEditableNode(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
         val focused = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
         if (focused != null && focused.isEditable) return focused

@@ -14,6 +14,8 @@ import com.example.features.safety.SafetyManager
 import com.example.features.vision.CameraVisionManager
 import com.example.features.vision.ClipboardAiManager
 import com.example.features.vision.ScreenHelpManager
+import com.example.domain.ai.AiRouter
+import com.example.features.searchplay.SearchPlayEngine
 import dagger.hilt.android.qualifiers.ApplicationContext
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -31,10 +33,80 @@ class ExtendedToolRouter @Inject constructor(
     private val clipboardAiManager: ClipboardAiManager,
     private val cameraVisionManager: CameraVisionManager,
     private val macroManager: MacroManager,
-    private val safetyManager: SafetyManager
+    private val safetyManager: SafetyManager,
+    private val searchPlayEngine: SearchPlayEngine?,
+    private val aiRouter: AiRouter?
 ) {
+    // Legacy 12-arg constructor for unit tests
+    constructor(
+        context: Context,
+        keyStore: SecureKeyStore,
+        historyRepository: HistoryRepository,
+        routineManager: RoutineManager,
+        memoryManager: MemoryManager,
+        reminderManager: ReminderManager,
+        notificationSummaryManager: NotificationSummaryManager,
+        screenHelpManager: ScreenHelpManager,
+        clipboardAiManager: ClipboardAiManager,
+        cameraVisionManager: CameraVisionManager,
+        macroManager: MacroManager,
+        safetyManager: SafetyManager
+    ) : this(
+        context = context,
+        keyStore = keyStore,
+        historyRepository = historyRepository,
+        routineManager = routineManager,
+        memoryManager = memoryManager,
+        reminderManager = reminderManager,
+        notificationSummaryManager = notificationSummaryManager,
+        screenHelpManager = screenHelpManager,
+        clipboardAiManager = clipboardAiManager,
+        cameraVisionManager = cameraVisionManager,
+        macroManager = macroManager,
+        safetyManager = safetyManager,
+        searchPlayEngine = null,
+        aiRouter = null
+    )
+
     suspend fun tryExecute(name: String, args: Map<String, Any?>): ToolExecutionResult? {
         return when (name) {
+            "search_web" -> {
+                val query = args["query"]?.toString().orEmpty().trim()
+                if (query.isBlank()) return ToolExecutionResult(false, "Search query empty hai.")
+                val router = aiRouter ?: return null
+                if (keyStore.settings.value.geminiApiKey.isBlank()) {
+                    return null // Falls back to PhoneControlExecutor.searchWeb browser launch
+                }
+                val res = router.searchWebWithGrounding(
+                    query = query,
+                    userLanguageHint = keyStore.settings.value.preferredLanguage.name.lowercase()
+                )
+                res.fold(
+                    onSuccess = { plan ->
+                        val base = plan.replyText ?: "Web search complete."
+                        val sourcesText = if (plan.sources.isNotEmpty()) {
+                            "\n\nSources:\n" + plan.sources.take(4).joinToString("\n") { "- [${it.title}](${it.uri})" }
+                        } else ""
+                        ToolExecutionResult(true, "$base$sourcesText")
+                    },
+                    onFailure = {
+                        null // Fall back cleanly to PhoneControlExecutor browser search
+                    }
+                )
+            }
+
+            "search_in_app" -> {
+                val engine = searchPlayEngine ?: return ToolExecutionResult(false, "SearchPlayEngine unavailable.")
+                val appName = args["app_name"]?.toString().orEmpty()
+                val query = args["query"]?.toString().orEmpty()
+                val autoPlay = when (val ap = args["auto_play"]) {
+                    is Boolean -> ap
+                    is String -> ap.equals("true", ignoreCase = true)
+                    else -> true
+                }
+                engine.executeSearchAndPlay(appName, query, autoPlay)
+            }
+
             "create_routine" -> {
                 if (!keyStore.settings.value.routinesEnabled) {
                     return ToolExecutionResult(false, "Routines feature Settings mein OFF hai.")

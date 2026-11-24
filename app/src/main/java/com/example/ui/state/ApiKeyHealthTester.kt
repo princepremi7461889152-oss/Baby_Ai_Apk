@@ -1,6 +1,7 @@
 package com.example.ui.state
 
 import com.example.core.security.AiModelConfig
+import com.example.core.security.AiRole
 import com.example.core.security.SensitiveDataSanitizer
 import com.example.domain.ai.AiFailureClassifier
 import kotlinx.coroutines.CancellationException
@@ -30,7 +31,9 @@ data class ModelTestItem(
     val label: String,
     val modelId: String,
     val passed: Boolean?,
-    val detail: String
+    val detail: String,
+    val role: AiRole? = null,
+    val latencyMs: Long = 0L
 )
 
 data class ModelsTestUiState(
@@ -42,17 +45,57 @@ data class ModelsTestUiState(
 class ApiKeyHealthTester @Inject constructor(
     private val okHttpClient: OkHttpClient
 ) {
+    internal var inceptionBaseUrl: String = AiModelConfig.DEFAULT_INCEPTION_BASE_URL
     internal var groqBaseUrl: String = "https://api.groq.com"
     internal var geminiBaseUrl: String = "https://generativelanguage.googleapis.com"
 
-    suspend fun testGroqKey(rawKey: String): KeyTestResult = withContext(Dispatchers.IO) {
+    suspend fun testInceptionKey(
+        rawKey: String,
+        baseUrlOverride: String = inceptionBaseUrl
+    ): KeyTestResult = withContext(Dispatchers.IO) {
         val key = rawKey.trim()
+        val base = baseUrlOverride.trim().trimEnd('/').ifBlank { AiModelConfig.DEFAULT_INCEPTION_BASE_URL }
+        if (key.isBlank()) {
+            return@withContext KeyTestResult.Invalid("Inception API key khali hai")
+        }
+        try {
+            val request = Request.Builder()
+                .url("$base/models")
+                .header("Authorization", "Bearer $key")
+                .get()
+                .build()
+            okHttpClient.newCall(request).execute().use { resp ->
+                when {
+                    resp.isSuccessful -> KeyTestResult.Valid("Inception Mercury key verified (HTTP ${resp.code})")
+                    resp.code == 401 || resp.code == 403 -> KeyTestResult.Invalid("Invalid Inception API key (${resp.code})")
+                    resp.code == 429 -> KeyTestResult.Valid("Key valid, rate limit active (429)")
+                    else -> KeyTestResult.Invalid("Inception check failed (HTTP ${resp.code})")
+                }
+            }
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (e: Exception) {
+            val msg = when (e) {
+                is SocketTimeoutException -> "Connection timed out"
+                is UnknownHostException -> "Offline / No internet"
+                else -> SensitiveDataSanitizer.sanitizeError(e.localizedMessage, key)
+            }
+            KeyTestResult.Invalid("Network error: $msg")
+        }
+    }
+
+    suspend fun testGroqKey(
+        rawKey: String,
+        baseUrlOverride: String? = null
+    ): KeyTestResult = withContext(Dispatchers.IO) {
+        val key = rawKey.trim()
+        val base = resolveGroqOpenAiRoot(baseUrlOverride)
         if (key.isBlank()) {
             return@withContext KeyTestResult.Invalid("Groq key khali hai")
         }
         try {
             val request = Request.Builder()
-                .url("${groqBaseUrl.trimEnd('/')}/openai/v1/models")
+                .url("$base/models")
                 .header("Authorization", "Bearer $key")
                 .get()
                 .build()
@@ -76,14 +119,18 @@ class ApiKeyHealthTester @Inject constructor(
         }
     }
 
-    suspend fun testGeminiKey(rawKey: String): KeyTestResult = withContext(Dispatchers.IO) {
+    suspend fun testGeminiKey(
+        rawKey: String,
+        baseUrlOverride: String? = null
+    ): KeyTestResult = withContext(Dispatchers.IO) {
         val key = rawKey.trim()
+        val base = resolveGeminiV1BetaRoot(baseUrlOverride)
         if (key.isBlank()) {
             return@withContext KeyTestResult.Invalid("Gemini key khali hai")
         }
         try {
             val request = Request.Builder()
-                .url("${geminiBaseUrl.trimEnd('/')}/v1beta/models?pageSize=1")
+                .url("$base/models?pageSize=1")
                 .header("x-goog-api-key", key)
                 .get()
                 .build()
@@ -108,14 +155,75 @@ class ApiKeyHealthTester @Inject constructor(
         }
     }
 
-    suspend fun fetchGroqModels(rawKey: String): Result<List<String>> = withContext(Dispatchers.IO) {
+    suspend fun fetchMercuryModels(
+        rawKey: String,
+        baseUrlOverride: String = inceptionBaseUrl
+    ): Result<List<String>> = withContext(Dispatchers.IO) {
         val key = rawKey.trim()
+        val base = baseUrlOverride.trim().trimEnd('/').ifBlank { AiModelConfig.DEFAULT_INCEPTION_BASE_URL }
+        if (key.isBlank()) {
+            return@withContext Result.failure(IllegalStateException("Inception API key missing hai."))
+        }
+        fetchOpenAiModelIds("$base/models", "Mercury", key)
+    }
+
+    suspend fun fetchGroqModels(
+        rawKey: String,
+        baseUrlOverride: String? = null
+    ): Result<List<String>> = withContext(Dispatchers.IO) {
+        val key = rawKey.trim()
+        val base = resolveGroqOpenAiRoot(baseUrlOverride)
         if (key.isBlank()) {
             return@withContext Result.failure(IllegalStateException("Groq API key missing hai."))
         }
+        fetchOpenAiModelIds("$base/models", "Groq", key)
+    }
+
+    suspend fun fetchGeminiModels(
+        rawKey: String,
+        baseUrlOverride: String? = null
+    ): Result<List<String>> = withContext(Dispatchers.IO) {
+        val key = rawKey.trim()
+        val base = resolveGeminiV1BetaRoot(baseUrlOverride)
+        if (key.isBlank()) {
+            return@withContext Result.failure(IllegalStateException("Gemini API key missing hai."))
+        }
         try {
             val request = Request.Builder()
-                .url("${groqBaseUrl.trimEnd('/')}/openai/v1/models")
+                .url("$base/models?pageSize=100")
+                .header("x-goog-api-key", key)
+                .get()
+                .build()
+            okHttpClient.newCall(request).execute().use { resp ->
+                val rawBody = runCatching { resp.body?.string() }.getOrNull()
+                if (!resp.isSuccessful || rawBody.isNullOrBlank()) {
+                    return@withContext Result.failure(
+                        AiFailureClassifier.fromHttp("Gemini", "models", resp.code, rawBody, 1, key)
+                    )
+                }
+                val root = JSONObject(rawBody)
+                val arr = root.optJSONArray("models") ?: JSONArray()
+                val ids = mutableListOf<String>()
+                for (i in 0 until arr.length()) {
+                    val item = arr.optJSONObject(i) ?: continue
+                    val name = item.optString("name", "").removePrefix("models/").trim()
+                    if (name.isNotEmpty() && !name.contains("embedding", ignoreCase = true)) {
+                        ids.add(name)
+                    }
+                }
+                Result.success(ids.distinct().sorted())
+            }
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (e: Exception) {
+            Result.failure(AiFailureClassifier.fromException("Gemini", "models", e, 1, key))
+        }
+    }
+
+    private fun fetchOpenAiModelIds(url: String, provider: String, key: String): Result<List<String>> {
+        return try {
+            val request = Request.Builder()
+                .url(url)
                 .header("Authorization", "Bearer $key")
                 .get()
                 .build()
@@ -123,14 +231,14 @@ class ApiKeyHealthTester @Inject constructor(
                 val rawBody = runCatching { resp.body?.string() }.getOrNull()
                 if (!resp.isSuccessful || rawBody.isNullOrBlank()) {
                     val ex = AiFailureClassifier.fromHttp(
-                        provider = "Groq",
+                        provider = provider,
                         model = "models",
                         code = resp.code,
                         rawErrorBody = rawBody,
                         attempts = 1,
                         secretKeys = arrayOf(key)
                     )
-                    return@withContext Result.failure(ex)
+                    return Result.failure(ex)
                 }
                 val root = JSONObject(rawBody)
                 val arr = root.optJSONArray("data") ?: JSONArray()
@@ -148,7 +256,7 @@ class ApiKeyHealthTester @Inject constructor(
         } catch (e: Exception) {
             Result.failure(
                 AiFailureClassifier.fromException(
-                    provider = "Groq",
+                    provider = provider,
                     model = "models",
                     err = e,
                     attempts = 1,
@@ -158,6 +266,24 @@ class ApiKeyHealthTester @Inject constructor(
         }
     }
 
+    suspend fun testSingleRole(
+        role: AiRole,
+        config: AiModelConfig,
+        inceptionKey: String,
+        geminiKey: String,
+        groqKey: String
+    ): ModelTestItem = withContext(Dispatchers.IO) {
+        val norm = config.normalized()
+        when (role) {
+            AiRole.MIND -> testMercuryChatModel("MIND (Mercury)", norm.mindModel, inceptionKey.trim(), norm.inceptionBaseUrl)
+            AiRole.VISION_SEARCH -> testGeminiModel("Vision & Search", norm.geminiModel, geminiKey.trim(), norm.geminiBaseUrl)
+            AiRole.STT -> testGroqSttModel("Speech-to-Text", norm.sttModel, groqKey.trim(), norm.groqBaseUrl)
+            AiRole.TTS -> testGeminiTtsModel("Voice TTS", norm.ttsModel, geminiKey.trim(), norm.geminiBaseUrl)
+            AiRole.FALLBACK_CHAT -> testGroqChatModel("Fallback Chat", norm.chatModel, groqKey.trim(), norm.groqBaseUrl)
+        }
+    }
+
+    // Backwards-compatible 3-arg overload preserved for existing tests
     suspend fun testAllModels(
         groqKey: String,
         geminiKey: String,
@@ -176,10 +302,91 @@ class ApiKeyHealthTester @Inject constructor(
         ModelsTestUiState(isTesting = false, items = items)
     }
 
-    private fun testGroqChatModel(label: String, modelId: String, key: String): ModelTestItem {
+    suspend fun testAllRoles(
+        inceptionKey: String,
+        groqKey: String,
+        geminiKey: String,
+        config: AiModelConfig
+    ): ModelsTestUiState = withContext(Dispatchers.IO) {
+        val norm = config.normalized()
+        val items = listOf(
+            testMercuryChatModel("MIND (Mercury)", norm.mindModel, inceptionKey.trim(), norm.inceptionBaseUrl),
+            testGeminiModel("Vision & Search", norm.geminiModel, geminiKey.trim(), norm.geminiBaseUrl),
+            testGroqSttModel("Speech-to-Text", norm.sttModel, groqKey.trim(), norm.groqBaseUrl),
+            testGeminiTtsModel("Voice TTS", norm.ttsModel, geminiKey.trim(), norm.geminiBaseUrl),
+            testGroqChatModel("Fallback Chat", norm.chatModel, groqKey.trim(), norm.groqBaseUrl),
+            testGroqChatModel("Fast / Simple", norm.fastModel, groqKey.trim(), norm.groqBaseUrl)
+        )
+        ModelsTestUiState(isTesting = false, items = items)
+    }
+
+    private fun testMercuryChatModel(
+        label: String,
+        modelId: String,
+        key: String,
+        baseUrl: String = inceptionBaseUrl
+    ): ModelTestItem {
         if (key.isBlank()) {
-            return ModelTestItem(label, modelId, passed = false, detail = "Groq API key missing")
+            return ModelTestItem(label, modelId, passed = false, detail = "Inception API key missing", role = AiRole.MIND)
         }
+        val t0 = System.currentTimeMillis()
+        return try {
+            val base = baseUrl.trim().trimEnd('/').ifBlank { AiModelConfig.DEFAULT_INCEPTION_BASE_URL }
+            val payload = JSONObject().apply {
+                put("model", modelId)
+                put("max_tokens", 16)
+                put("reasoning_effort", "low")
+                put(
+                    "messages",
+                    JSONArray().put(
+                        JSONObject().apply {
+                            put("role", "user")
+                            put("content", "Reply OK")
+                        }
+                    )
+                )
+            }.toString()
+            val req = Request.Builder()
+                .url("$base/chat/completions")
+                .header("Authorization", "Bearer $key")
+                .post(payload.toRequestBody("application/json; charset=utf-8".toMediaType()))
+                .build()
+            okHttpClient.newCall(req).execute().use { resp ->
+                val elapsed = System.currentTimeMillis() - t0
+                val body = runCatching { resp.body?.string() }.getOrNull()
+                if (resp.isSuccessful) {
+                    ModelTestItem(label, modelId, passed = true, detail = "Pass (HTTP ${resp.code}, ${elapsed}ms)", role = AiRole.MIND, latencyMs = elapsed)
+                } else {
+                    val (reason, _) = AiFailureClassifier.extractCleanErrorMessageAndCode(body, key)
+                    ModelTestItem(
+                        label,
+                        modelId,
+                        passed = false,
+                        detail = "Fail (HTTP ${resp.code}${if (!reason.isNullOrBlank()) ": ${reason.take(80)}" else ""})",
+                        role = AiRole.MIND,
+                        latencyMs = elapsed
+                    )
+                }
+            }
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (e: Exception) {
+            val clean = SensitiveDataSanitizer.sanitizeError(e.message, key).take(80)
+            ModelTestItem(label, modelId, passed = false, detail = "Fail ($clean)", role = AiRole.MIND)
+        }
+    }
+
+    private fun testGroqChatModel(
+        label: String,
+        modelId: String,
+        key: String,
+        baseUrlOverride: String? = null
+    ): ModelTestItem {
+        if (key.isBlank()) {
+            return ModelTestItem(label, modelId, passed = false, detail = "Groq API key missing", role = AiRole.FALLBACK_CHAT)
+        }
+        val t0 = System.currentTimeMillis()
+        val base = resolveGroqOpenAiRoot(baseUrlOverride)
         return try {
             val payload = JSONObject().apply {
                 put("model", modelId)
@@ -196,21 +403,24 @@ class ApiKeyHealthTester @Inject constructor(
                 )
             }.toString()
             val req = Request.Builder()
-                .url("${groqBaseUrl.trimEnd('/')}/openai/v1/chat/completions")
+                .url("$base/chat/completions")
                 .header("Authorization", "Bearer $key")
                 .post(payload.toRequestBody("application/json; charset=utf-8".toMediaType()))
                 .build()
             okHttpClient.newCall(req).execute().use { resp ->
+                val elapsed = System.currentTimeMillis() - t0
                 val body = runCatching { resp.body?.string() }.getOrNull()
                 if (resp.isSuccessful) {
-                    ModelTestItem(label, modelId, passed = true, detail = "Pass (HTTP ${resp.code})")
+                    ModelTestItem(label, modelId, passed = true, detail = "Pass (HTTP ${resp.code}, ${elapsed}ms)", role = AiRole.FALLBACK_CHAT, latencyMs = elapsed)
                 } else {
                     val (reason, _) = AiFailureClassifier.extractCleanErrorMessageAndCode(body, key)
                     ModelTestItem(
                         label,
                         modelId,
                         passed = false,
-                        detail = "Fail (HTTP ${resp.code}${if (!reason.isNullOrBlank()) ": ${reason.take(80)}" else ""})"
+                        detail = "Fail (HTTP ${resp.code}${if (!reason.isNullOrBlank()) ": ${reason.take(80)}" else ""})",
+                        role = AiRole.FALLBACK_CHAT,
+                        latencyMs = elapsed
                     )
                 }
             }
@@ -218,14 +428,21 @@ class ApiKeyHealthTester @Inject constructor(
             throw ce
         } catch (e: Exception) {
             val clean = SensitiveDataSanitizer.sanitizeError(e.message, key).take(80)
-            ModelTestItem(label, modelId, passed = false, detail = "Fail ($clean)")
+            ModelTestItem(label, modelId, passed = false, detail = "Fail ($clean)", role = AiRole.FALLBACK_CHAT)
         }
     }
 
-    private fun testGroqSttModel(label: String, modelId: String, key: String): ModelTestItem {
+    private fun testGroqSttModel(
+        label: String,
+        modelId: String,
+        key: String,
+        baseUrlOverride: String? = null
+    ): ModelTestItem {
         if (key.isBlank()) {
-            return ModelTestItem(label, modelId, passed = false, detail = "Groq API key missing")
+            return ModelTestItem(label, modelId, passed = false, detail = "Groq API key missing", role = AiRole.STT)
         }
+        val t0 = System.currentTimeMillis()
+        val base = resolveGroqOpenAiRoot(baseUrlOverride)
         return try {
             val tinyWav = buildMinimalSilentWav(durationMs = 150)
             val multipart = MultipartBody.Builder()
@@ -235,21 +452,24 @@ class ApiKeyHealthTester @Inject constructor(
                 .addFormDataPart("response_format", "json")
                 .build()
             val req = Request.Builder()
-                .url("${groqBaseUrl.trimEnd('/')}/openai/v1/audio/transcriptions")
+                .url("$base/audio/transcriptions")
                 .header("Authorization", "Bearer $key")
                 .post(multipart)
                 .build()
             okHttpClient.newCall(req).execute().use { resp ->
+                val elapsed = System.currentTimeMillis() - t0
                 val body = runCatching { resp.body?.string() }.getOrNull()
                 if (resp.isSuccessful) {
-                    ModelTestItem(label, modelId, passed = true, detail = "Pass (HTTP ${resp.code})")
+                    ModelTestItem(label, modelId, passed = true, detail = "Pass (HTTP ${resp.code}, ${elapsed}ms)", role = AiRole.STT, latencyMs = elapsed)
                 } else {
                     val (reason, _) = AiFailureClassifier.extractCleanErrorMessageAndCode(body, key)
                     ModelTestItem(
                         label,
                         modelId,
                         passed = false,
-                        detail = "Fail (HTTP ${resp.code}${if (!reason.isNullOrBlank()) ": ${reason.take(80)}" else ""})"
+                        detail = "Fail (HTTP ${resp.code}${if (!reason.isNullOrBlank()) ": ${reason.take(80)}" else ""})",
+                        role = AiRole.STT,
+                        latencyMs = elapsed
                     )
                 }
             }
@@ -257,15 +477,23 @@ class ApiKeyHealthTester @Inject constructor(
             throw ce
         } catch (e: Exception) {
             val clean = SensitiveDataSanitizer.sanitizeError(e.message, key).take(80)
-            ModelTestItem(label, modelId, passed = false, detail = "Fail ($clean)")
+            ModelTestItem(label, modelId, passed = false, detail = "Fail ($clean)", role = AiRole.STT)
         }
     }
 
-    private fun testGeminiModel(label: String, modelId: String, key: String): ModelTestItem {
+    private fun testGeminiModel(
+        label: String,
+        modelId: String,
+        key: String,
+        baseUrlOverride: String? = null
+    ): ModelTestItem {
         if (key.isBlank()) {
-            return ModelTestItem(label, modelId, passed = false, detail = "Gemini API key missing")
+            return ModelTestItem(label, modelId, passed = false, detail = "Gemini API key missing", role = AiRole.VISION_SEARCH)
         }
+        val t0 = System.currentTimeMillis()
+        val base = resolveGeminiV1BetaRoot(baseUrlOverride)
         return try {
+            // Gemini 3.8 Flash: NO temperature/top_p/top_k/candidate_count; use thinking_level="low"
             val payload = JSONObject().apply {
                 put(
                     "contents",
@@ -282,27 +510,33 @@ class ApiKeyHealthTester @Inject constructor(
                 put(
                     "generationConfig",
                     JSONObject().apply {
-                        put("maxOutputTokens", 12)
-                        put("temperature", 0.0)
+                        put("maxOutputTokens", 16)
+                        put(
+                            "thinkingConfig",
+                            JSONObject().apply { put("thinkingLevel", "low") }
+                        )
                     }
                 )
             }.toString()
             val req = Request.Builder()
-                .url("${geminiBaseUrl.trimEnd('/')}/v1beta/models/${modelId.trim()}:generateContent")
+                .url("$base/models/${modelId.trim()}:generateContent")
                 .header("x-goog-api-key", key)
                 .post(payload.toRequestBody("application/json; charset=utf-8".toMediaType()))
                 .build()
             okHttpClient.newCall(req).execute().use { resp ->
+                val elapsed = System.currentTimeMillis() - t0
                 val body = runCatching { resp.body?.string() }.getOrNull()
                 if (resp.isSuccessful) {
-                    ModelTestItem(label, modelId, passed = true, detail = "Pass (HTTP ${resp.code})")
+                    ModelTestItem(label, modelId, passed = true, detail = "Pass (HTTP ${resp.code}, ${elapsed}ms)", role = AiRole.VISION_SEARCH, latencyMs = elapsed)
                 } else {
                     val (reason, _) = AiFailureClassifier.extractCleanErrorMessageAndCode(body, key)
                     ModelTestItem(
                         label,
                         modelId,
                         passed = false,
-                        detail = "Fail (HTTP ${resp.code}${if (!reason.isNullOrBlank()) ": ${reason.take(80)}" else ""})"
+                        detail = "Fail (HTTP ${resp.code}${if (!reason.isNullOrBlank()) ": ${reason.take(80)}" else ""})",
+                        role = AiRole.VISION_SEARCH,
+                        latencyMs = elapsed
                     )
                 }
             }
@@ -310,7 +544,110 @@ class ApiKeyHealthTester @Inject constructor(
             throw ce
         } catch (e: Exception) {
             val clean = SensitiveDataSanitizer.sanitizeError(e.message, key).take(80)
-            ModelTestItem(label, modelId, passed = false, detail = "Fail ($clean)")
+            ModelTestItem(label, modelId, passed = false, detail = "Fail ($clean)", role = AiRole.VISION_SEARCH)
+        }
+    }
+
+    private fun testGeminiTtsModel(
+        label: String,
+        modelId: String,
+        key: String,
+        baseUrlOverride: String? = null
+    ): ModelTestItem {
+        if (key.isBlank()) {
+            return ModelTestItem(label, modelId, passed = true, detail = "Android TTS ready (Gemini TTS key missing)", role = AiRole.TTS)
+        }
+        val t0 = System.currentTimeMillis()
+        val base = resolveGeminiV1BetaRoot(baseUrlOverride)
+        return try {
+            val payload = JSONObject().apply {
+                put(
+                    "contents",
+                    JSONArray().put(
+                        JSONObject().apply {
+                            put("role", "user")
+                            put(
+                                "parts",
+                                JSONArray().put(
+                                    JSONObject().apply {
+                                        put("text", "Namaste.")
+                                        put("speechMetadata", JSONObject().apply { put("style", "warm") })
+                                    }
+                                )
+                            )
+                        }
+                    )
+                )
+                put(
+                    "generationConfig",
+                    JSONObject().apply {
+                        put("responseModalities", JSONArray().put("AUDIO"))
+                        put(
+                            "speechConfig",
+                            JSONObject().apply {
+                                put(
+                                    "voiceConfig",
+                                    JSONObject().apply {
+                                        put(
+                                            "prebuiltVoiceConfig",
+                                            JSONObject().apply { put("voiceName", "Kore") }
+                                        )
+                                    }
+                                )
+                            }
+                        )
+                    }
+                )
+            }.toString()
+            val req = Request.Builder()
+                .url("$base/models/${modelId.trim()}:generateContent")
+                .header("x-goog-api-key", key)
+                .post(payload.toRequestBody("application/json; charset=utf-8".toMediaType()))
+                .build()
+            okHttpClient.newCall(req).execute().use { resp ->
+                val elapsed = System.currentTimeMillis() - t0
+                val body = runCatching { resp.body?.string() }.getOrNull()
+                if (resp.isSuccessful) {
+                    ModelTestItem(label, modelId, passed = true, detail = "Pass (HTTP ${resp.code}, ${elapsed}ms)", role = AiRole.TTS, latencyMs = elapsed)
+                } else {
+                    val (reason, _) = AiFailureClassifier.extractCleanErrorMessageAndCode(body, key)
+                    ModelTestItem(
+                        label,
+                        modelId,
+                        passed = false,
+                        detail = "Fail (HTTP ${resp.code}${if (!reason.isNullOrBlank()) ": ${reason.take(80)}" else ""})",
+                        role = AiRole.TTS,
+                        latencyMs = elapsed
+                    )
+                }
+            }
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (e: Exception) {
+            val clean = SensitiveDataSanitizer.sanitizeError(e.message, key).take(80)
+            ModelTestItem(label, modelId, passed = false, detail = "Fail ($clean)", role = AiRole.TTS)
+        }
+    }
+
+    private fun resolveGroqOpenAiRoot(baseUrlOverride: String?): String {
+        val raw = baseUrlOverride?.trim()?.trimEnd('/').orEmpty()
+        return if (raw.isBlank()) {
+            "${groqBaseUrl.trimEnd('/')}/openai/v1"
+        } else if (raw.endsWith("/openai/v1")) {
+            raw
+        } else {
+            "$raw/openai/v1"
+        }
+    }
+
+    private fun resolveGeminiV1BetaRoot(baseUrlOverride: String?): String {
+        val raw = baseUrlOverride?.trim()?.trimEnd('/').orEmpty()
+        return if (raw.isBlank()) {
+            "${geminiBaseUrl.trimEnd('/')}/v1beta"
+        } else if (raw.endsWith("/v1beta")) {
+            raw
+        } else {
+            "$raw/v1beta"
         }
     }
 

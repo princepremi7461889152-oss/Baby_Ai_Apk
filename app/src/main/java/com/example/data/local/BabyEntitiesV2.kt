@@ -111,3 +111,38 @@ data class SavedPlaceEntity(
     val addressHint: String = "",
     val updatedAt: Long = System.currentTimeMillis()
 )
+
+@Entity(tableName = "app_aliases")
+data class AppAliasEntity(
+    @PrimaryKey val alias: String,
+    val packageName: String,
+    val appLabel: String,
+    val isUserEdited: Boolean = false,
+    val updatedAt: Long = System.currentTimeMillis()
+)
+
+@Entity(tableName = "search_recipes")
+data class SearchRecipeEntity(
+    @PrimaryKey val appKey: String,
+    val displayName: String,
+    val packageName: String,
+    val recipeJson: String,
+    val updatedAt: Long = System.currentTimeMillis()
+)
+
+@Entity(
+    tableName = "call_screening_logs",
+    indices = [Index(value = ["timestamp"])]
+)
+data class CallScreeningLogEntity(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    val timestamp: Long = System.currentTimeMillis(),
+    val callerNumber: String,
+    val callerName: String = "",
+    val mode: String,
+    val decision: String,
+    val reason: String,
+    val transcript: String = "",
+    val replySent: String = ""
+)
+

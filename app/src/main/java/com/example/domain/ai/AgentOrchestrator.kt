@@ -3,6 +3,8 @@ package com.example.domain.ai
 import android.content.Context
 import com.example.core.security.SecureKeyStore
 import com.example.core.security.SensitiveDataSanitizer
+import com.example.core.telemetry.ExecutionPathType
+import com.example.core.telemetry.LatencyTracker
 import com.example.data.local.ChatMessageEntity
 import com.example.data.local.HistoryRepository
 import com.example.domain.tools.ExtendedToolRouter
@@ -17,8 +19,11 @@ import com.example.features.notifications.NotificationSummaryManager
 import com.example.features.offline.OfflineCommandEngine
 import com.example.features.routines.RoutineManager
 import com.example.features.safety.SafetyManager
+import com.example.features.searchplay.SearchPlayEngine
 import com.example.features.widget.BabyWidgetProvider
 import com.example.service.BabyAccessibilityService
+import com.example.ui.theme.BabyMood
+import com.example.ui.theme.BabyMoodResolver
 import com.example.util.PermissionHelper
 import com.example.voice.BabyTtsManager
 import com.example.voice.WakeWordDetector
@@ -58,7 +63,10 @@ data class AgentExecutionState(
     val queuedCount: Int = 0,
     val lastError: String? = null,
     val lastErrorDetails: String? = null,
-    val oneTimeNotice: String? = null
+    val oneTimeNotice: String? = null,
+    val streamingReply: String = "",
+    val streamingSources: List<WebSourceLink> = emptyList(),
+    val activeMood: BabyMood = BabyMood.CALM
 ) {
     companion object {
         const val MAX_STEPS = 15
@@ -83,12 +91,58 @@ class AgentOrchestrator @Inject constructor(
     private val keyStore: SecureKeyStore,
     private val permissionHelper: PermissionHelper,
     private val ttsManager: BabyTtsManager,
-    private val stopSignalBus: StopSignalBus
+    private val stopSignalBus: StopSignalBus,
+    private val latencyTracker: LatencyTracker,
+    private val searchPlayEngine: SearchPlayEngine? = null
 ) {
+    // Legacy 17-arg constructor for unit tests
+    constructor(
+        appContext: Context,
+        aiRouter: AiRouter,
+        executor: PhoneControlExecutor,
+        extendedToolRouter: ExtendedToolRouter,
+        historyRepository: HistoryRepository,
+        actionLogRepository: ActionLogRepository,
+        actionLogInterceptor: ActionLogInterceptor,
+        offlineCommandEngine: OfflineCommandEngine,
+        routineManager: RoutineManager,
+        macroManager: MacroManager,
+        memoryManager: MemoryManager,
+        notificationSummaryManager: NotificationSummaryManager,
+        safetyManager: SafetyManager,
+        keyStore: SecureKeyStore,
+        permissionHelper: PermissionHelper,
+        ttsManager: BabyTtsManager,
+        stopSignalBus: StopSignalBus
+    ) : this(
+        appContext = appContext,
+        aiRouter = aiRouter,
+        executor = executor,
+        extendedToolRouter = extendedToolRouter,
+        historyRepository = historyRepository,
+        actionLogRepository = actionLogRepository,
+        actionLogInterceptor = actionLogInterceptor,
+        offlineCommandEngine = offlineCommandEngine,
+        routineManager = routineManager,
+        macroManager = macroManager,
+        memoryManager = memoryManager,
+        notificationSummaryManager = notificationSummaryManager,
+        safetyManager = safetyManager,
+        keyStore = keyStore,
+        permissionHelper = permissionHelper,
+        ttsManager = ttsManager,
+        stopSignalBus = stopSignalBus,
+        latencyTracker = LatencyTracker(),
+        searchPlayEngine = null
+    )
+
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var activeJob: Job? = null
     private var activeTaskId: Long? = null
     private var pendingConfirmDeferred: CompletableDeferred<Boolean>? = null
+
+    @Volatile
+    private var lastSttDurationMs: Long = 0L
 
     private val _state = MutableStateFlow(AgentExecutionState())
     val state: StateFlow<AgentExecutionState> = _state.asStateFlow()
@@ -138,7 +192,12 @@ class AgentOrchestrator @Inject constructor(
             statusText = "Starting...",
             lastError = null,
             lastErrorDetails = null,
-            pendingConfirmation = null
+            pendingConfirmation = null,
+            activeMood = if (keyStore.settings.value.emotionIntensity == com.example.core.security.EmotionIntensity.OFF) {
+                BabyMood.CALM
+            } else {
+                BabyMood.THINKING
+            }
         )
 
         activeJob = scope.launch {
@@ -152,7 +211,9 @@ class AgentOrchestrator @Inject constructor(
             lastError = null,
             lastErrorDetails = null
         )
+        val sttStart = System.currentTimeMillis()
         val res = aiRouter.transcribeAudio(wavBytes)
+        lastSttDurationMs = (System.currentTimeMillis() - sttStart).coerceAtLeast(0L)
         return res.fold(
             onSuccess = { transcript ->
                 if (!transcript.modelSwitchedNotice.isNullOrBlank()) {
@@ -188,6 +249,7 @@ class AgentOrchestrator @Inject constructor(
                 val failure = (err as? AiCallException)?.failure
                 val friendlyErr = failure?.userMessage ?: SensitiveDataSanitizer.sanitizeError(
                     err.message ?: "Voice transcribe nahi ho paya",
+                    settings.inceptionApiKey,
                     settings.groqApiKey,
                     settings.geminiApiKey
                 )
@@ -302,10 +364,43 @@ class AgentOrchestrator @Inject constructor(
         )
 
         val settings = keyStore.settings.value
+        var finalResolvedMood = BabyMood.CALM
+
+        // Safety-first distress & helpline guard (before any tool or cloud call)
+        BabyMoodResolver.detectDistressAndHelpline(command)?.let { helplineReply ->
+            finalResolvedMood = BabyMood.EMPATHETIC
+            historyRepository.addMessage(
+                ChatMessageEntity(role = "assistant", content = helplineReply, brainUsed = "local")
+            )
+            historyRepository.updateTaskRun(
+                id = taskId,
+                status = "COMPLETED",
+                stepsCount = 1,
+                brainSummary = "Local",
+                finalReply = helplineReply,
+                stepLogsJson = "[]",
+                finishedAt = System.currentTimeMillis()
+            )
+            speakIfEnabled(helplineReply, languageHint, finalResolvedMood)
+            if (activeTaskId == taskId) {
+                activeTaskId = null
+                _state.value = AgentExecutionState(
+                    statusText = "Ready",
+                    activeMood = finalResolvedMood
+                )
+            }
+            return
+        }
 
         // Explicit confirmation gate for "Sab bhool jao" before wiping all memories
         if (MemoryManager.isWipeMemoryPhrase(command)) {
             val wipeReply = confirmAndWipeMemories(command, source, languageHint, settings)
+            finalResolvedMood = BabyMoodResolver.resolveMood(
+                rawReplyText = wipeReply,
+                userCommand = command,
+                intensity = settings.emotionIntensity,
+                understandUserMood = settings.understandMyMoodEnabled
+            ).mood
             historyRepository.addMessage(
                 ChatMessageEntity(role = "assistant", content = wipeReply, brainUsed = "local")
             )
@@ -318,17 +413,32 @@ class AgentOrchestrator @Inject constructor(
                 stepLogsJson = "[]",
                 finishedAt = System.currentTimeMillis()
             )
-            speakIfEnabled(wipeReply, languageHint)
+            speakIfEnabled(wipeReply, languageHint, finalResolvedMood)
             if (activeTaskId == taskId) {
                 activeTaskId = null
-                _state.value = AgentExecutionState(statusText = "Ready")
+                _state.value = AgentExecutionState(statusText = "Ready", activeMood = finalResolvedMood)
             }
             return
         }
 
-        // Fast local deterministic paths before hitting Groq/Gemini APIs
+        val loopStartMs = System.currentTimeMillis()
+        val sttMs = if (source == "voice") lastSttDurationMs.also { lastSttDurationMs = 0L } else 0L
+
+        // Fast local deterministic paths before hitting Mercury/Gemini/Groq APIs
+        val quickStartMs = System.currentTimeMillis()
         val quickLocalOutcome = tryQuickLocalExecution(command, source, languageHint, settings)
         if (quickLocalOutcome != null) {
+            val quickExecMs = (System.currentTimeMillis() - quickStartMs).coerceAtLeast(1L)
+            val isSos = command.lowercase().let {
+                it == "baby help" || it.startsWith("baby help ") || it.contains("emergency sos") || it == "help me baby"
+            }
+            finalResolvedMood = BabyMoodResolver.resolveMood(
+                rawReplyText = quickLocalOutcome,
+                userCommand = command,
+                intensity = settings.emotionIntensity,
+                understandUserMood = settings.understandMyMoodEnabled,
+                isSosOrAlert = isSos
+            ).mood
             historyRepository.addMessage(
                 ChatMessageEntity(role = "assistant", content = quickLocalOutcome, brainUsed = "local")
             )
@@ -341,11 +451,24 @@ class AgentOrchestrator @Inject constructor(
                 stepLogsJson = "[]",
                 finishedAt = System.currentTimeMillis()
             )
-            speakIfEnabled(quickLocalOutcome, languageHint)
+            val ttsStartMs = System.currentTimeMillis()
+            speakIfEnabled(quickLocalOutcome, languageHint, finalResolvedMood)
+            val ttsMs = (System.currentTimeMillis() - ttsStartMs).coerceAtLeast(0L)
+            latencyTracker.recordSimple(
+                command = command,
+                pathType = ExecutionPathType.FAST_PATH,
+                sttMs = sttMs,
+                intentOrLlmMs = quickExecMs,
+                toolMs = 0L,
+                ttsMs = ttsMs,
+                firstSpokenMs = quickExecMs,
+                totalMs = (System.currentTimeMillis() - loopStartMs).coerceAtLeast(1L),
+                status = "OK"
+            )
             updateWidgetLastTask(command, quickLocalOutcome)
             if (activeTaskId == taskId) {
                 activeTaskId = null
-                _state.value = AgentExecutionState(statusText = "Ready")
+                _state.value = AgentExecutionState(statusText = "Ready", activeMood = finalResolvedMood)
             }
             return
         }
@@ -368,6 +491,17 @@ class AgentOrchestrator @Inject constructor(
         var stepFailedError: String? = null
         var stepFailedErrorDetails: String? = null
         var lastStepCompleted = 0
+        var totalLlmMs = 0L
+        var totalToolMs = 0L
+        var firstSpokenMs = 0L
+        var lastBrainUsed: BrainType = BrainType.MERCURY
+        var ackSpoken = false
+
+        if (source == "voice" && isLikelyMultiStepCommand(command)) {
+            ackSpoken = true
+            firstSpokenMs = (System.currentTimeMillis() - loopStartMs).coerceAtLeast(1L)
+            speakIfEnabled("Theek hai, dekh rahi hoon...", languageHint)
+        }
 
         try {
             for (step in 0 until AgentExecutionState.MAX_STEPS) {
@@ -389,9 +523,14 @@ class AgentOrchestrator @Inject constructor(
                 _state.value = _state.value.copy(
                     isRunning = true,
                     currentStep = step + 1,
-                    statusText = "Soch rahi hoon (${step + 1}/15)..."
+                    statusText = "Soch rahi hoon (${step + 1}/15)...",
+                    streamingReply = ""
                 )
 
+                val streamBuf = StringBuilder()
+                var streamedFirstSentenceSpoken = false
+                var spokenStreamingPrefix = ""
+                val llmStepStartMs = System.currentTimeMillis()
                 val planRes = aiRouter.planNextStep(
                     turns = turns,
                     screenContext = screenContext,
@@ -399,8 +538,32 @@ class AgentOrchestrator @Inject constructor(
                     stepIndex = step,
                     isLocked = isLocked,
                     userLanguageHint = languageHint,
-                    memoryBlock = relevantMemoryBlock
+                    memoryBlock = relevantMemoryBlock,
+                    onStreamingToken = { token ->
+                        streamBuf.append(token)
+                        val cleanStreamRaw = AiResponseParser.stripReasoningForStreaming(streamBuf.toString())
+                        val cleanStream = BabyMoodResolver.stripMoodTagForStreaming(cleanStreamRaw)
+                        if (cleanStream.isNotBlank()) {
+                            _state.value = _state.value.copy(streamingReply = cleanStream)
+                            if (!streamedFirstSentenceSpoken &&
+                                settings.ttsRepliesEnabled &&
+                                !cleanStream.trimStart().startsWith("{")
+                            ) {
+                                val firstSentence = BabyTtsManager.splitSentences(cleanStream).firstOrNull()
+                                val hasBoundary = cleanStream.any { it == '.' || it == '!' || it == '?' || it == '।' || it == '\n' }
+                                if (hasBoundary && !firstSentence.isNullOrBlank() && firstSentence.length >= 12) {
+                                    streamedFirstSentenceSpoken = true
+                                    spokenStreamingPrefix = firstSentence
+                                    if (firstSpokenMs == 0L) {
+                                        firstSpokenMs = (System.currentTimeMillis() - loopStartMs).coerceAtLeast(1L)
+                                    }
+                                    ttsManager.speakStreamingSentence(firstSentence, languageHint, flushFirst = !ackSpoken)
+                                }
+                            }
+                        }
+                    }
                 )
+                totalLlmMs += (System.currentTimeMillis() - llmStepStartMs).coerceAtLeast(0L)
                 latestScreenshot = null
 
                 if (planRes.isFailure) {
@@ -449,6 +612,7 @@ class AgentOrchestrator @Inject constructor(
 
                     val friendlyMsg = failure?.userMessage ?: SensitiveDataSanitizer.sanitizeError(
                         err?.message ?: "AI abhi jawab nahi de pa rahi hai. Retry karo ya Settings > AI Models check karo.",
+                        curKeys.inceptionApiKey,
                         curKeys.groqApiKey,
                         curKeys.geminiApiKey
                     )
@@ -456,6 +620,13 @@ class AgentOrchestrator @Inject constructor(
                     stepFailedError = friendlyMsg
                     stepFailedErrorDetails = techDetails
                     finalReply = friendlyMsg
+                    finalResolvedMood = BabyMoodResolver.resolveMood(
+                        rawReplyText = friendlyMsg,
+                        userCommand = command,
+                        intensity = curKeys.emotionIntensity,
+                        understandUserMood = curKeys.understandMyMoodEnabled,
+                        isError = true
+                    ).mood
                     historyRepository.addMessage(
                         ChatMessageEntity(
                             role = "assistant",
@@ -474,19 +645,33 @@ class AgentOrchestrator @Inject constructor(
                         stepLogsJson = stepLogs.toString(),
                         finishedAt = System.currentTimeMillis()
                     )
-                    speakIfEnabled(friendlyMsg, languageHint)
+                    speakIfEnabled(friendlyMsg, languageHint, finalResolvedMood)
                     return
                 }
 
                 val plan = planRes.getOrThrow()
+                lastBrainUsed = plan.brainUsed
                 brainsUsed.add(plan.brainUsed.label)
                 _state.value = _state.value.copy(
                     activeBrain = plan.brainUsed,
-                    oneTimeNotice = plan.modelSwitchedNotice ?: _state.value.oneTimeNotice
+                    oneTimeNotice = plan.modelSwitchedNotice ?: _state.value.oneTimeNotice,
+                    streamingSources = plan.sources
                 )
 
                 if (plan.toolCalls.isEmpty()) {
-                    finalReply = plan.replyText ?: "Ho gaya!"
+                    val curSettings = keyStore.settings.value
+                    val moodOutcome = BabyMoodResolver.resolveMood(
+                        rawReplyText = plan.replyText ?: "Ho gaya!",
+                        userCommand = command,
+                        intensity = curSettings.emotionIntensity,
+                        understandUserMood = curSettings.understandMyMoodEnabled
+                    )
+                    val baseReply = moodOutcome.cleanedText.ifBlank { "Ho gaya!" }
+                    finalResolvedMood = moodOutcome.mood
+                    finalReply = if (plan.sources.isNotEmpty()) {
+                        val sourceLines = plan.sources.take(3).joinToString("\n") { "- [${it.title}](${it.uri})" }
+                        "$baseReply\n\nSources:\n$sourceLines"
+                    } else baseReply
                     historyRepository.addMessage(
                         ChatMessageEntity(
                             role = "assistant",
@@ -503,9 +688,45 @@ class AgentOrchestrator @Inject constructor(
                         stepLogsJson = stepLogs.toString(),
                         finishedAt = System.currentTimeMillis()
                     )
-                    speakIfEnabled(finalReply, languageHint)
-                    updateWidgetLastTask(command, finalReply)
+                    if (firstSpokenMs == 0L) {
+                        firstSpokenMs = (System.currentTimeMillis() - loopStartMs).coerceAtLeast(1L)
+                    }
+                    val ttsStart = System.currentTimeMillis()
+                    if (streamedFirstSentenceSpoken && spokenStreamingPrefix.isNotBlank()) {
+                        val remaining = baseReply.removePrefix(spokenStreamingPrefix).trim()
+                        if (remaining.isNotEmpty() && curSettings.ttsRepliesEnabled) {
+                            ttsManager.speakStreamingSentence(remaining, languageHint, flushFirst = false)
+                        }
+                    } else {
+                        speakIfEnabled(baseReply, languageHint, finalResolvedMood)
+                    }
+                    val ttsMs = (System.currentTimeMillis() - ttsStart).coerceAtLeast(0L)
+                    val path = when (lastBrainUsed) {
+                        BrainType.MERCURY -> ExecutionPathType.MERCURY
+                        BrainType.GEMINI -> ExecutionPathType.GEMINI
+                        BrainType.GROQ -> ExecutionPathType.GROQ
+                    }
+                    latencyTracker.recordSimple(
+                        command = command,
+                        pathType = path,
+                        sttMs = sttMs,
+                        intentOrLlmMs = totalLlmMs,
+                        toolMs = totalToolMs,
+                        ttsMs = ttsMs,
+                        firstSpokenMs = firstSpokenMs,
+                        totalMs = (System.currentTimeMillis() - loopStartMs).coerceAtLeast(1L),
+                        status = "OK"
+                    )
+                    updateWidgetLastTask(command, baseReply)
                     return
+                }
+
+                if (!ackSpoken && source == "voice" && step == 0 && plan.toolCalls.isNotEmpty() &&
+                    ToolDefinitions.requiresUnlockedScreen(plan.toolCalls.first().name)
+                ) {
+                    ackSpoken = true
+                    firstSpokenMs = (System.currentTimeMillis() - loopStartMs).coerceAtLeast(1L)
+                    speakIfEnabled("Theek hai, abhi karti hoon.", languageHint)
                 }
 
                 // Execute planned tool calls
@@ -595,6 +816,7 @@ class AgentOrchestrator @Inject constructor(
                     }
 
                     _state.value = _state.value.copy(statusText = "Running: ${call.name}")
+                    val toolStartMs = System.currentTimeMillis()
                     val result = actionLogInterceptor.executeLogged(
                         commandText = command,
                         toolName = call.name,
@@ -604,6 +826,7 @@ class AgentOrchestrator @Inject constructor(
                         extendedToolRouter.tryExecute(call.name, call.args)
                             ?: executor.execute(call.name, call.args)
                     }
+                    totalToolMs += (System.currentTimeMillis() - toolStartMs).coerceAtLeast(0L)
                     if (result.screenshotBase64 != null && !curSettings.dataSaverEnabled) {
                         latestScreenshot = result.screenshotBase64
                     }
@@ -696,6 +919,7 @@ class AgentOrchestrator @Inject constructor(
             val failure = (t as? AiCallException)?.failure
             val safeErr = failure?.userMessage ?: SensitiveDataSanitizer.sanitizeError(
                 t.message ?: "Task complete nahi ho paya. Retry karo.",
+                curKeys.inceptionApiKey,
                 curKeys.groqApiKey,
                 curKeys.geminiApiKey
             )
@@ -703,6 +927,12 @@ class AgentOrchestrator @Inject constructor(
             stepFailedError = safeErr
             stepFailedErrorDetails = details
             finalReply = safeErr
+            finalResolvedMood = BabyMoodResolver.resolveMood(
+                rawReplyText = safeErr,
+                userCommand = command,
+                intensity = curKeys.emotionIntensity,
+                isError = true
+            ).mood
             withContext(NonCancellable) {
                 historyRepository.addMessage(
                     ChatMessageEntity(
@@ -731,7 +961,8 @@ class AgentOrchestrator @Inject constructor(
                     queuedCount = _state.value.queuedCount,
                     lastError = stepFailedError,
                     lastErrorDetails = stepFailedErrorDetails,
-                    oneTimeNotice = _state.value.oneTimeNotice
+                    oneTimeNotice = _state.value.oneTimeNotice,
+                    activeMood = finalResolvedMood
                 )
             }
         }
@@ -854,7 +1085,24 @@ class AgentOrchestrator @Inject constructor(
             }
         }
 
-        // 8. Offline deterministic commands (flashlight, volume, brightness, alarm, DND, open app, call contact)
+        // 8. Search-and-Play recipes ("YouTube par Arijit Singh ka gaana bajao", "Spotify pe Kesariya chalao", etc.)
+        if (searchPlayEngine != null && !permissionHelper.isDeviceLocked()) {
+            SearchPlayEngine.extractSearchPlayIntent(command)?.let { intent ->
+                val result = searchPlayEngine.executeSearchAndPlay(intent.appKey, intent.query, intent.autoPlay)
+                actionLogRepository.record(
+                    commandText = command,
+                    toolName = "search_in_app",
+                    argsSummary = "app=${intent.appKey}, query=${intent.query}, autoPlay=${intent.autoPlay}",
+                    resultText = result.output,
+                    targetApp = intent.appKey,
+                    status = if (result.ok) "OK" else "ERR",
+                    source = normSource
+                )
+                return result.output
+            }
+        }
+
+        // 9. Offline deterministic commands (flashlight, volume, brightness, alarm, DND, open app, call contact)
         offlineCommandEngine.tryExecuteOffline(command)?.let { match ->
             actionLogRepository.record(
                 commandText = command,
@@ -880,9 +1128,11 @@ class AgentOrchestrator @Inject constructor(
         BabyWidgetProvider.refreshAllWidgets(appContext)
     }
 
-    private fun speakIfEnabled(text: String, languageHint: String) {
-        if (keyStore.settings.value.ttsRepliesEnabled) {
-            ttsManager.speak(text, languageHint)
+    private fun speakIfEnabled(text: String, languageHint: String, mood: BabyMood = BabyMood.CALM) {
+        val cur = keyStore.settings.value
+        if (cur.ttsRepliesEnabled) {
+            val style = BabyMoodResolver.ttsStyleDirective(mood, cur.emotionIntensity)
+            ttsManager.speak(text, languageHint, styleDirective = style)
         }
     }
 
@@ -895,5 +1145,19 @@ class AgentOrchestrator @Inject constructor(
         } else {
             keyStore.settings.value.preferredLanguage.name.lowercase()
         }
+    }
+
+    private fun isLikelyMultiStepCommand(command: String): Boolean {
+        val l = command.lowercase()
+        return l.contains("youtube") ||
+            l.contains("spotify") ||
+            l.contains("amazon") ||
+            l.contains("flipkart") ||
+            l.contains("screen") ||
+            l.contains("camera") ||
+            l.contains("search") ||
+            l.contains("bajao") ||
+            l.contains("dhundo") ||
+            l.contains("summarize")
     }
 }

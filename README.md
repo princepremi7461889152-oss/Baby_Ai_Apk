@@ -1,168 +1,77 @@
 # Baby — Native Android AI Phone Assistant
 
-**Baby** is a native Kotlin + Jetpack Compose voice and text AI phone assistant that controls the device via Accessibility, Notification Listener, Quick Settings Tile, Floating Bubble, and Foreground Background Listening — even when the screen is off or locked.
+**Baby** is a native Kotlin + Jetpack Compose (Material 3, Min SDK 26, Target SDK 34) voice and text AI phone assistant that controls Android via Accessibility, Notification Listener, Call Screening, Quick Settings Tiles, Floating Bubble, and Foreground Background Listening — including while the screen is off or locked.
 
-## Key Features
-- **Identity & Personality**: Friendly Hinglish by default (automatically adapts to Hindi, Hinglish, or English). Always introduces itself as **Baby**.
-- **Dual Wake Word**: Responds to both **"Hey Baby"** and **"Baby"** with an adjustable sensitivity slider and a 2-second cooldown to prevent false triggers. Say **"Baby stop"** (or double-press Volume Down / tap STOP) anytime to abort a running task.
-- **Dual-Brain AI Routing + Auto-Fallback**:
-  - **Groq (`llama-3.3-70b-versatile`)**: Fast brain for intent detection, structured function calling, and quick replies.
-  - **Groq Whisper (`whisper-large-v3-turbo`)**: Accurate Hinglish / Hindi / English speech-to-text.
-  - **Gemini (`gemini-3.8-flash`)**: Heavy brain for screenshot vision analysis and complex multi-step reasoning.
-  - Automatic fallback switches brains seamlessly if one provider hits a rate limit or network error.
-- **Autonomous Agent Loop (Max 15 Steps)**: `Observe (UI tree + optional screenshot) -> Plan -> Act -> Verify -> Repeat` with a confirmation gate before sensitive actions (payments, UPI, sending SMS/WhatsApp, deleting data, uninstalling apps).
-- **Background & Locked Phone Support**:
-  - `BabyForegroundService` (`START_STICKY`, partial `WakeLock`, persistent notification `"Baby is listening"`).
-  - `BootReceiver` auto-restarts Baby after reboot.
-  - Non-UI tasks (calls, alarms, timers, flashlight, volume, media, DND, notification reading, TTS) run while locked. UI-automation tasks queue safely, speak `"Unlock karo, kaam shuru karta hoon."`, and resume automatically upon unlock (`ACTION_USER_PRESENT`).
-- **On-Device Privacy**: No login or Google Sign-In. API keys are encrypted locally using Android Keystore (`EncryptedSharedPreferences`). Chat and task logs stay in local Room SQLite.
+## 1. Identity & Language Behavior
+- **Name**: **Baby** (never self-identifies as Gemini, Mercury, Llama, GPT-OSS, Qwen, Groq, or Inception).
+- **Wake Words**: `"Hey Baby"` and `"Baby"` (pluggable `KeywordSpotter` on a single 16 kHz `AudioRecord` loop).
+- **Language & Script**: Friendly, short, natural **Hinglish** in Latin script by default; automatically matches the user's Hindi/Hinglish/English language and script (never converts Hinglish/English into Devanagari).
+- **Emergency Stop**: Say `"Baby stop"`, double-press Volume Down, tap **STOP** in the UI, or tap **Stop Task** in the persistent notification.
 
-## Project Structure
+## 2. Triple-Brain AI Routing & Speed Architecture
+All base URLs and model IDs live in one editable config (`AiModelConfig` + Settings → AI Models) with **zero login** and **EncryptedSharedPreferences** key storage:
+
+| Role | Provider & Default Model | Notes |
+| --- | --- | --- |
+| **MIND** (chat, intents, function calling, agent loop) | **Inception Labs `mercury-3`** | OpenAI-compatible API (`https://api.inceptionlabs.ai/v1/chat/completions`), **SSE streaming**, `reasoning_effort`, JSON tool calls |
+| **VISION & SEARCH** (camera, screen help, grounded search) | **Gemini `gemini-3.8-flash`** | Multimodal `inline_data` + `google_search` tool; sends `thinkingConfig.thinkingLevel` (`low`/`medium`); never sends `temperature`/`topP`/`topK`/`candidateCount` or `"minimal"` |
+| **STT** (voice transcription) | **Groq `whisper-large-v3-turbo`** | Multipart WAV transcription (`response_format=json`) |
+| **CHAT FALLBACK** | **Groq `openai/gpt-oss-120b`** (alt: `qwen/qwen3.6-27b`) | Automatically engaged if Mercury -> Gemini fail or when Groq First is chosen |
+
+- **404 Live Model Recovery**: On HTTP 404 / `model_not_found`, Baby fetches the live model list from the provider, picks a valid replacement, saves it to `SecureKeyStore`, retries once, and notifies the user cleanly.
+- **Error Handling**: `429/500/502/503/504` and network timeouts retry up to 3 times with exponential backoff + jitter before switching providers; `400/401/403/404` show concise friendly Hinglish guidance without raw JSON.
+- **Built-in Benchmark (`CompareModelsScreen`)**: Runs **30 Hinglish benchmark commands** across configured providers and reports pass/fail, latency, and tool-call accuracy.
+- **Speed Optimizations**:
+  - **Local Fast Path (`FastPathIntentMatcher`, `<300ms`)** executes offline before any LLM call for flashlight, Wi-Fi, Bluetooth, DND, volume, brightness, alarm, timer, open app, call contact, media play/pause/next/prev, back, and home.
+  - **Streaming First-Sentence TTS (`BabyTtsManager`)**: Tier A (Android TTS) handles short replies (`<8 words`), offline mode, or >1.5s cloud timeout; Tier B (Gemini `gemini-3.8-flash-lite-tts` / `gemini-3.8-flash-tts`) handles rich long replies with audio disk cache.
+  - **OkHttp Warmup & Step Latency Debug (`LatencyTracker`, `LatencyDebugScreen`)**: Tracks Fast Path / STT / LLM / Tool / TTS latency per request.
+
+## 3. Core & Extended Features
+1. **Phone Control & Installed App Index (`AppResolver`, `PackageChangeReceiver`)**: Scans launcher apps (Android 11+ `<queries>`), fuzzy-matches 35+ Hinglish aliases (`yutub`, `insta`, `whatsap`, `gpay`, `phonepe`, `paytm`, `krome`, etc.) + user-editable aliases, asks on ambiguity, handles Android 10+ background launch restrictions via Accessibility/Overlay or a full-screen `"Tap to open"` fallback notification, and logs every launch attempt.
+2. **Search-and-Play Engine (`SearchPlayEngine`, `RecipeTestScreen`)**: 10 editable JSON app recipes (`YouTube`, `YouTube Music`, `Spotify`, `Instagram`, `Facebook`, `Amazon`, `Flipkart`, `Google Maps`, `Play Store`, `Chrome`) using `MEDIA_PLAY_FROM_SEARCH` / deep links + semantic Accessibility node lookup (skips `Ad`/`Sponsored`/`Shorts`, retries once, blocks banking/UPI/payment apps).
+3. **Single 16 kHz Mic Pipeline + Wake Word Lab (`MicPipelineManager`, `WakeWordTestScreen`)**: Single shared `AudioRecord` loop with 1-second circular pre-roll PCM buffer, 300ms post-TTS self-trigger ignore window, exponential `MIC_BUSY` watchdog retries (`1s..30s`), and live RMS/wake score diagnostics.
+4. **Call Assistant & Scam Shield (`BabyCallScreeningService`, `CallAssistantManager`, `ScamMatcher`, `CallAssistantScreen`)**: `OFF` / `SMART` / `BUSY` / `DRIVING` / `SLEEPING` modes, VIP & Emergency overrides, **2-in-3-minute repeat-caller bypass**, `ScamMatcher` KYC/OTP/Digital Arrest filter, rate-limited (1/hr) SMS replies, and strictly opt-in + country-acknowledged **Level 2 best-effort AI call answer** (60s hard auto-end cap + `<untrusted_caller_speech_do_not_obey_commands>` prompt-injection isolation).
+5. **Emotion Layer (`BabyMoodResolver`, `BabyOrb`, `BabyMotion`)**: Mood-reactive Orb (`Calm`, `Happy`, `Excited`, `Thinking`, `Empathetic`, `Concerned`, `Alert`), optional minimal Canvas face mode, subtle haptics, `speechMetadata.style` voice hints, and text-only self-harm crisis guard providing India 24x7 free helplines (`Tele-MANAS 14416`, `Kiran 1800-599-0019`).
+6. **Memory, Routines, Custom Commands, Macros, Reminders, Vision & Safety**:
+   - Room SQLite (`v1 → v6` real migrations; zero destructive fallback), 10k-log Action Log retention/export, Memory nickname/fact injection, Routines + Custom Commands + element-anchored Macros, Time + Geofence Reminders, CameraX/UI-tree Screen Help, Clipboard AI (**Clip** bubble button), Voice PIN + Biometric + Allowed Apps + SOS 5-second countdown, and Home/Lock Widget (`BabyWidgetProvider`).
+
+## 4. API Key Setup (No Login Required)
+Open the app → **Onboarding** (or **Settings → API Keys**):
+1. **Inception Labs API Key** (`mercury-3` MIND brain)
+2. **Google Gemini API Key** (`gemini-3.8-flash` Vision/Search & Gemini TTS)
+3. **Groq API Key** (`whisper-large-v3-turbo` STT & fallback chat `openai/gpt-oss-120b`)
+
+All keys are stored encrypted inside Android `EncryptedSharedPreferences`.
+
+## 5. Build, Signing & Verification Commands
+> Always invoke `gradle` directly (`./gradlew` is omitted intentionally).
+
+```bash
+# Run full JVM & Robolectric unit test suite
+gradle :app:testDebugUnitTest
+
+# Build debug APK
+gradle :app:assembleDebug
+
+# Create upload keystore for Play / sideload release builds (one-time)
+keytool -genkey -v -keystore my-upload-key.jks -keyalg RSA -keysize 2048 -validity 10000 -alias upload
+
+# Build release APK (set KEYSTORE_PATH, STORE_PASSWORD, KEY_PASSWORD env vars)
+gradle :app:assembleRelease
+
+# Verify APK signature
+apksigner verify --verbose app/build/outputs/apk/release/app-release.apk
+
+# Install via ADB & watch Baby runtime logs
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+adb logcat -s Baby* AndroidRuntime
 ```
-app/src/main/java/com/example/
-├── BabyApplication.kt
-├── MainActivity.kt
-├── core/security/SecureKeyStore.kt
-├── data/
-│   ├── local/ (BabyDatabase.kt, Entities.kt, Daos.kt, HistoryRepository.kt)
-│   └── remote/ (GeminiApiService.kt, GeminiModels.kt, GroqApiService.kt, GroqModels.kt)
-├── di/AppModule.kt
-├── domain/
-│   ├── ai/ (AiRouter.kt, AgentOrchestrator.kt)
-│   └── tools/ (ToolDefinitions.kt, PhoneControlExecutor.kt, StopSignalBus.kt)
-├── service/
-│   ├── BabyForegroundService.kt
-│   ├── BabyAccessibilityService.kt
-│   ├── BabyNotificationListenerService.kt
-│   ├── BabyQuickSettingsTileService.kt
-│   ├── FloatingBubbleController.kt
-│   └── BootReceiver.kt
-├── ui/
-│   ├── navigation/Routes.kt
-│   ├── screens/ (OnboardingScreen.kt, ChatScreen.kt, HistoryScreen.kt, SettingsScreen.kt)
-│   ├── theme/ (Color.kt, Theme.kt, Type.kt)
-│   └── viewmodel/BabyViewModel.kt
-├── util/PermissionHelper.kt
-└── voice/ (AudioRecorderManager.kt, BabyTtsManager.kt, WakeWordDetector.kt)
-```
 
-## Setup & Build Steps
-1. Open the project in Android Studio (JDK 11+, Android SDK 34/36, minSdk 26).
-2. Build the debug APK:
-   ```bash
-   gradle assembleDebug
-   ```
-3. Install on an Android 8.0+ (API 26+) device and complete the step-by-step **Onboarding Wizard**:
-   - Grant Microphone, Notifications, and optional Phone/Contacts/SMS permissions.
-   - Enable **Baby Phone Control** in Android Accessibility Settings.
-   - Enable **Baby Notification Reader** in Notification Access Settings.
-   - Allow **Ignore Battery Optimizations** and follow the OEM Autostart guide (Xiaomi/Oppo/Vivo/Samsung).
-   - Paste your **Groq API Key** and **Gemini API Key** in Onboarding or Settings.
-4. Add the **Baby** Quick Settings tile from the notification shade for one-tap voice access anywhere.
+- **Room Migrations**: `MIGRATION_1_2` (Phase 1–3 core tables), `MIGRATION_2_3` (`action_logs.source`, `memories.createdAt`), `MIGRATION_3_4` (`saved_places`), `MIGRATION_4_5` (`app_aliases`), `MIGRATION_5_6` (`search_recipes`, `call_screening_logs`).
 
-## Extended Features & How to Test
-
-### 1. Action Log (`ActionLogInterceptor`, `ActionLogRepository`, `HistoryScreen`)
-- **Schema & Interceptor**: Every tool call in the agent loop passes through `ActionLogInterceptor` storing `timestamp`, `commandText`, `toolName`, `resultText`, `targetApp`, and `source` (`voice`, `text`, `routine`, `auto-reply`).
-- **How to Test**:
-  1. Run a voice command (`"Flashlight on karo"`), a text command, a routine (`"Good morning"`), and an auto-reply.
-  2. Open **History → Action Log**, filter by **Date (`TODAY` / `7D`)**, **Source**, **Status**, or **App**, and search by keyword.
-  3. Tap the download icon to export as `baby_action_log.txt` or share as plain text; change **Auto-Delete Action Logs After** (`7 / 30 / 90 days` or `Forever`) in **Settings**.
-
-### 2. Memory (`MemoryManager`, `PhoneControlExecutor`, `MemoryScreen`)
-- **Nicknames & Top-10 Injection**: Nicknames/preferences/facts/habits are stored in Room (`memories`), up to 10 keyword-matched items are injected per LLM call, and contact nicknames resolve automatically in calls/SMS/WhatsApp.
-- **How to Test**:
-  1. Say `"yaad rakhna Mummy ka naam Sunita Sharma hai"` or add a `NICKNAME` (`Mummy -> 98...` or contact name) in **Settings → Manage Memories**.
-  2. Ask `"Mummy ko call karo"` — Baby resolves the nickname before querying contacts.
-  3. Edit/delete single memories in **Manage Memories** (or ask `"delete memory Mummy"`). Say `"Sab bhool jao"` and verify Baby asks for confirmation before wiping.
-
-### 3. Daily Routines (`RoutineManager`, `RoutineTriggerWorker`, `RoutinesScreen`)
-- **Built-ins & Triggers**: `"Good morning"` (stop alarm → weather → calendar events → notification summary), `"Good night"`, `"Leaving home"`, `"Reached home"`, plus custom routines (`MANUAL`, `TIME`, `CHARGING`, `HEADPHONES`). Sensitive actions (payments, SMS/WhatsApp, delete, uninstall) are stripped/blocked from routines.
-- **How to Test**:
-  1. Open **Routines**, run `"Good morning"`, or say `"routine banao: jab main bolu study mode to DND on aur brightness 20% karo"`.
-  2. Tap **Edit** on a routine to set trigger mode (`TIME`, `CHARGING`, or `HEADPHONES`) and connect earphones to test headphone auto-trigger.
-  3. Trigger a routine with UI steps while screen is locked — non-UI steps run immediately and UI steps queue until unlock.
-
-### 4. Auto-Reply (`AutoReplyManager`, `AutoReplyQuickSettingsTileService`, `BabyNotificationListenerService`)
-- **Modes & Safety**: Supports `Busy`, `Driving`, `Sleeping`, `Custom` (via inline notification reply or `SmsManager` SMS fallback for SMS/missed calls), optional Groq Hinglish reply, per-contact ALLOW/NEVER rules, group chat ignore (default ON), scheduled active hours, 1-reply/contact/hour rate limit, persistent `"Auto-reply ON (mode)"` notification, and a **Baby Auto-Reply** Quick Settings tile.
-- **How to Test**:
-  1. Enable **Auto-Reply** in **Settings** (or tap the **Baby Auto-Reply** Quick Settings tile), choose a mode (`Busy` / `Custom`), customize templates, and verify `"Auto-reply ON (...)"` appears in the foreground notification.
-  2. Receive a WhatsApp/SMS notification from a non-blocked contact and confirm an auto-reply is sent once per hour and logged in **Action Log** with `[auto-reply]`.
-
-### Phase 2 Modules & How to Test
-
-#### 5. Notification Summary (`NotificationSummaryManager`, `ScheduledSummaryWorker`)
-- **Features**: `"Notifications batao"` generates a Hinglish summary ordered **People first, Updates next, Promos last** via Groq (`summarize_notifications(scope)`). Scheduled morning/evening summaries post notifications via WorkManager (speaking aloud optional). **OTPs & banking alerts are masked by default** and never read aloud unless enabled in Settings.
-- **How to Test**:
-  1. Ensure **Notification Access** and **Notification Summary** are enabled in Settings.
-  2. Say `"Notifications batao"` (or `"WhatsApp notifications batao"`) — verify people messages appear before promos and OTPs/bank figures show `[OTP/Bank alert masked]`.
-  3. Toggle **Morning / Evening Summary** in Settings, and optionally test enabling **Allow Reading OTPs & Banking Alerts**.
-
-#### 6. Reminders & Saved Places (`ReminderManager`, `RemindersScreen`, `BootReceiver`)
-- **Features**: Natural-language reminders (`"shaam 6 baje doodh yaad dilana"`) parsed via Groq + `AlarmManager`, Geofencing location reminders (`"ghar pahunchu to bolna"`), saved **Home/Work** places (via voice `save_place`, current GPS, or interactive Map Picker), **Reminders** screen with **list, edit, delete, snooze**, notification **Snooze 10m / Done** actions, and `BootReceiver` reboot rescheduling (`set_reminder`, `list_reminders`, `delete_reminder`).
-- **How to Test**:
-  1. Say `"Shaam 6 baje doodh yaad dilana"` and verify it appears in the **Reminders** tab.
-  2. Tap **Snooze** or **Edit** or **Delete** on the reminder card.
-  3. Enable **Location Reminders** in Settings (location permission requested only then), tap **Pick Home** on the Reminders tab to save Home via GPS/Map Picker, and add a `"Ghar pahunchu to..."` reminder.
-
-#### 7. Screen Help (`ScreenHelpManager`)
-- **Features**: `"Ye kya hai?"`, `"isko translate karo"`, `"isko summarize karo"` uses the **Accessibility UI tree first**, capturing a screenshot for Gemini Vision **only when the UI tree lacks readable text and Data Saver is OFF** (`explain_screen(mode)`).
-- **How to Test**:
-  1. Open any text-rich app (e.g. a WhatsApp chat or Settings) and ask `"Isko summarize karo"` or `"Isko translate karo"` — confirm it uses the UI tree without capturing a screenshot.
-  2. Turn **Data Saver** ON in Settings and open an image-only screen — verify Baby still restricts itself to the text tree only.
-
-#### 8. Clipboard AI (`ClipboardAiManager`, `ClipboardActionActivity`, `FloatingBubbleController`)
-- **Features**: On-demand summarize, translate, or draft-reply for copied text via voice (`read_clipboard_and_process(mode)`) or the **Clip** button on the floating bubble. Never reads clipboard in the background.
-- **How to Test**:
-  1. Copy any English/Hindi paragraph or message.
-  2. Tap **Clip** on the Floating Bubble (or say `"Clipboard summarize karo"` / `"Clipboard ka reply draft karo"`) and pick **Summarize**, **Translate**, or **Draft Reply**.
-
-#### 9. Camera + Vision (`CameraVisionManager`, `CameraCaptureActivity`)
-- **Features**: `"Ye kya hai?"` / camera icon opens `CameraCaptureActivity`, captures one temporary photo in `cacheDir` (never saved to Gallery), sends it to Gemini Vision (`capture_and_describe(question)`), speaks the Hinglish answer, and deletes the temp file right after the API call.
-- **How to Test**:
-  1. Tap the Camera icon in Chat (or say `"Camera se dekho ye kya hai?"`). Grant Camera permission if prompted on first use.
-  2. Confirm Baby captures one photo, speaks the Hinglish description, and leaves no photo in Gallery.
-
-### Phase 3 Modules & How to Test
-
-#### 10. Custom Commands (`RoutineManager` reuse, `RoutinesScreen` → Commands tab)
-- **Features**: Define custom multi-action phrases (e.g. `"Movie mode"` -> DND on, brightness low, media volume 40%, open Netflix) by voice (`"Naya command banao..."`) or UI, reusing `RoutineManager` (`scheduleType = "COMMAND"`) without duplicating execution logic. Includes enable toggle and tools `create_command`, `run_command`, `list_commands`, `delete_command`.
-- **How to Test**:
-  1. Open **Routines → Commands**, tap **Add Movie Mode** preset (or create your own), and confirm actions appear in order.
-  2. Say `"Movie mode"` or tap **Run** — verify all steps execute cleanly and log in **Action Log**.
-
-#### 11. Macro Recording (`MacroManager`, `BabyAccessibilityService`, `RoutinesScreen` → Macros tab)
-- **Features**: `"Macro record shuru karo"` captures Accessibility taps, scrolls (debounced), and text inputs (coalesced) with element identifiers (`viewId`, `targetText`, `contentDesc`, `packageName`) — never raw coordinates alone. `"Macro save karo [name]"` saves in Room and `"[name] chalao"` replays. Replay verifies each element, retries once after 750ms, and stops naming the failed step if still missing. Password/OTP/payment screens are automatically skipped with a spoken warning. UI macros queue safely while locked and run automatically after unlock. Tools: `start_macro_recording`, `stop_macro_recording`, `run_macro`, `list_macros`, `delete_macro`.
-- **How to Test**:
-  1. Say `"Macro record shuru karo"` (or tap **Start Macro Recording**), tap through 2–3 non-sensitive screens, then say `"Macro save karo Open Notes"` (or tap **Save**).
-  2. Open a password or UPI screen while recording — confirm Baby skips the step and warns you.
-  3. Trigger `"[name] chalao"` while the phone is locked to confirm it queues until unlock, or while unlocked on the wrong screen to confirm 1 retry + clear step-failure message.
-
-#### 12. Safety Features (`SafetyManager`, `SecureKeyStore`, `StopSignalBus`)
-- **Features**: Keystore-backed salted SHA-256 Voice PIN + optional `BiometricPrompt` gate before sensitive actions (payments, delete, uninstall, security settings); Allowed Apps allowlist with spoken refusal when disabled apps are blocked; automatic blocklist for banking/UPI apps, password managers, and system security screens; Panic Stop (`"Baby stop"`, Stop button, foreground notification **Stop Task**, and double-press Volume Down) halting active task, macro, and routine immediately.
-- **How to Test**:
-  1. Set a Voice PIN in **Settings → Safety & Emergency** (and toggle Biometric if supported), then ask Baby to uninstall an app or send money — confirm PIN/biometric prompt blocks execution until verified.
-  2. Turn on **Allowed Apps Only**, add only 1–2 apps, then ask `"Open Instagram"` — verify Baby speaks the refusal aloud.
-  3. Run a multi-step task/macro and say `"Baby stop"` (or tap **Stop**) to verify immediate cancellation.
-
-#### 13. Emergency Mode (`SafetyManager`, `BabyForegroundService`)
-- **Features**: `"Baby help"` or optional **Power-Button Multi-Press** (4 rapid screen ON/OFF toggles within 3.5s) starts a **5-second countdown** with a **Cancel SOS** dialog/notification action and voice cancel (`"Cancel"`, `"Mat bhejo"`). Dispatches SMS with live GPS location link (plus custom SOS message and optional auto-call) to up to **5 saved emergency contacts**, even while locked, and logs `send_emergency_alert` in **Action Log**.
-- **How to Test**:
-  1. Enable **Emergency Mode** in **Settings** (grants `SEND_SMS` / `ACCESS_FINE_LOCATION` on-demand) and add up to 5 contacts + custom message.
-  2. Say `"Baby help"` — confirm the 5s countdown appears with **Cancel SOS** and cancels cleanly when tapped or spoken; let it finish with real contacts to verify SOS SMS + location link dispatch.
-
-#### 14. Extras: Offline Commands, Personality, Data Saver & Home/Lock Widget (`OfflineCommandEngine`, `BabyWidgetProvider`)
-- **Features**: Offline pattern matching works without internet for `flashlight`, `volume`, `brightness`, `alarm`, `DND`, `open app`, and `call contact`. Switch Personality (`Friendly` / `Funny` / `Serious`) and **Data Saver** (compact AI history, no screenshots, shorter replies). Includes a resizable Home & Keyguard Lock-Screen widget (`Mic`, `SOS`, `Stop`, and **last task summary**) plus lock-screen/launcher app shortcut (`res/xml/shortcuts.xml`).
-- **How to Test**:
-  1. Enable Airplane Mode and say `"Flashlight on karo"`, `"Volume 50%"`, or `"Mummy ko call karo"` — verify instant offline execution.
-  2. Toggle **Data Saver** and test **Personality** (`Funny` vs `Serious`) in Settings.
-  3. Add the **Baby** widget to the Home/Lock screen (Android launcher widget picker), tap **Mic**, and confirm **Last:** updates after a command.
-
-## Permissions & Room Schema Migrations
-- **On-Demand Permissions** (no additions needed in `AndroidManifest.xml` for Phase 3; `SEND_SMS`, `CALL_PHONE`, `ACCESS_FINE_LOCATION`, `USE_BIOMETRIC` are already declared and requested only when each feature is enabled/used):
-  - `CAMERA`, `ACCESS_FINE_LOCATION`, `SCHEDULE_EXACT_ALARM`, `READ_CALENDAR`, `SEND_SMS`, `CALL_PHONE`, `USE_BIOMETRIC`.
-- **Room Database v1 → v2 (`MIGRATION_1_2`)**: Adds `routines`, `auto_reply_rules`, `memories`, `action_logs`, `reminders`, `macros`, `allowed_apps`, and `emergency_contacts`.
-- **Room Database v2 → v3 (`MIGRATION_2_3`)**: Adds `source` to `action_logs` and `createdAt` to `memories`.
-- **Room Database v3 → v4 (`MIGRATION_3_4`)**: Adds `saved_places` table for Home/Work/custom geofence coordinates.
-- **Phase 3 Schema Note**: No Room schema migration was needed in Phase 3 (database remains at v4); Custom Commands reuse `routines` (`scheduleType = "COMMAND"`) and Macro element identifiers live inside existing `macros.stepsJson`.
-
+## 6. Physical-Device QA Checklist & Honest Disclosures
+Because automated CI/container builds do not attach real cellular hardware or live external API keys, verify these items on a physical Android 8.0–15 device:
+- [ ] Grant **Microphone**, **Notifications**, **Accessibility**, **Notification Access**, **Display Over Other Apps**, and **Ignore Battery Optimizations** (disable OEM Autostart/MIUI/ColorOS battery killers).
+- [ ] Test `"Hey Baby, flashlight on karo"`, `"YouTube par Arijit Singh ka gaana bajao"`, locked-screen `"Unlock karo"` queueing, and `"Baby stop"`.
+- [ ] **Call Assistant Level 2 Limitation**: Standard unprivileged Android apps **cannot inject TTS audio directly into the cellular uplink (TX) stream**; Level 2 works best-effort via speakerphone + mic disclosure.
+- [ ] **Sideloading**: Installing debug/self-signed APKs may trigger Google Play Protect confirmation on device.

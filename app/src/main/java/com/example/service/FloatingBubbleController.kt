@@ -186,8 +186,11 @@ class FloatingBubbleController @Inject constructor(
         }
 
         quickMenu.addView(makeMenuAction("Mic", "#FF8A5B") { onTapBubble?.invoke() })
+        if (showClipButton && onClipClick != null) {
+            quickMenu.addView(makeMenuAction("Clip", "#2DD4BF") { onTapClip?.invoke() })
+        }
         quickMenu.addView(makeMenuAction("Stop", "#F87171") { onTapStop?.invoke() })
-        quickMenu.addView(makeMenuAction("Open", "#2DD4BF") {
+        quickMenu.addView(makeMenuAction("Open", "#93C5FD") {
             runCatching {
                 context.startActivity(
                     Intent(context, MainActivity::class.java).apply {

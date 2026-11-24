@@ -141,6 +141,15 @@ class PermissionHelper @Inject constructor(
         return runCatching { km.isKeyguardLocked }.getOrDefault(false)
     }
 
+    fun isCallScreeningRoleHeld(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return false
+        val rm = context.getSystemService(Context.ROLE_SERVICE) as? android.app.role.RoleManager ?: return false
+        return runCatching {
+            rm.isRoleAvailable(android.app.role.RoleManager.ROLE_CALL_SCREENING) &&
+                rm.isRoleHeld(android.app.role.RoleManager.ROLE_CALL_SCREENING)
+        }.getOrDefault(false)
+    }
+
     fun openAccessibilitySettings() {
         launchSettingsIntent(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
     }
