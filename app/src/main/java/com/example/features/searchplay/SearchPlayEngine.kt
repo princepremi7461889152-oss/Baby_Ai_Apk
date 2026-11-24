@@ -134,8 +134,11 @@ class SearchPlayEngine @Inject constructor(
         query: String,
         autoPlay: Boolean = true
     ): ToolExecutionResult {
-        val cleanQuery = query.trim()
-        val cleanApp = appQuery.trim()
+        val cleanQuery = com.example.domain.ai.ToolCallNormalizer.cleanString(query).orEmpty()
+        val cleanApp = com.example.domain.ai.ToolCallNormalizer.cleanString(appQuery).orEmpty()
+        if (cleanApp.isBlank()) {
+            return ToolExecutionResult(false, "Kis app mein search karna hai? App ka naam missing hai.")
+        }
         if (cleanQuery.isBlank()) {
             return ToolExecutionResult(false, "Kya search karna hai? Query empty hai.")
         }
@@ -148,8 +151,11 @@ class SearchPlayEngine @Inject constructor(
 
         ensureDefaultRecipesSeeded()
         val specs = getAllSpecs()
-        val spec = resolveRecipeSpec(cleanApp, specs)
-            ?: return fallbackGenericAppSearch(cleanApp, cleanQuery)
+        val resolvedApp = (appResolver.resolveApp(cleanApp) as? com.example.domain.tools.AppResolution.Resolved)?.app
+        val spec = resolvedApp?.let { app ->
+            resolveRecipeSpec(app.packageName, specs) ?: resolveRecipeSpec(app.label, specs)
+        } ?: resolveRecipeSpec(cleanApp, specs)
+            ?: return fallbackGenericAppSearch(resolvedApp?.packageName ?: cleanApp, cleanQuery)
 
         // Check foreground sensitive/payment block before touching screen
         BabyAccessibilityService.instance?.let { acc ->
@@ -168,7 +174,8 @@ class SearchPlayEngine @Inject constructor(
         }
 
         if (!deepLinkOk) {
-            val openOutcome = appResolver.openApp(spec.packageName.ifBlank { spec.displayName })
+            val targetAppLookup = resolvedApp?.packageName ?: spec.packageName.ifBlank { spec.displayName }
+            val openOutcome = appResolver.openApp(targetAppLookup)
             if (!openOutcome.ok && openOutcome.status == AppOpenStatus.NOT_FOUND) {
                 return ToolExecutionResult(false, "${spec.displayName} phone mein install nahi mila.")
             }

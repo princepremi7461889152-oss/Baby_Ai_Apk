@@ -16,6 +16,7 @@ data class AiFailure(
     val isRetryable: Boolean = false,
     val isModelNotFound: Boolean = false,
     val isOffline: Boolean = false,
+    val isValidationFailure: Boolean = false,
     val userMessage: String,
     val technicalDetails: String
 )

@@ -1,5 +1,7 @@
 package com.example.domain.ai
 
+import android.util.Log
+import com.example.BuildConfig
 import com.example.core.security.AiModelConfig
 import com.example.core.security.BabySettings
 import com.example.core.security.GroqModelRole
@@ -63,7 +65,8 @@ data class AgentStepTurn(
 data class PlannedToolCall(
     val id: String,
     val name: String,
-    val args: Map<String, Any?>
+    val args: Map<String, Any?>,
+    val rawCallSanitized: String = ""
 )
 
 data class AiPlanResult(
@@ -115,9 +118,10 @@ class AiRouter @Inject constructor(
     )
     private val mapAdapter = moshi.adapter<Map<String, Any?>>(mapType)
 
-    // Test hooks for deterministic backoff tests without slow sleeps
+    // Test hooks for deterministic backoff & logging tests without slow sleeps
     internal var sleeper: suspend (Long) -> Unit = { delay(it) }
     internal var jitterRatioProvider: () -> Double = { Random.nextDouble(0.0, 0.25) }
+    internal var debugLogSink: ((String) -> Unit)? = null
 
     suspend fun transcribeAudio(
         wavBytes: ByteArray,
@@ -388,6 +392,9 @@ class AiRouter @Inject constructor(
         val failures = mutableListOf<Pair<BrainType, AiFailure?>>()
         val firstEx = firstAttempt.exceptionOrNull()
         val firstFailure = (firstEx as? AiCallException)?.failure
+        if (firstFailure?.isValidationFailure == true) {
+            return Result.failure(firstEx as AiCallException)
+        }
         failures += primary to firstFailure
 
         if (settings.autoFallbackEnabled) {
@@ -413,7 +420,11 @@ class AiRouter @Inject constructor(
                     )
                 }
                 val ex = attempt.exceptionOrNull()
-                failures += nextBrain to (ex as? AiCallException)?.failure
+                val nextFailure = (ex as? AiCallException)?.failure
+                if (nextFailure?.isValidationFailure == true) {
+                    return Result.failure(ex as AiCallException)
+                }
+                failures += nextBrain to nextFailure
             }
         }
 
@@ -748,6 +759,83 @@ class AiRouter @Inject constructor(
         )
     }
 
+    private fun debugLogRawToolCalls(
+        providerName: String,
+        modelUsed: String,
+        calls: List<NormalizedToolCall>
+    ) {
+        if (calls.isEmpty()) return
+        val shouldLog = BuildConfig.DEBUG || debugLogSink != null
+        if (!shouldLog) return
+        val payload = calls.joinToString(prefix = "[", postfix = "]") { it.rawCallSanitized }
+        val line = "[$providerName/$modelUsed] raw_tool_calls=$payload"
+        debugLogSink?.invoke(line)
+        if (BuildConfig.DEBUG) {
+            runCatching { Log.d("BabyToolCalls", line) }
+        }
+    }
+
+    private fun extractAndNormalizeOpenAiCalls(
+        msg: GroqMessage,
+        providerName: String,
+        secretKeys: Array<String>
+    ): List<NormalizedToolCall> {
+        val structured = msg.toolCalls.orEmpty().mapIndexedNotNull { idx, tc ->
+            ToolCallNormalizer.normalizeOpenAiToolCall(
+                tc = tc,
+                index = idx,
+                providerName = providerName,
+                mapAdapter = mapAdapter,
+                secretKeys = secretKeys
+            )
+        }
+        if (structured.isNotEmpty()) return structured
+        return AiResponseParser.extractInlineToolCalls(msg.content, mapAdapter).map { inline ->
+            NormalizedToolCall(
+                id = inline.id,
+                name = inline.name,
+                args = inline.args,
+                missingRequired = ToolDefinitions.validateRequiredArgs(inline.name, inline.args),
+                isMalformedJson = false,
+                rawCallSanitized = SensitiveDataSanitizer.sanitizeToolCallPayload(inline.rawCallSanitized, *secretKeys)
+            )
+        }
+    }
+
+    private fun buildMissingParamRepairInstruction(badCall: NormalizedToolCall): String {
+        return if (badCall.missingRequired.isNotEmpty()) {
+            val missingList = badCall.missingRequired.joinToString(", ")
+            "Parameter '$missingList' is missing for '${badCall.name}', call the tool again with it."
+        } else {
+            "Your previous tool call for '${badCall.name}' had malformed JSON arguments. Call '${badCall.name}' again ONCE with valid JSON arguments only."
+        }
+    }
+
+    private fun validationFailureResult(
+        providerName: String,
+        modelUsed: String,
+        badCall: NormalizedToolCall
+    ): Result<AiPlanResult> {
+        val missingDesc = if (badCall.missingRequired.isNotEmpty()) {
+            badCall.missingRequired.joinToString(", ")
+        } else {
+            "valid JSON arguments"
+        }
+        val friendlyHinglish = "Kaam poora nahi ho paya — '${badCall.name}' ke liye zaroori parameter ($missingDesc) missing ya galat tha. Kripya thoda aur clear bolke phir se try karo."
+        return Result.failure(
+            AiCallException(
+                AiFailure(
+                    provider = providerName,
+                    model = modelUsed,
+                    isRetryable = false,
+                    isValidationFailure = true,
+                    userMessage = friendlyHinglish,
+                    technicalDetails = "Tool validation failed after 1 repair attempt: tool=${badCall.name}, missing=${badCall.missingRequired}, malformed=${badCall.isMalformedJson}"
+                )
+            )
+        )
+    }
+
     private suspend fun parseOpenAiChoiceAndMaybeRepair(
         brain: BrainType,
         providerName: String,
@@ -757,6 +845,9 @@ class AiRouter @Inject constructor(
         repairCall: suspend (List<GroqMessage>) -> GroqChatResponse?,
         baseMessages: List<GroqMessage>
     ): Result<AiPlanResult> {
+        val settings = keyStore.settings.value
+        val secretKeys = arrayOf(settings.inceptionApiKey, settings.groqApiKey, settings.geminiApiKey)
+
         var msg = body.choices?.firstOrNull()?.message
             ?: return Result.failure(
                 AiCallException(
@@ -769,45 +860,40 @@ class AiRouter @Inject constructor(
                 )
             )
 
-        val malformedTool = msg.toolCalls.orEmpty().firstOrNull { tc ->
-            AiResponseParser.hasMalformedToolJson(tc.function?.arguments)
-        }
-        if (malformedTool != null) {
+        var normalizedCalls = extractAndNormalizeOpenAiCalls(msg, providerName, secretKeys)
+        debugLogRawToolCalls(providerName, modelUsed, normalizedCalls)
+
+        val badCall = normalizedCalls.firstOrNull { it.isMalformedJson || it.missingRequired.isNotEmpty() }
+        if (badCall != null) {
+            val repairInstruction = buildMissingParamRepairInstruction(badCall)
             val repairPrompt = buildList {
                 addAll(baseMessages)
                 add(msg)
-                add(
-                    GroqMessage(
-                        role = "user",
-                        content = "Your previous tool call for '${malformedTool.function?.name ?: "tool"}' had malformed JSON arguments. Retry the tool call ONCE with strictly valid JSON arguments only."
-                    )
-                )
+                add(GroqMessage(role = "user", content = repairInstruction))
             }
             val repairedBody = repairCall(repairPrompt)
             val repairedMsg = repairedBody?.choices?.firstOrNull()?.message
             if (repairedMsg != null && (!repairedMsg.toolCalls.isNullOrEmpty() || !repairedMsg.content.isNullOrBlank())) {
                 msg = repairedMsg
+                normalizedCalls = extractAndNormalizeOpenAiCalls(msg, providerName, secretKeys)
+                debugLogRawToolCalls("$providerName-repair", modelUsed, normalizedCalls)
+            } else {
+                return validationFailureResult(providerName, modelUsed, badCall)
+            }
+
+            val stillBad = normalizedCalls.firstOrNull { it.isMalformedJson || it.missingRequired.isNotEmpty() }
+            if (stillBad != null) {
+                return validationFailureResult(providerName, modelUsed, stillBad)
             }
         }
 
-        val structuredToolCalls = msg.toolCalls.orEmpty()
-            .mapNotNull { tc ->
-                val fnName = tc.function?.name?.trim()?.takeIf { it.isNotEmpty() } ?: return@mapNotNull null
-                val rawArgs = tc.function.arguments
-                fnName to (tc.id?.trim()?.takeIf { it.isNotEmpty() } to rawArgs)
-            }
-            .mapIndexed { idx, (fnName, idAndArgs) ->
-                PlannedToolCall(
-                    id = idAndArgs.first ?: "${providerName.lowercase()}_call_$idx",
-                    name = fnName,
-                    args = parseToolArgsSafely(idAndArgs.second)
-                )
-            }
-
-        val toolCalls = if (structuredToolCalls.isNotEmpty()) {
-            structuredToolCalls
-        } else {
-            AiResponseParser.extractInlineToolCalls(msg.content, mapAdapter)
+        val toolCalls = normalizedCalls.map {
+            PlannedToolCall(
+                id = it.id,
+                name = it.name,
+                args = it.args,
+                rawCallSanitized = it.rawCallSanitized
+            )
         }
 
         val replyText = AiResponseParser.stripReasoning(msg.content)
@@ -883,7 +969,7 @@ class AiRouter @Inject constructor(
                             GeminiPart(
                                 functionCall = GeminiFunctionCall(
                                     name = turn.toolName,
-                                    args = turn.toolArgs ?: emptyMap()
+                                    args = turn.toolArgs ?: emptyMap<String, Any?>()
                                 )
                             )
                         )
@@ -961,7 +1047,8 @@ class AiRouter @Inject constructor(
             }
         }
 
-        val firstCandidate = body.candidates?.firstOrNull()
+        val secretKeys = arrayOf(settings.inceptionApiKey, settings.groqApiKey, settings.geminiApiKey)
+        var firstCandidate = body.candidates?.firstOrNull()
             ?: return Result.failure(
                 AiCallException(
                     AiFailure(
@@ -972,17 +1059,76 @@ class AiRouter @Inject constructor(
                     )
                 )
             )
-        val parts = firstCandidate.content?.parts.orEmpty()
-        val visibleReply = AiResilienceHelper.extractGeminiVisibleText(parts)
-        val calls = parts.mapNotNull { it.functionCall }
-            .filter { it.name.isNotBlank() }
-            .mapIndexed { index, fc ->
-                PlannedToolCall(
-                    id = "gem_call_$index",
-                    name = fc.name.trim(),
-                    args = fc.args ?: emptyMap()
+        var parts = firstCandidate.content?.parts.orEmpty()
+        var visibleReply = AiResilienceHelper.extractGeminiVisibleText(parts)
+        var normalizedCalls = parts.mapNotNull { it.functionCall }
+            .mapIndexedNotNull { index, fc ->
+                ToolCallNormalizer.normalizeGeminiFunctionCall(
+                    fc = fc,
+                    index = index,
+                    mapAdapter = mapAdapter,
+                    secretKeys = secretKeys
                 )
             }
+        debugLogRawToolCalls("Gemini", attempt.modelUsed, normalizedCalls)
+
+        val badCall = normalizedCalls.firstOrNull { it.isMalformedJson || it.missingRequired.isNotEmpty() }
+        if (badCall != null) {
+            val repairInstruction = buildMissingParamRepairInstruction(badCall)
+            val repairContents = contents + listOfNotNull(
+                firstCandidate.content,
+                GeminiContent(role = "user", parts = listOf(GeminiPart(text = repairInstruction)))
+            )
+            val repairRes = AiResilienceHelper.executeGeminiWithRecovery(
+                geminiApi = geminiApi,
+                keyStore = keyStore,
+                key = key,
+                initialModel = attempt.modelUsed,
+                request = GeminiGenerateRequest(
+                    systemInstruction = GeminiContent(parts = listOf(GeminiPart(text = systemPrompt))),
+                    contents = repairContents,
+                    tools = geminiTools,
+                    generationConfig = GeminiGenerationConfig(
+                        maxOutputTokens = 1536,
+                        thinkingConfig = GeminiThinkingConfig(thinkingLevel = thinkingLevel)
+                    )
+                ),
+                sleeper = sleeper,
+                jitterRatioProvider = jitterRatioProvider
+            )
+            val repairedCand = repairRes.getOrNull()?.value?.candidates?.firstOrNull()
+            if (repairedCand != null) {
+                firstCandidate = repairedCand
+                parts = firstCandidate.content?.parts.orEmpty()
+                visibleReply = AiResilienceHelper.extractGeminiVisibleText(parts)
+                normalizedCalls = parts.mapNotNull { it.functionCall }
+                    .mapIndexedNotNull { index, fc ->
+                        ToolCallNormalizer.normalizeGeminiFunctionCall(
+                            fc = fc,
+                            index = index,
+                            mapAdapter = mapAdapter,
+                            secretKeys = secretKeys
+                        )
+                    }
+                debugLogRawToolCalls("Gemini-repair", attempt.modelUsed, normalizedCalls)
+            } else {
+                return validationFailureResult("Gemini", attempt.modelUsed, badCall)
+            }
+
+            val stillBad = normalizedCalls.firstOrNull { it.isMalformedJson || it.missingRequired.isNotEmpty() }
+            if (stillBad != null) {
+                return validationFailureResult("Gemini", attempt.modelUsed, stillBad)
+            }
+        }
+
+        val calls = normalizedCalls.map {
+            PlannedToolCall(
+                id = it.id,
+                name = it.name,
+                args = it.args,
+                rawCallSanitized = it.rawCallSanitized
+            )
+        }
         val sources = firstCandidate.groundingMetadata?.groundingChunks.orEmpty()
             .mapNotNull { chunk ->
                 val web = chunk.web ?: return@mapNotNull null
@@ -1016,7 +1162,7 @@ class AiRouter @Inject constructor(
         )
     }
 
-    internal fun parseToolArgsSafely(rawJson: String?): Map<String, Any?> {
+    internal fun parseToolArgsSafely(rawJson: Any?): Map<String, Any?> {
         return AiResponseParser.parseToolArgsSafely(rawJson, mapAdapter)
     }
 

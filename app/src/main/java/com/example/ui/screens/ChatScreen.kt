@@ -120,11 +120,14 @@ import com.example.data.local.ChatMessageEntity
 import com.example.domain.ai.AgentExecutionState
 import com.example.domain.ai.BrainType
 import com.example.domain.ai.ConfirmationRequest
+import com.example.domain.tools.ToolDefinitions
 import com.example.ui.components.BabyMarkdownText
 import com.example.ui.components.BabyOrb
 import com.example.ui.components.BabyOrbState
 import com.example.ui.components.BabyWaveformStrip
 import com.example.ui.components.QuickStatusSheet
+import com.example.ui.components.ToolActionStatus
+import com.example.ui.components.cleanToolArgsForSignature
 import com.example.ui.components.headerStatusLabel
 import com.example.ui.components.presentToolAction
 import com.example.ui.state.BabyUiPreferences
@@ -214,23 +217,25 @@ fun ChatScreen(
         if (granted) onSendCommand("Camera se dekho ye kya hai?")
     }
 
-    val showJumpToLatest by remember(messages) {
+    val displayItems = remember(messages) { collapseRepeatedToolErrors(messages) }
+
+    val showJumpToLatest by remember(displayItems) {
         derivedStateOf {
-            if (messages.isEmpty()) false
+            if (displayItems.isEmpty()) false
             else {
                 val lastVisible = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
-                lastVisible < messages.lastIndex - 1
+                lastVisible < displayItems.lastIndex - 1
             }
         }
     }
 
-    LaunchedEffect(messages.size) {
-        if (messages.isNotEmpty()) {
+    LaunchedEffect(displayItems.size) {
+        if (displayItems.isNotEmpty()) {
             if (!hasPerformedInitialScroll) {
                 hasPerformedInitialScroll = true
-                listState.scrollToItem(messages.lastIndex)
+                listState.scrollToItem(displayItems.lastIndex)
             } else {
-                listState.animateScrollToItem(messages.lastIndex)
+                listState.animateScrollToItem(displayItems.lastIndex)
             }
         } else {
             hasPerformedInitialScroll = false
@@ -612,31 +617,43 @@ fun ChatScreen(
                         )
                     }
 
-                    if (messages.isNotEmpty()) {
+                    if (displayItems.isNotEmpty() || (agentState.isRunning && !agentState.runningToolName.isNullOrBlank())) {
                         LazyColumn(
                             state = listState,
                             modifier = Modifier
                                 .weight(1f)
-                                .fillMaxWidth(),
+                                .fillMaxWidth()
+                                .testTag("chat_messages_list"),
                             contentPadding = PaddingValues(horizontal = spacing.md, vertical = spacing.sm),
                             verticalArrangement = Arrangement.spacedBy(spacing.sm)
                         ) {
                             itemsIndexed(
-                                items = messages,
-                                key = { _, msg -> msg.id },
-                                contentType = { _, msg -> msg.role }
-                            ) { index, msg ->
-                                val isLatestAssistant = index == messages.lastIndex &&
+                                items = displayItems,
+                                key = { _, item -> item.message.id },
+                                contentType = { _, item -> item.message.role }
+                            ) { index, item ->
+                                val msg = item.message
+                                val isLatestAssistant = index == displayItems.lastIndex &&
                                     msg.role != "user" && msg.role != "tool"
                                 ChatBubbleItem(
                                     msg = msg,
                                     isLatestAssistant = isLatestAssistant,
+                                    repeatCount = item.repeatCount,
                                     reducedMotion = reducedMotion,
                                     hapticsEnabled = settings.hapticsEnabled,
                                     onRegenerate = { onRegenerateMessage(msg.id) },
                                     onSpeak = { onSpeakMessage(msg.content) },
                                     modifier = Modifier.animateItem()
                                 )
+                            }
+
+                            if (agentState.isRunning && !agentState.runningToolName.isNullOrBlank()) {
+                                item(key = "running_tool_card", contentType = "tool_running") {
+                                    RunningToolActionCard(
+                                        toolName = agentState.runningToolName.orEmpty(),
+                                        argsJson = agentState.runningToolArgsJson
+                                    )
+                                }
                             }
 
                             if (agentState.isRunning && agentState.streamingReply.isNotBlank()) {
@@ -664,7 +681,7 @@ fun ChatScreen(
                                         }
                                     }
                                 }
-                            } else if (agentState.isRunning) {
+                            } else if (agentState.isRunning && agentState.runningToolName.isNullOrBlank()) {
                                 item(key = "typing_indicator", contentType = "typing") {
                                     TypingIndicatorBubble(reducedMotion = reducedMotion)
                                 }
@@ -677,7 +694,7 @@ fun ChatScreen(
 
                 // Jump to Latest FAB
                 androidx.compose.animation.AnimatedVisibility(
-                    visible = showJumpToLatest && messages.isNotEmpty(),
+                    visible = showJumpToLatest && displayItems.isNotEmpty(),
                     enter = fadeIn() + expandVertically(),
                     exit = fadeOut() + shrinkVertically(),
                     modifier = Modifier
@@ -687,8 +704,8 @@ fun ChatScreen(
                     SmallFloatingActionButton(
                         onClick = {
                             scope.launch {
-                                if (messages.isNotEmpty()) {
-                                    listState.animateScrollToItem(messages.lastIndex)
+                                if (displayItems.isNotEmpty()) {
+                                    listState.animateScrollToItem(displayItems.lastIndex)
                                 }
                             }
                         },
@@ -1057,6 +1074,7 @@ private fun ChatBubbleItem(
     msg: ChatMessageEntity,
     isLatestAssistant: Boolean,
     reducedMotion: Boolean,
+    repeatCount: Int = 1,
     hapticsEnabled: Boolean = true,
     onRegenerate: () -> Unit,
     onSpeak: () -> Unit,
@@ -1147,25 +1165,43 @@ private fun ChatBubbleItem(
         }
 
         "tool" -> {
-            var expanded by remember { mutableStateOf(false) }
-            val toolUi = remember(msg.toolName, msg.toolArgsJson, msg.toolResult) {
-                presentToolAction(msg.toolName, msg.toolArgsJson, msg.toolResult)
+            var expanded by remember(msg.id) { mutableStateOf(false) }
+            val toolUi = remember(msg.toolName, msg.toolArgsJson, msg.toolResult, msg.content) {
+                presentToolAction(
+                    toolName = msg.toolName,
+                    argsJson = msg.toolArgsJson,
+                    resultText = msg.toolResult,
+                    detailText = msg.content,
+                    isRunning = false
+                )
             }
-            val isOk = !msg.toolResult.orEmpty().contains("err", ignoreCase = true) &&
-                !msg.toolResult.orEmpty().contains("fail", ignoreCase = true)
+            val isError = toolUi.status == ToolActionStatus.ERROR
 
             Surface(
-                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.8f),
+                color = if (isError) {
+                    MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.45f)
+                } else {
+                    MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.8f)
+                },
                 shape = RoundedCornerShape(spacing.chipRadius),
                 modifier = modifier
                     .fillMaxWidth(0.92f)
                     .clip(RoundedCornerShape(spacing.chipRadius))
-                    .clickable { expanded = !expanded }
+                    .testTag("tool_action_card_${msg.id}")
             ) {
                 Column(modifier = Modifier.padding(horizontal = spacing.sm, vertical = 9.dp)) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { expanded = !expanded }
+                    ) {
                         Surface(
-                            color = MaterialTheme.colorScheme.secondaryContainer,
+                            color = if (isError) {
+                                MaterialTheme.colorScheme.errorContainer
+                            } else {
+                                MaterialTheme.colorScheme.secondaryContainer
+                            },
                             shape = CircleShape,
                             modifier = Modifier.size(26.dp)
                         ) {
@@ -1173,7 +1209,11 @@ private fun ChatBubbleItem(
                                 Icon(
                                     imageVector = toolUi.icon,
                                     contentDescription = null,
-                                    tint = MaterialTheme.colorScheme.secondary,
+                                    tint = if (isError) {
+                                        MaterialTheme.colorScheme.error
+                                    } else {
+                                        MaterialTheme.colorScheme.secondary
+                                    },
                                     modifier = Modifier.size(15.dp)
                                 )
                             }
@@ -1185,12 +1225,40 @@ private fun ChatBubbleItem(
                             color = MaterialTheme.colorScheme.onSurface,
                             modifier = Modifier.weight(1f)
                         )
-                        Icon(
-                            imageVector = Icons.Default.CheckCircle,
-                            contentDescription = if (isOk) "Completed" else "Status",
-                            tint = if (isOk) ext.success else MaterialTheme.colorScheme.error,
-                            modifier = Modifier.size(16.dp)
-                        )
+                        if (repeatCount > 1) {
+                            Surface(
+                                color = MaterialTheme.colorScheme.error,
+                                contentColor = MaterialTheme.colorScheme.onError,
+                                shape = RoundedCornerShape(10.dp),
+                                modifier = Modifier
+                                    .padding(end = 6.dp)
+                                    .testTag("tool_error_repeat_badge")
+                            ) {
+                                Text(
+                                    text = "x$repeatCount",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                )
+                            }
+                        }
+                        when (toolUi.status) {
+                            ToolActionStatus.RUNNING -> CircularProgressIndicator(
+                                strokeWidth = 2.dp,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            ToolActionStatus.SUCCESS -> Icon(
+                                imageVector = Icons.Default.CheckCircle,
+                                contentDescription = "Completed",
+                                tint = ext.success,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            ToolActionStatus.ERROR -> Icon(
+                                imageVector = Icons.Default.ErrorOutline,
+                                contentDescription = "Error",
+                                tint = MaterialTheme.colorScheme.error,
+                                modifier = Modifier.size(16.dp)
+                            )
+                        }
                         Spacer(Modifier.width(4.dp))
                         Icon(
                             imageVector = if (expanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
@@ -1199,10 +1267,57 @@ private fun ChatBubbleItem(
                             modifier = Modifier.size(18.dp)
                         )
                     }
+
+                    if (isError && !toolUi.errorSummary.isNullOrBlank()) {
+                        Text(
+                            text = toolUi.errorSummary,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.error,
+                            modifier = Modifier.padding(top = 4.dp, start = 34.dp)
+                        )
+                    }
+
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier
+                            .padding(top = 4.dp, start = 34.dp)
+                            .clip(RoundedCornerShape(6.dp))
+                            .clickable { expanded = !expanded }
+                            .padding(vertical = 2.dp, horizontal = 4.dp)
+                            .testTag("tool_card_details_toggle_${msg.id}")
+                    ) {
+                        Text(
+                            text = if (expanded) "Hide details" else "Details",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Spacer(Modifier.width(2.dp))
+                        Icon(
+                            imageVector = if (expanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.size(14.dp)
+                        )
+                    }
+
                     AnimatedVisibility(visible = expanded) {
-                        Column(modifier = Modifier.padding(top = 6.dp)) {
+                        Column(
+                            modifier = Modifier
+                                .padding(top = 6.dp, start = 34.dp)
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.65f))
+                                .padding(8.dp)
+                                .testTag("tool_card_details_body_${msg.id}"),
+                            verticalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
                             Text(
-                                text = msg.content.take(400),
+                                text = "Raw call: ${toolUi.rawCallDetails}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            Text(
+                                text = "Result: ${toolUi.rawResultDetails}",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -1595,6 +1710,102 @@ private fun QuickCommandEditDialog(
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
     )
+}
+
+internal data class ChatDisplayItem(
+    val message: ChatMessageEntity,
+    val repeatCount: Int = 1
+)
+
+private fun isFailingToolMessage(msg: ChatMessageEntity): Boolean {
+    if (msg.role != "tool") return false
+    val res = msg.toolResult.orEmpty().trim()
+    return res.equals("ERR", ignoreCase = true) ||
+        res.equals("ERROR", ignoreCase = true) ||
+        res.equals("FAILED", ignoreCase = true) ||
+        res.startsWith("ERR", ignoreCase = true) ||
+        res.contains("fail", ignoreCase = true)
+}
+
+internal fun collapseRepeatedToolErrors(messages: List<ChatMessageEntity>): List<ChatDisplayItem> {
+    if (messages.isEmpty()) return emptyList()
+    val out = ArrayList<ChatDisplayItem>(messages.size)
+    var lastErrorKey: String? = null
+    for (msg in messages) {
+        if (isFailingToolMessage(msg)) {
+            val canonicalName = ToolDefinitions.canonicalToolName(msg.toolName.orEmpty())
+            val sigArgs = cleanToolArgsForSignature(msg.toolArgsJson)
+            val errKey = "$canonicalName|$sigArgs|${msg.content.trim().take(120)}"
+            if (out.isNotEmpty() && lastErrorKey == errKey) {
+                val prev = out[out.lastIndex]
+                out[out.lastIndex] = ChatDisplayItem(message = msg, repeatCount = prev.repeatCount + 1)
+            } else {
+                out += ChatDisplayItem(message = msg, repeatCount = 1)
+                lastErrorKey = errKey
+            }
+        } else {
+            out += ChatDisplayItem(message = msg, repeatCount = 1)
+            lastErrorKey = null
+        }
+    }
+    return out
+}
+
+@Composable
+private fun RunningToolActionCard(
+    toolName: String,
+    argsJson: String?
+) {
+    val spacing = BabyThemeTokens.spacing
+    val toolUi = remember(toolName, argsJson) {
+        presentToolAction(
+            toolName = toolName,
+            argsJson = argsJson,
+            resultText = null,
+            detailText = null,
+            isRunning = true
+        )
+    }
+    Surface(
+        color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.65f),
+        shape = RoundedCornerShape(spacing.chipRadius),
+        modifier = Modifier
+            .fillMaxWidth(0.92f)
+            .testTag("running_tool_card")
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.padding(horizontal = spacing.sm, vertical = 9.dp)
+        ) {
+            Surface(
+                color = MaterialTheme.colorScheme.primaryContainer,
+                shape = CircleShape,
+                modifier = Modifier.size(26.dp)
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    Icon(
+                        imageVector = toolUi.icon,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.size(15.dp)
+                    )
+                }
+            }
+            Spacer(Modifier.width(8.dp))
+            Text(
+                text = toolUi.title,
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.onSurface,
+                modifier = Modifier.weight(1f)
+            )
+            CircularProgressIndicator(
+                strokeWidth = 2.dp,
+                modifier = Modifier
+                    .size(16.dp)
+                    .semantics { contentDescription = "Running action" }
+            )
+        }
+    }
 }
 
 @Composable

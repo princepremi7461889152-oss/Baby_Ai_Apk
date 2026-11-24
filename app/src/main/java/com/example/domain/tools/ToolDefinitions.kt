@@ -523,10 +523,60 @@ object ToolDefinitions {
 
     private val byName: Map<String, ToolSpec> = allTools.associateBy { it.name }
 
-    fun getSpec(name: String): ToolSpec? = byName[name]
+    private val toolNameAliases: Map<String, String> = mapOf(
+        "openapp" to "open_app",
+        "launch_app" to "open_app",
+        "searchinapp" to "search_in_app",
+        "search_app" to "search_in_app",
+        "searchweb" to "search_web",
+        "web_search" to "search_web",
+        "call" to "call_contact",
+        "callcontact" to "call_contact",
+        "sendsms" to "send_sms",
+        "sendwhatsapp" to "send_whatsapp",
+        "read_clipboard" to "read_clipboard_and_process",
+        "capture_photo" to "capture_and_describe",
+        "flashlight" to "toggle_flashlight",
+        "wifi" to "toggle_wifi",
+        "bluetooth" to "toggle_bluetooth",
+        "dnd" to "toggle_dnd"
+    )
+
+    fun canonicalToolName(rawName: String): String {
+        val trimmed = rawName.trim()
+        if (trimmed.isEmpty()) return ""
+        if (byName.containsKey(trimmed)) return trimmed
+        val snake = trimmed
+            .replace(Regex("([a-z])([A-Z])"), "$1_$2")
+            .replace('-', '_')
+            .replace(' ', '_')
+            .lowercase()
+        if (byName.containsKey(snake)) return snake
+        val compact = snake.replace("_", "")
+        return toolNameAliases[snake] ?: toolNameAliases[compact] ?: snake
+    }
+
+    fun getSpec(name: String): ToolSpec? = byName[canonicalToolName(name)]
+
+    fun validateRequiredArgs(name: String, args: Map<String, Any?>): List<String> {
+        val spec = getSpec(name) ?: return emptyList()
+        return spec.required.filter { reqKey ->
+            val v = args[reqKey]
+            when (v) {
+                null -> true
+                is String -> {
+                    val t = v.trim()
+                    t.isEmpty() || t.equals("null", ignoreCase = true) || t.equals("undefined", ignoreCase = true)
+                }
+                is Double -> v.isNaN()
+                is Float -> v.isNaN()
+                else -> false
+            }
+        }
+    }
 
     fun requiresUnlockedScreen(name: String): Boolean =
-        byName[name]?.requiresUnlockedScreen ?: false
+        getSpec(name)?.requiresUnlockedScreen ?: false
 
     fun isSensitiveAction(name: String, args: Map<String, Any?>): Boolean {
         val spec = byName[name]

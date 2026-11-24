@@ -68,10 +68,14 @@ class ExtendedToolRouter @Inject constructor(
         aiRouter = null
     )
 
-    suspend fun tryExecute(name: String, args: Map<String, Any?>): ToolExecutionResult? {
-        return when (name) {
+    suspend fun tryExecute(name: String, rawArgs: Map<String, Any?>): ToolExecutionResult? {
+        val canonicalName = ToolDefinitions.canonicalToolName(name)
+        val args = com.example.domain.ai.ToolCallNormalizer.canonicalizeArgsForTool(canonicalName, rawArgs)
+        fun str(key: String): String = com.example.domain.ai.ToolCallNormalizer.cleanString(args[key]).orEmpty()
+
+        return when (canonicalName) {
             "search_web" -> {
-                val query = args["query"]?.toString().orEmpty().trim()
+                val query = str("query")
                 if (query.isBlank()) return ToolExecutionResult(false, "Search query empty hai.")
                 val router = aiRouter ?: return null
                 if (keyStore.settings.value.geminiApiKey.isBlank()) {
@@ -97,8 +101,10 @@ class ExtendedToolRouter @Inject constructor(
 
             "search_in_app" -> {
                 val engine = searchPlayEngine ?: return ToolExecutionResult(false, "SearchPlayEngine unavailable.")
-                val appName = args["app_name"]?.toString().orEmpty()
-                val query = args["query"]?.toString().orEmpty()
+                val appName = str("app_name")
+                val query = str("query")
+                if (appName.isBlank()) return ToolExecutionResult(false, "Kis app mein search karna hai? App naam missing hai.")
+                if (query.isBlank()) return ToolExecutionResult(false, "Kya search karna hai? Query missing hai.")
                 val autoPlay = when (val ap = args["auto_play"]) {
                     is Boolean -> ap
                     is String -> ap.equals("true", ignoreCase = true)

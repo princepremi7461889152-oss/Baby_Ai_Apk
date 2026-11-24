@@ -52,6 +52,25 @@ object SensitiveDataSanitizer {
         return maskSecretsAndPii(out)
     }
 
+    private val TOOL_CONTENT_FIELD_JSON_REGEX = Regex(
+        """(?i)("?(?:message|msg|text|body|sms_body|reply|content|password|passcode|pin|voice_pin|token|secret|api_key|apikey)"?\s*:\s*)("(?:\\.|[^"\\])*"|[^,\}\]]+)"""
+    )
+    private val TOOL_ESCAPED_CONTENT_FIELD_REGEX = Regex(
+        """(?i)(\\?"(?:message|msg|text|body|sms_body|reply|content|password|passcode|pin|voice_pin|token|secret|api_key|apikey)\\?"\s*:\s*)(\\?"(?:\\\\.|\\"|[^"\\])*\\?")"""
+    )
+
+    fun sanitizeToolCallPayload(rawPayload: String?, vararg secretKeys: String): String {
+        if (rawPayload.isNullOrBlank()) return "{}"
+        var out = sanitizeError(rawPayload, *secretKeys)
+        out = TOOL_ESCAPED_CONTENT_FIELD_REGEX.replace(out) { m ->
+            "${m.groupValues[1]}\"[MASKED_CONTENT]\""
+        }
+        out = TOOL_CONTENT_FIELD_JSON_REGEX.replace(out) { m ->
+            "${m.groupValues[1]}\"[MASKED_CONTENT]\""
+        }
+        return out
+    }
+
     fun containsOnlyRedactedContent(sanitizedText: String): Boolean {
         val remaining = REDACTED_TAG_REGEX.replace(sanitizedText, "")
             .replace(Regex("""[\s:;,.\-_/|()\[\]{}]+"""), "")

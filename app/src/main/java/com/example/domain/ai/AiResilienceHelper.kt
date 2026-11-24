@@ -388,11 +388,26 @@ object AiResilienceHelper {
                         val tcObj = tcArr.optJSONObject(i) ?: continue
                         val idx = tcObj.optInt("index", i)
                         val acc = toolCallsByIndex.getOrPut(idx) { MutableToolCallAcc() }
-                        tcObj.optString("id", "").takeIf { it.isNotEmpty() }?.let { acc.id = it }
-                        tcObj.optString("type", "").takeIf { it.isNotEmpty() }?.let { acc.type = it }
-                        tcObj.optJSONObject("function")?.let { fn ->
-                            fn.optString("name", "").takeIf { it.isNotEmpty() }?.let { acc.name += it }
-                            val argChunk = fn.opt("arguments")?.takeIf { it != JSONObject.NULL }?.toString()
+                        ToolCallNormalizer.cleanString(tcObj.opt("id"))?.let { acc.id = it }
+                        ToolCallNormalizer.cleanString(tcObj.opt("type"))?.let { acc.type = it }
+                        val fn = tcObj.optJSONObject("function")
+                        if (fn != null) {
+                            ToolCallNormalizer.cleanString(fn.opt("name"))?.let { acc.name += it }
+                            val rawArgObj = fn.opt("arguments") ?: fn.opt("parameters") ?: fn.opt("args")
+                            val argChunk = rawArgObj
+                                ?.takeIf { it != JSONObject.NULL }
+                                ?.toString()
+                                ?.takeIf { !it.equals("null", ignoreCase = true) }
+                            if (!argChunk.isNullOrEmpty()) {
+                                acc.arguments.append(argChunk)
+                            }
+                        } else {
+                            ToolCallNormalizer.cleanString(tcObj.opt("name"))?.let { acc.name += it }
+                            val rawArgObj = tcObj.opt("arguments") ?: tcObj.opt("args")
+                            val argChunk = rawArgObj
+                                ?.takeIf { it != JSONObject.NULL }
+                                ?.toString()
+                                ?.takeIf { !it.equals("null", ignoreCase = true) }
                             if (!argChunk.isNullOrEmpty()) {
                                 acc.arguments.append(argChunk)
                             }

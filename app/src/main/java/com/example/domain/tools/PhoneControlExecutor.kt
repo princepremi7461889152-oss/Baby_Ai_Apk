@@ -66,60 +66,53 @@ class PhoneControlExecutor @Inject constructor(
     )
 
     suspend fun execute(name: String, args: Map<String, Any?>): ToolExecutionResult {
-        return when (name) {
+        val canonicalName = ToolDefinitions.canonicalToolName(name)
+        val cleanArgs = com.example.domain.ai.ToolCallNormalizer.canonicalizeArgsForTool(canonicalName, args)
+        fun str(key: String): String = com.example.domain.ai.ToolCallNormalizer.cleanString(cleanArgs[key]).orEmpty()
+        fun optStr(key: String): String? = com.example.domain.ai.ToolCallNormalizer.cleanString(cleanArgs[key])
+
+        return when (canonicalName) {
             "open_app" -> openApp(
-                query = args["app_name"]?.toString().orEmpty(),
-                fromBackground = asBool(args["from_background"], false)
+                query = str("app_name"),
+                fromBackground = asBool(cleanArgs["from_background"], false)
             )
-            "call_contact" -> callContact(args["target"]?.toString().orEmpty())
-            "send_sms" -> sendSms(
-                args["recipient"]?.toString().orEmpty(),
-                args["message"]?.toString().orEmpty()
-            )
-            "send_whatsapp" -> sendWhatsApp(
-                args["recipient"]?.toString().orEmpty(),
-                args["message"]?.toString().orEmpty()
-            )
+            "call_contact" -> callContact(str("target"))
+            "send_sms" -> sendSms(str("recipient"), str("message"))
+            "send_whatsapp" -> sendWhatsApp(str("recipient"), str("message"))
             "set_alarm" -> setAlarm(
-                asInt(args["hour"], 7),
-                asInt(args["minute"], 0),
-                args["label"]?.toString().orEmpty()
+                asInt(cleanArgs["hour"], 7),
+                asInt(cleanArgs["minute"], 0),
+                str("label")
             )
             "set_timer" -> setTimer(
-                asInt(args["seconds"], 60),
-                args["label"]?.toString().orEmpty()
+                asInt(cleanArgs["seconds"], 60),
+                str("label")
             )
-            "toggle_wifi" -> toggleWifi(asBool(args["enable"], true))
-            "toggle_bluetooth" -> toggleBluetooth(asBool(args["enable"], true))
-            "toggle_flashlight" -> toggleFlashlight(asBool(args["enable"], true))
-            "toggle_dnd" -> toggleDnd(asBool(args["enable"], true))
+            "toggle_wifi" -> toggleWifi(asBool(cleanArgs["enable"], true))
+            "toggle_bluetooth" -> toggleBluetooth(asBool(cleanArgs["enable"], true))
+            "toggle_flashlight" -> toggleFlashlight(asBool(cleanArgs["enable"], true))
+            "toggle_dnd" -> toggleDnd(asBool(cleanArgs["enable"], true))
             "set_volume" -> setVolume(
-                args["stream"]?.toString() ?: "media",
-                asInt(args["level_percent"], 50)
+                optStr("stream") ?: "media",
+                asInt(cleanArgs["level_percent"], 50)
             )
-            "set_brightness" -> setBrightness(asInt(args["level_percent"], 60))
-            "media_control" -> controlMedia(args["action"]?.toString() ?: "toggle")
-            "search_web" -> searchWeb(args["query"]?.toString().orEmpty())
-            "read_screen" -> readScreen(asBool(args["include_screenshot"], false))
-            "tap" -> tap(asFloat(args["x"], 0f), asFloat(args["y"], 0f))
-            "long_press" -> longPress(asFloat(args["x"], 0f), asFloat(args["y"], 0f))
-            "type_text" -> typeText(args["text"]?.toString().orEmpty())
-            "swipe" -> swipe(args)
-            "scroll" -> scroll(args["direction"]?.toString() ?: "down")
+            "set_brightness" -> setBrightness(asInt(cleanArgs["level_percent"], 60))
+            "media_control" -> controlMedia(optStr("action") ?: "toggle")
+            "search_web" -> searchWeb(str("query"))
+            "read_screen" -> readScreen(asBool(cleanArgs["include_screenshot"], false))
+            "tap" -> tap(asFloat(cleanArgs["x"], 0f), asFloat(cleanArgs["y"], 0f))
+            "long_press" -> longPress(asFloat(cleanArgs["x"], 0f), asFloat(cleanArgs["y"], 0f))
+            "type_text" -> typeText(str("text"))
+            "swipe" -> swipe(cleanArgs)
+            "scroll" -> scroll(optStr("direction") ?: "down")
             "go_back" -> globalAction("back")
             "go_home" -> globalAction("home")
             "open_recents" -> globalAction("recents")
             "open_notifications" -> globalAction("notifications")
             "take_screenshot" -> takeScreenshot()
-            "read_notifications" -> readNotifications(args["filter_app"]?.toString())
-            "reply_notification" -> replyNotification(
-                args["key"]?.toString().orEmpty(),
-                args["message"]?.toString().orEmpty()
-            )
-            "speak" -> speak(
-                args["text"]?.toString().orEmpty(),
-                args["language"]?.toString() ?: "hinglish"
-            )
+            "read_notifications" -> readNotifications(optStr("filter_app"))
+            "reply_notification" -> replyNotification(str("key"), str("message"))
+            "speak" -> speak(str("text"), optStr("language") ?: "hinglish")
             else -> ToolExecutionResult(false, "Unknown tool: $name")
         }
     }

@@ -78,87 +78,31 @@ object AiResponseParser {
         val results = mutableListOf<PlannedToolCall>()
         INLINE_TOOL_CALL_REGEX.findAll(rawContent).forEachIndexed { idx, match ->
             val jsonBlock = match.groupValues.getOrNull(1)?.trim() ?: return@forEachIndexed
-            runCatching {
-                val obj = JSONObject(jsonBlock)
-                val name = obj.optString("name", "").trim()
-                if (name.isNotEmpty()) {
-                    val argsRaw = when {
-                        obj.has("arguments") -> obj.opt("arguments")?.toString()
-                        obj.has("parameters") -> obj.opt("parameters")?.toString()
-                        else -> "{}"
-                    }
-                    results.add(
-                        PlannedToolCall(
-                            id = "inline_call_$idx",
-                            name = name,
-                            args = parseToolArgsSafely(argsRaw, mapAdapter)
-                        )
+            val normalized = ToolCallNormalizer.normalizeFromRaw(
+                rawPayload = jsonBlock,
+                defaultId = "inline_call_$idx",
+                mapAdapter = mapAdapter
+            )
+            if (normalized != null && !normalized.isMalformedJson) {
+                results.add(
+                    PlannedToolCall(
+                        id = normalized.id,
+                        name = normalized.name,
+                        args = normalized.args,
+                        rawCallSanitized = normalized.rawCallSanitized
                     )
-                }
+                )
             }
         }
         return results
     }
 
-    fun hasMalformedToolJson(rawJson: String?): Boolean {
-        if (rawJson.isNullOrBlank()) return false
-        val cleaned = unwrapMarkdownAndEscapedString(rawJson)
-        if (cleaned.isBlank() || cleaned == "{}") return false
-        val candidate = extractBracedJson(cleaned) ?: return true
-        return runCatching {
-            JSONObject(candidate)
-            false
-        }.getOrDefault(true)
-    }
+    fun hasMalformedToolJson(rawJson: String?): Boolean =
+        ToolCallNormalizer.hasMalformedArgsPayload(rawJson)
 
     fun parseToolArgsSafely(
-        rawJson: String?,
-        mapAdapter: JsonAdapter<Map<String, Any?>>
-    ): Map<String, Any?> {
-        if (rawJson.isNullOrBlank()) return emptyMap()
-        val cleaned = unwrapMarkdownAndEscapedString(rawJson)
-        val jsonCandidate = extractBracedJson(cleaned) ?: return emptyMap()
-
-        return runCatching {
-            mapAdapter.fromJson(jsonCandidate).orEmpty()
-        }.getOrElse {
-            runCatching {
-                val obj = JSONObject(jsonCandidate)
-                val map = linkedMapOf<String, Any?>()
-                val keys = obj.keys()
-                while (keys.hasNext()) {
-                    val k = keys.next()
-                    val v = obj.opt(k)
-                    map[k] = if (v == JSONObject.NULL) null else v
-                }
-                map
-            }.getOrDefault(emptyMap())
-        }
-    }
-
-    private fun unwrapMarkdownAndEscapedString(rawJson: String): String {
-        var cleaned = rawJson.trim()
-            .removePrefix("```json")
-            .removePrefix("```JSON")
-            .removePrefix("```")
-            .removeSuffix("```")
-            .trim()
-
-        if (cleaned.startsWith("\"") && cleaned.endsWith("\"") && cleaned.length >= 2) {
-            val unwrapped = runCatching {
-                JSONObject("{\"v\":$cleaned}").optString("v", "")
-            }.getOrNull()
-            if (!unwrapped.isNullOrBlank()) {
-                cleaned = unwrapped.trim()
-            }
-        }
-        return cleaned
-    }
-
-    private fun extractBracedJson(cleaned: String): String? {
-        if (cleaned.startsWith("{")) return cleaned
-        val start = cleaned.indexOf('{')
-        val end = cleaned.lastIndexOf('}')
-        return if (start >= 0 && end > start) cleaned.substring(start, end + 1) else null
-    }
+        rawJson: Any?,
+        mapAdapter: JsonAdapter<Map<String, Any?>>? = null,
+        toolName: String? = null
+    ): Map<String, Any?> = ToolCallNormalizer.parseArgsMapSafely(rawJson, toolName, mapAdapter)
 }

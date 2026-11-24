@@ -460,8 +460,10 @@ class AiRouterAndSanitizerTest {
         val unclosedThink = "<think>still thinking forever..."
         assertEquals(null, AiResponseParser.stripReasoning(unclosedThink))
 
+        val malformedAttempts = AtomicInteger(0)
         val router = buildRouter(
             groqHandler = { req ->
+                malformedAttempts.incrementAndGet()
                 buildJsonResponse(
                     req,
                     200,
@@ -495,12 +497,11 @@ class AiRouterAndSanitizerTest {
             turns = listOf(AgentStepTurn(role = "user", text = "Torch")),
             screenContext = null, screenshotBase64 = null, stepIndex = 0, isLocked = false, userLanguageHint = null
         )
-        assertTrue(res.isSuccess)
-        val plan = res.getOrThrow()
-        assertEquals(null, plan.replyText)
-        assertEquals(1, plan.toolCalls.size)
-        assertEquals("toggle_flashlight", plan.toolCalls.first().name)
-        assertTrue(plan.toolCalls.first().args.isEmpty())
+        // Malformed JSON / missing required 'enable' triggers 1 repair attempt, never crashes, and stops rather than executing empty args
+        assertTrue(res.isFailure)
+        assertEquals(2, malformedAttempts.get())
+        val ex = res.exceptionOrNull() as AiCallException
+        assertTrue(ex.failure.isValidationFailure)
 
         // Also test inline <tool_call> fallback when tool_calls array is absent
         val inlineRouter = buildRouter(

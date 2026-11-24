@@ -41,13 +41,18 @@ data class GroqFunctionSpec(
 data class GroqToolCall(
     val id: String? = null,
     val type: String? = "function",
-    val function: GroqFunctionCallPayload? = null
+    val function: GroqFunctionCallPayload? = null,
+    val name: String? = null,
+    val arguments: Any? = null,
+    val args: Map<String, Any?>? = null
 )
 
 @JsonClass(generateAdapter = true)
 data class GroqFunctionCallPayload(
     val name: String? = null,
-    val arguments: String? = null
+    val arguments: Any? = null,
+    val parameters: Map<String, Any?>? = null,
+    val args: Map<String, Any?>? = null
 )
 
 @JsonClass(generateAdapter = true)

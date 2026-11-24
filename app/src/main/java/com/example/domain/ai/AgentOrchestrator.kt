@@ -59,6 +59,8 @@ data class AgentExecutionState(
     val maxSteps: Int = MAX_STEPS,
     val activeBrain: BrainType? = null,
     val statusText: String = "Ready",
+    val runningToolName: String? = null,
+    val runningToolArgsJson: String? = null,
     val pendingConfirmation: ConfirmationRequest? = null,
     val queuedCount: Int = 0,
     val lastError: String? = null,
@@ -496,6 +498,8 @@ class AgentOrchestrator @Inject constructor(
         var firstSpokenMs = 0L
         var lastBrainUsed: BrainType = BrainType.MERCURY
         var ackSpoken = false
+        val failedCallCounts = mutableMapOf<String, Int>()
+        var extraFailedStepsCount = 0
 
         if (source == "voice" && isLikelyMultiStepCommand(command)) {
             ackSpoken = true
@@ -505,7 +509,9 @@ class AgentOrchestrator @Inject constructor(
 
         try {
             for (step in 0 until AgentExecutionState.MAX_STEPS) {
-                lastStepCompleted = step + 1
+                if (step + extraFailedStepsCount >= AgentExecutionState.MAX_STEPS) break
+                val effectiveStep = (step + 1 + extraFailedStepsCount).coerceAtMost(AgentExecutionState.MAX_STEPS)
+                lastStepCompleted = effectiveStep
                 val isLocked = permissionHelper.isDeviceLocked()
                 val screenContext = if (!isLocked) {
                     val acc = BabyAccessibilityService.instance
@@ -522,8 +528,10 @@ class AgentOrchestrator @Inject constructor(
 
                 _state.value = _state.value.copy(
                     isRunning = true,
-                    currentStep = step + 1,
-                    statusText = "Soch rahi hoon (${step + 1}/15)...",
+                    currentStep = effectiveStep,
+                    statusText = "Soch rahi hoon ($effectiveStep/${AgentExecutionState.MAX_STEPS})...",
+                    runningToolName = null,
+                    runningToolArgsJson = null,
                     streamingReply = ""
                 )
 
@@ -571,8 +579,8 @@ class AgentOrchestrator @Inject constructor(
                     val err = planRes.exceptionOrNull()
                     val failure = (err as? AiCallException)?.failure
 
-                    // Try offline fallback when cloud providers fail on supported device commands
-                    if (step == 0) {
+                    // Try offline fallback when cloud providers fail on supported device commands (unless parameter validation halted it)
+                    if (step == 0 && failure?.isValidationFailure != true) {
                         val offlineMatch = offlineCommandEngine.tryExecuteOffline(command, fallbackMode = true)
                         if (offlineMatch != null) {
                             actionLogRepository.record(
@@ -730,7 +738,13 @@ class AgentOrchestrator @Inject constructor(
                 }
 
                 // Execute planned tool calls
-                for (call in plan.toolCalls) {
+                var abortedByLoopGuard = false
+                for ((callIdx, rawCall) in plan.toolCalls.withIndex()) {
+                    if (step + extraFailedStepsCount >= AgentExecutionState.MAX_STEPS) break
+                    val canonicalToolName = ToolDefinitions.canonicalToolName(rawCall.name)
+                    val cleanCallArgs = ToolCallNormalizer.canonicalizeArgsForTool(canonicalToolName, rawCall.args)
+                    val call = rawCall.copy(name = canonicalToolName, args = cleanCallArgs)
+
                     // Check locked-phone gate for UI automation
                     if (permissionHelper.isDeviceLocked() && ToolDefinitions.requiresUnlockedScreen(call.name)) {
                         historyRepository.enqueueForUnlock(command, source)
@@ -745,7 +759,7 @@ class AgentOrchestrator @Inject constructor(
                         historyRepository.updateTaskRun(
                             id = taskId,
                             status = "QUEUED_FOR_UNLOCK",
-                            stepsCount = step + 1,
+                            stepsCount = lastStepCompleted,
                             brainSummary = brainsUsed.joinToString(" -> "),
                             finalReply = unlockMsg,
                             stepLogsJson = stepLogs.toString(),
@@ -772,7 +786,7 @@ class AgentOrchestrator @Inject constructor(
                             pendingConfirmation = ConfirmationRequest(
                                 toolName = call.name,
                                 summary = summary,
-                                argsPreview = SensitiveDataSanitizer.sanitizeForLogs(JSONObject(call.args).toString()),
+                                argsPreview = SensitiveDataSanitizer.sanitizeToolCallPayload(JSONObject(call.args).toString()),
                                 requiresVoicePin = needsPin
                             )
                         )
@@ -804,7 +818,7 @@ class AgentOrchestrator @Inject constructor(
                             historyRepository.updateTaskRun(
                                 id = taskId,
                                 status = "STOPPED",
-                                stepsCount = step + 1,
+                                stepsCount = lastStepCompleted,
                                 brainSummary = brainsUsed.joinToString(" -> "),
                                 finalReply = finalReply,
                                 stepLogsJson = stepLogs.toString(),
@@ -815,18 +829,45 @@ class AgentOrchestrator @Inject constructor(
                         }
                     }
 
-                    _state.value = _state.value.copy(statusText = "Running: ${call.name}")
-                    val toolStartMs = System.currentTimeMillis()
-                    val result = actionLogInterceptor.executeLogged(
-                        commandText = command,
+                    val argsPreviewJson = SensitiveDataSanitizer.sanitizeToolCallPayload(
+                        JSONObject(call.args).toString(),
+                        curSettings.inceptionApiKey,
+                        curSettings.groqApiKey,
+                        curSettings.geminiApiKey
+                    )
+                    val runningLabel = com.example.ui.components.presentToolAction(
                         toolName = call.name,
-                        args = call.args,
-                        source = source
-                    ) {
-                        extendedToolRouter.tryExecute(call.name, call.args)
-                            ?: executor.execute(call.name, call.args)
+                        argsJson = argsPreviewJson,
+                        resultText = null,
+                        isRunning = true
+                    ).title
+                    _state.value = _state.value.copy(
+                        statusText = runningLabel,
+                        runningToolName = call.name,
+                        runningToolArgsJson = argsPreviewJson
+                    )
+
+                    val missingRequired = ToolDefinitions.validateRequiredArgs(call.name, call.args)
+                    val toolStartMs = System.currentTimeMillis()
+                    val result = if (missingRequired.isNotEmpty()) {
+                        com.example.domain.tools.ToolExecutionResult(
+                            ok = false,
+                            output = "Parameter '${missingRequired.joinToString(", ")}' missing hai '${call.name}' ke liye."
+                        )
+                    } else {
+                        actionLogInterceptor.executeLogged(
+                            commandText = command,
+                            toolName = call.name,
+                            args = call.args,
+                            source = source
+                        ) {
+                            extendedToolRouter.tryExecute(call.name, call.args)
+                                ?: executor.execute(call.name, call.args)
+                        }
                     }
                     totalToolMs += (System.currentTimeMillis() - toolStartMs).coerceAtLeast(0L)
+                    _state.value = _state.value.copy(runningToolName = null, runningToolArgsJson = null)
+
                     if (result.screenshotBase64 != null && !curSettings.dataSaverEnabled) {
                         latestScreenshot = result.screenshotBase64
                     }
@@ -834,14 +875,23 @@ class AgentOrchestrator @Inject constructor(
                         memoryManager.recordAppUsageHabit(call.args["app_name"]?.toString().orEmpty())
                     }
 
-                    val argsJson = SensitiveDataSanitizer.sanitizeForLogs(JSONObject(call.args).toString())
+                    val storedArgsObj = JSONObject(call.args)
+                    if (call.rawCallSanitized.isNotBlank()) {
+                        storedArgsObj.put("_raw_call", call.rawCallSanitized)
+                    }
+                    val storedArgsJson = SensitiveDataSanitizer.sanitizeToolCallPayload(
+                        storedArgsObj.toString(),
+                        curSettings.inceptionApiKey,
+                        curSettings.groqApiKey,
+                        curSettings.geminiApiKey
+                    )
 
                     stepLogs.put(
                         JSONObject().apply {
-                            put("step", step + 1)
+                            put("step", lastStepCompleted)
                             put("brain", plan.brainUsed.label)
                             put("tool", call.name)
-                            put("args", argsJson)
+                            put("args", argsPreviewJson)
                             put("ok", result.ok)
                             put("output", SensitiveDataSanitizer.sanitizeForLogs(result.output).take(300))
                         }
@@ -853,7 +903,7 @@ class AgentOrchestrator @Inject constructor(
                             content = result.output,
                             brainUsed = plan.brainUsed.name.lowercase(),
                             toolName = call.name,
-                            toolArgsJson = argsJson,
+                            toolArgsJson = storedArgsJson,
                             toolResult = if (result.ok) "OK" else "ERR"
                         )
                     )
@@ -877,11 +927,57 @@ class AgentOrchestrator @Inject constructor(
                         )
                     )
 
-                    // Small settle delay after UI actions so target window updates before next Observe
-                    if (ToolDefinitions.requiresUnlockedScreen(call.name)) {
+                    if (!result.ok) {
+                        if (callIdx > 0) {
+                            extraFailedStepsCount++
+                            lastStepCompleted = (step + 1 + extraFailedStepsCount).coerceAtMost(AgentExecutionState.MAX_STEPS)
+                        }
+                        val callSignature = buildCanonicalCallSignature(call.name, call.args)
+                        val failCount = (failedCallCounts[callSignature] ?: 0) + 1
+                        failedCallCounts[callSignature] = failCount
+
+                        if (failCount >= 2) {
+                            abortedByLoopGuard = true
+                            val friendlyLabel = com.example.ui.components.presentToolAction(
+                                toolName = call.name,
+                                argsJson = argsPreviewJson,
+                                resultText = "ERR",
+                                detailText = result.output
+                            ).title
+                            val shortReason = SensitiveDataSanitizer.sanitizeForLogs(result.output).trim().take(150)
+                            val stopMsg = "Kaam do baar fail ho gaya ($friendlyLabel): $shortReason. Loop rok diya hai — kripya check karke phir se try karo."
+                            stepFailedError = stopMsg
+                            stepFailedErrorDetails = "Repeated failing tool call halted after $failCount failures: tool=${call.name}, args=$argsPreviewJson, output=$shortReason"
+                            finalReply = stopMsg
+                            historyRepository.addMessage(
+                                ChatMessageEntity(
+                                    role = "assistant",
+                                    content = stopMsg,
+                                    brainUsed = "local",
+                                    toolName = "ai_error",
+                                    toolResult = stepFailedErrorDetails
+                                )
+                            )
+                            historyRepository.updateTaskRun(
+                                id = taskId,
+                                status = "FAILED",
+                                stepsCount = lastStepCompleted,
+                                brainSummary = brainsUsed.joinToString(" -> "),
+                                finalReply = stopMsg,
+                                stepLogsJson = stepLogs.toString(),
+                                finishedAt = System.currentTimeMillis()
+                            )
+                            speakIfEnabled(stopMsg, languageHint, BabyMood.CONCERNED)
+                            return
+                        }
+                    }
+
+                    // Small settle delay after successful UI actions so target window updates before next Observe
+                    if (result.ok && ToolDefinitions.requiresUnlockedScreen(call.name)) {
                         delay(550L)
                     }
                 }
+                if (abortedByLoopGuard) break
             }
 
             finalReply = "15 steps poore ho gaye. Jo kar sakti thi kar diya!"
@@ -1145,6 +1241,14 @@ class AgentOrchestrator @Inject constructor(
         } else {
             keyStore.settings.value.preferredLanguage.name.lowercase()
         }
+    }
+
+    private fun buildCanonicalCallSignature(toolName: String, args: Map<String, Any?>): String {
+        val sortedArgs = args.entries
+            .filter { !ToolCallNormalizer.isNullOrLiteralNull(it.value) }
+            .sortedBy { it.key.lowercase() }
+            .joinToString("&") { (k, v) -> "${k.lowercase()}=${v.toString().trim().lowercase()}" }
+        return "${ToolDefinitions.canonicalToolName(toolName)}|$sortedArgs"
     }
 
     private fun isLikelyMultiStepCommand(command: String): Boolean {

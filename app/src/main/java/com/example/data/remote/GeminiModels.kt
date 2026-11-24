@@ -77,7 +77,7 @@ data class GeminiInlineData(
 @JsonClass(generateAdapter = true)
 data class GeminiFunctionCall(
     val name: String,
-    val args: Map<String, Any?>? = emptyMap()
+    val args: Any? = emptyMap<String, Any?>()
 )
 
 @JsonClass(generateAdapter = true)
