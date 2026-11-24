@@ -1,6 +1,7 @@
 package com.example.features.vision
 
 import com.example.core.security.SecureKeyStore
+import com.example.core.security.SensitiveDataSanitizer
 import com.example.data.remote.GeminiApiService
 import com.example.data.remote.GeminiContent
 import com.example.data.remote.GeminiGenerateRequest
@@ -13,6 +14,7 @@ import com.example.domain.tools.ToolExecutionResult
 import com.example.features.safety.SafetyManager
 import com.example.service.BabyAccessibilityService
 import com.example.util.PermissionHelper
+import kotlinx.coroutines.CancellationException
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -63,7 +65,8 @@ class ScreenHelpManager @Inject constructor(
         val useVisionScreenshot = !treeEnough && !settings.dataSaverEnabled && settings.geminiApiKey.isNotBlank()
 
         val taskPrompt = buildTaskInstruction(normMode, langLabel, extraQuestion)
-        val minimalTextPayload = extractedLines.take(35).joinToString("\n").ifBlank { uiTree.take(1500) }
+        val rawPayload = extractedLines.take(35).joinToString("\n").ifBlank { uiTree.take(1500) }
+        val minimalTextPayload = SensitiveDataSanitizer.sanitizeForRemoteAi(rawPayload)
 
         if (!useVisionScreenshot) {
             val textAnswer = runTextBrain(taskPrompt, minimalTextPayload)
@@ -104,10 +107,10 @@ class ScreenHelpManager @Inject constructor(
 
     private suspend fun runTextBrain(taskPrompt: String, screenText: String): String? {
         val settings = keyStore.settings.value
-        val userContent = "$taskPrompt\n\nVisible Screen Content:\n$screenText"
+        val userContent = SensitiveDataSanitizer.sanitizeForRemoteAi("$taskPrompt\n\nVisible Screen Content:\n$screenText")
 
         if (settings.groqApiKey.isNotBlank()) {
-            val groqAns = runCatching {
+            val groqAns = try {
                 val resp = groqApi.chatCompletions(
                     bearerAuth = "Bearer ${settings.groqApiKey.trim()}",
                     request = GroqChatRequest(
@@ -123,13 +126,19 @@ class ScreenHelpManager @Inject constructor(
                         toolChoice = null
                     )
                 )
-                resp.body()?.choices?.firstOrNull()?.message?.content?.trim()
-            }.getOrNull()
+                if (resp.isSuccessful) {
+                    resp.body()?.choices?.firstOrNull()?.message?.content?.trim()
+                } else null
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (_: Exception) {
+                null
+            }
             if (!groqAns.isNullOrBlank()) return groqAns
         }
 
         if (settings.geminiApiKey.isNotBlank()) {
-            return runCatching {
+            return try {
                 val resp = geminiApi.generateContent(
                     model = settings.geminiModel,
                     apiKey = settings.geminiApiKey.trim(),
@@ -140,9 +149,16 @@ class ScreenHelpManager @Inject constructor(
                         contents = listOf(GeminiContent(role = "user", parts = listOf(GeminiPart(text = userContent))))
                     )
                 )
-                resp.body()?.candidates?.firstOrNull()?.content?.parts
-                    ?.mapNotNull { it.text }?.joinToString("\n")?.trim()
-            }.getOrNull()?.takeIf { it.isNotBlank() }
+                if (resp.isSuccessful) {
+                    resp.body()?.candidates?.firstOrNull()?.content?.parts
+                        ?.mapNotNull { it.text }?.joinToString("\n")?.trim()
+                        ?.takeIf { it.isNotBlank() }
+                } else null
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (_: Exception) {
+                null
+            }
         }
         return null
     }
@@ -152,7 +168,7 @@ class ScreenHelpManager @Inject constructor(
         val key = settings.geminiApiKey.trim()
         if (key.isBlank()) return null
 
-        return runCatching {
+        return try {
             val resp = geminiApi.generateContent(
                 model = settings.geminiModel,
                 apiKey = key,
@@ -166,16 +182,23 @@ class ScreenHelpManager @Inject constructor(
                         GeminiContent(
                             role = "user",
                             parts = listOf(
-                                GeminiPart(text = prompt),
+                                GeminiPart(text = SensitiveDataSanitizer.sanitizeForRemoteAi(prompt)),
                                 GeminiPart(inlineData = GeminiInlineData("image/jpeg", jpegBase64))
                             )
                         )
                     )
                 )
             )
-            resp.body()?.candidates?.firstOrNull()?.content?.parts
-                ?.mapNotNull { it.text }?.joinToString("\n")?.trim()
-        }.getOrNull()?.takeIf { it.isNotBlank() }
+            if (resp.isSuccessful) {
+                resp.body()?.candidates?.firstOrNull()?.content?.parts
+                    ?.mapNotNull { it.text }?.joinToString("\n")?.trim()
+                    ?.takeIf { it.isNotBlank() }
+            } else null
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (_: Exception) {
+            null
+        }
     }
 
     private fun buildTaskInstruction(mode: String, targetLang: String, extraQuestion: String?): String {

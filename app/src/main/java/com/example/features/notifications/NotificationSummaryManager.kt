@@ -12,6 +12,7 @@ import androidx.work.WorkManager
 import com.example.MainActivity
 import com.example.R
 import com.example.core.security.SecureKeyStore
+import com.example.core.security.SensitiveDataSanitizer
 import com.example.data.remote.GroqApiService
 import com.example.data.remote.GroqChatRequest
 import com.example.data.remote.GroqMessage
@@ -19,6 +20,7 @@ import com.example.service.BabyNotificationListenerService
 import com.example.service.CachedNotification
 import com.example.voice.BabyTtsManager
 import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.CancellationException
 import java.util.Calendar
 import java.util.concurrent.TimeUnit
 import javax.inject.Inject
@@ -108,8 +110,9 @@ class NotificationSummaryManager @Inject constructor(
             }
         }.trim()
 
+        val safeRemotePayload = SensitiveDataSanitizer.sanitizeForRemoteAi(structuredInput)
         val summary = if (!settings.dataSaverEnabled && settings.groqApiKey.isNotBlank()) {
-            runCatching {
+            try {
                 val resp = groqApi.chatCompletions(
                     bearerAuth = "Bearer ${settings.groqApiKey.trim()}",
                     request = GroqChatRequest(
@@ -119,14 +122,20 @@ class NotificationSummaryManager @Inject constructor(
                                 role = "system",
                                 content = "You are Baby. Summarize these notifications in 2-4 crisp Hinglish sentences grouped by app and importance: ALWAYS mention PEOPLE messages first, updates next, and PROMOS last. Never invent or reveal masked OTP/bank numbers."
                             ),
-                            GroqMessage(role = "user", content = structuredInput)
+                            GroqMessage(role = "user", content = safeRemotePayload)
                         ),
                         tools = null,
                         toolChoice = null
                     )
                 )
-                resp.body()?.choices?.firstOrNull()?.message?.content?.trim()
-            }.getOrNull() ?: formatLocalSummary(orderedByBucketAndApp, allowSensitive)
+                if (resp.isSuccessful) {
+                    resp.body()?.choices?.firstOrNull()?.message?.content?.trim()?.takeIf { it.isNotBlank() }
+                } else null
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (_: Exception) {
+                null
+            } ?: formatLocalSummary(orderedByBucketAndApp, allowSensitive)
         } else {
             formatLocalSummary(orderedByBucketAndApp, allowSensitive)
         }
@@ -146,7 +155,7 @@ class NotificationSummaryManager @Inject constructor(
     }
 
     fun showSummaryNotification(summaryText: String) {
-        val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
         val channelId = "baby_summary_channel"
         nm.createNotificationChannel(
             NotificationChannel(channelId, "Baby Daily Summaries", NotificationManager.IMPORTANCE_DEFAULT)
@@ -157,11 +166,12 @@ class NotificationSummaryManager @Inject constructor(
             Intent(context, MainActivity::class.java),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
+        val safeSummary = maskSensitiveText(SensitiveDataSanitizer.sanitizeForLogs(summaryText))
         val notif = NotificationCompat.Builder(context, channelId)
             .setSmallIcon(R.drawable.ic_baby_tile)
             .setContentTitle("Baby • Notification Summary")
-            .setContentText(summaryText.take(100))
-            .setStyle(NotificationCompat.BigTextStyle().bigText(summaryText))
+            .setContentText(safeSummary.take(100))
+            .setStyle(NotificationCompat.BigTextStyle().bigText(safeSummary))
             .setContentIntent(openIntent)
             .setAutoCancel(true)
             .build()

@@ -21,15 +21,21 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Alarm
+import androidx.compose.material.icons.filled.AutoAwesome
+import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Emergency
 import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.Memory
+import androidx.compose.material.icons.filled.PlayCircleOutline
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Shield
+import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -198,7 +204,10 @@ fun MoreScreen(
                         leadingIcon = { Icon(Icons.Default.Search, contentDescription = null) },
                         trailingIcon = {
                             if (searchQuery.isNotEmpty()) {
-                                IconButton(onClick = { searchQuery = "" }) {
+                                IconButton(
+                                    onClick = { searchQuery = "" },
+                                    modifier = Modifier.minimumInteractiveComponentSize()
+                                ) {
                                     Icon(Icons.Default.Clear, contentDescription = "Clear search")
                                 }
                             }
@@ -213,7 +222,9 @@ fun MoreScreen(
             }
 
             LazyColumn(
-                modifier = Modifier.fillMaxSize(),
+                modifier = Modifier
+                    .fillMaxSize()
+                    .testTag("more_list"),
                 contentPadding = PaddingValues(spacing.md),
                 verticalArrangement = Arrangement.spacedBy(spacing.sm)
             ) {
@@ -241,6 +252,61 @@ fun MoreScreen(
                         }
                     }
                 } else {
+                    item {
+                        MoreRowCard(
+                            icon = Icons.Default.AutoAwesome,
+                            title = "Daily Routines",
+                            subtitle = "Good morning, Good night & scheduled routines",
+                            badge = "Routines",
+                            badgePositive = true,
+                            testTag = "more_open_routines",
+                            onClick = { onOpenRoutinesTab(0) }
+                        )
+                    }
+                    item {
+                        MoreRowCard(
+                            icon = Icons.Default.Bolt,
+                            title = "Custom Commands",
+                            subtitle = "One-phrase shortcuts like Movie mode",
+                            badge = "Commands",
+                            badgePositive = true,
+                            testTag = "more_open_commands",
+                            onClick = { onOpenRoutinesTab(1) }
+                        )
+                    }
+                    item {
+                        MoreRowCard(
+                            icon = Icons.Default.PlayCircleOutline,
+                            title = "Macros",
+                            subtitle = "Record & replay multi-step screen actions",
+                            badge = "Macros",
+                            badgePositive = true,
+                            testTag = "more_open_macros",
+                            onClick = { onOpenRoutinesTab(2) }
+                        )
+                    }
+                    item {
+                        MoreRowCard(
+                            icon = Icons.Default.Alarm,
+                            title = "Reminders & Places",
+                            subtitle = "Exact time alarms & Home/Work geofences",
+                            badge = "Reminders",
+                            badgePositive = true,
+                            testTag = "more_open_reminders",
+                            onClick = onOpenReminders
+                        )
+                    }
+                    item {
+                        MoreRowCard(
+                            icon = Icons.Default.Memory,
+                            title = "Memory",
+                            subtitle = "Saved nicknames, contacts & personal facts",
+                            badge = "$memoriesCount saved",
+                            badgePositive = memoriesCount > 0,
+                            testTag = "more_open_memory",
+                            onClick = onOpenMemory
+                        )
+                    }
                     item {
                         MoreRowCard(
                             icon = Icons.Default.Settings,
@@ -435,7 +501,7 @@ private fun MoreRowCard(
                 Text(
                     text = badge,
                     style = MaterialTheme.typography.labelSmall,
-                    color = if (badgePositive) ext.success else ext.warning,
+                    color = if (badgePositive) ext.onSuccessContainer else ext.onWarningContainer,
                     modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
                 )
             }

@@ -12,6 +12,7 @@ import com.example.data.local.EmergencyContactDao
 import com.example.data.local.MIGRATION_1_2
 import com.example.data.local.MIGRATION_2_3
 import com.example.data.local.MIGRATION_3_4
+import com.example.data.local.MIGRATION_4_5
 import com.example.data.local.MacroDao
 import com.example.data.local.MemoryDao
 import com.example.data.local.QueuedTaskDao
@@ -103,7 +104,7 @@ object AppModule {
             context,
             BabyDatabase::class.java,
             "baby_assistant_db"
-        ).addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4).fallbackToDestructiveMigration(true).build()
+        ).addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5).build()
 
     @Provides
     fun provideChatDao(db: BabyDatabase): ChatDao = db.chatDao()

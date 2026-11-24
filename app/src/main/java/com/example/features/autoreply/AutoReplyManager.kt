@@ -11,14 +11,20 @@ import android.provider.ContactsContract
 import android.telephony.SmsManager
 import com.example.core.security.AutoReplyMode
 import com.example.core.security.SecureKeyStore
+import com.example.core.security.SensitiveDataSanitizer
 import com.example.data.local.AutoReplyContactRuleEntity
 import com.example.data.local.AutoReplyRuleDao
+import com.example.data.remote.GeminiApiService
+import com.example.data.remote.GeminiContent
+import com.example.data.remote.GeminiGenerateRequest
+import com.example.data.remote.GeminiPart
 import com.example.data.remote.GroqApiService
 import com.example.data.remote.GroqChatRequest
 import com.example.data.remote.GroqMessage
 import com.example.features.actionlog.ActionLogRepository
 import com.example.util.PermissionHelper
 import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.Flow
 import java.util.Calendar
 import javax.inject.Inject
@@ -30,6 +36,7 @@ class AutoReplyManager @Inject constructor(
     private val keyStore: SecureKeyStore,
     private val ruleDao: AutoReplyRuleDao,
     private val groqApi: GroqApiService,
+    private val geminiApi: GeminiApiService,
     private val actionLog: ActionLogRepository,
     private val permissionHelper: PermissionHelper
 ) {
@@ -116,18 +123,18 @@ class AutoReplyManager @Inject constructor(
                 replyAction.actionIntent.send(context, 0, intent)
                 true
             }.getOrElse {
-                resultNote = "Inline reply failed: ${it.message}"
+                resultNote = "Inline reply failed: ${SensitiveDataSanitizer.sanitizeError(it.message)}"
                 false
             }
-            if (sentOk) resultNote = "Auto-replied via $appLabel: \"$replyBody\""
+            if (sentOk) resultNote = "Auto-replied via $appLabel (template/AI, ${replyBody.length} chars)"
         } else if (isSmsOrCall && permissionHelper.hasPermission(Manifest.permission.SEND_SMS)) {
             val number = resolveSenderNumber(senderTitle)
             if (!number.isNullOrBlank()) {
                 sentOk = sendDirectSms(number, replyBody)
                 resultNote = if (sentOk) {
-                    "Auto-replied via SMS API ($appLabel) to $number: \"$replyBody\""
+                    "Auto-replied via SMS ($appLabel) to $senderTitle (${replyBody.length} chars)"
                 } else {
-                    "SMS auto-reply failed for $number"
+                    "SMS auto-reply failed for $senderTitle"
                 }
             } else {
                 resultNote = "Missed call/SMS from $senderTitle (no number resolved for SMS reply)"
@@ -164,7 +171,7 @@ class AutoReplyManager @Inject constructor(
             } else {
                 @Suppress("DEPRECATION")
                 SmsManager.getDefault()
-            }
+            } ?: return false
             val parts = smsManager.divideMessage(body)
             smsManager.sendMultipartTextMessage(phoneNumber, null, parts, null, null)
             true
@@ -177,14 +184,16 @@ class AutoReplyManager @Inject constructor(
         if (!permissionHelper.hasPermission(Manifest.permission.READ_CONTACTS)) return null
         val q = senderTitle.trim()
         if (q.isBlank()) return null
-        context.contentResolver.query(
-            ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
-            arrayOf(ContactsContract.CommonDataKinds.Phone.NUMBER),
-            "${ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME} LIKE ?",
-            arrayOf("%$q%"),
-            null
-        )?.use { c ->
-            if (c.moveToFirst()) return c.getString(0)
+        runCatching {
+            context.contentResolver.query(
+                ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+                arrayOf(ContactsContract.CommonDataKinds.Phone.NUMBER),
+                "${ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME} LIKE ?",
+                arrayOf("%$q%"),
+                null
+            )?.use { c ->
+                if (c.moveToFirst()) return c.getString(0)
+            }
         }
         return null
     }
@@ -195,25 +204,61 @@ class AutoReplyManager @Inject constructor(
         incomingText: String
     ): String {
         val settings = keyStore.settings.value
-        if (!settings.autoReplyAiEnabled || settings.dataSaverEnabled || settings.groqApiKey.isBlank()) {
+        if (!settings.autoReplyAiEnabled || settings.dataSaverEnabled || !settings.hasAnyApiKey) {
             return template
         }
-        return runCatching {
-            val prompt = "Mode: ${settings.autoReplyMode.label}. Base message: \"$template\". Sender: $sender wrote: \"$incomingText\". Write a short, polite 1-sentence Hinglish auto-reply."
-            val resp = groqApi.chatCompletions(
-                bearerAuth = "Bearer ${settings.groqApiKey.trim()}",
-                request = GroqChatRequest(
-                    model = settings.groqModel,
-                    messages = listOf(
-                        GroqMessage(role = "system", content = "You are Baby. Generate only the short 1-sentence Hinglish auto-reply text."),
-                        GroqMessage(role = "user", content = prompt)
-                    ),
-                    tools = null,
-                    toolChoice = null
+        val safeIncoming = SensitiveDataSanitizer.sanitizeForRemoteAi(incomingText.take(280))
+        val prompt = "Mode: ${settings.autoReplyMode.label}. Base message: \"$template\". Sender: $sender wrote: \"$safeIncoming\". Write a short, polite 1-sentence Hinglish auto-reply."
+
+        if (settings.groqApiKey.isNotBlank()) {
+            try {
+                val resp = groqApi.chatCompletions(
+                    bearerAuth = "Bearer ${settings.groqApiKey.trim()}",
+                    request = GroqChatRequest(
+                        model = settings.groqModel,
+                        messages = listOf(
+                            GroqMessage(role = "system", content = "You are Baby. Generate only the short 1-sentence Hinglish auto-reply text."),
+                            GroqMessage(role = "user", content = prompt)
+                        ),
+                        tools = null,
+                        toolChoice = null
+                    )
                 )
-            )
-            resp.body()?.choices?.firstOrNull()?.message?.content?.trim()?.takeIf { it.isNotBlank() } ?: template
-        }.getOrDefault(template)
+                if (resp.isSuccessful) {
+                    val text = resp.body()?.choices?.firstOrNull()?.message?.content?.trim()
+                    if (!text.isNullOrBlank()) return text
+                }
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (_: Exception) {
+                // Fall through to Gemini/template
+            }
+        }
+
+        if (settings.autoFallbackEnabled && settings.geminiApiKey.isNotBlank()) {
+            try {
+                val resp = geminiApi.generateContent(
+                    model = settings.geminiModel,
+                    apiKey = settings.geminiApiKey.trim(),
+                    request = GeminiGenerateRequest(
+                        systemInstruction = GeminiContent(
+                            parts = listOf(GeminiPart(text = "You are Baby. Generate only the short 1-sentence Hinglish auto-reply text."))
+                        ),
+                        contents = listOf(GeminiContent(role = "user", parts = listOf(GeminiPart(text = prompt))))
+                    )
+                )
+                if (resp.isSuccessful) {
+                    val text = resp.body()?.candidates?.firstOrNull()?.content?.parts
+                        ?.mapNotNull { it.text?.trim() }?.joinToString(" ")?.trim()
+                    if (!text.isNullOrBlank()) return text
+                }
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (_: Exception) {
+                // Fall back to template
+            }
+        }
+        return template
     }
 
     companion object {

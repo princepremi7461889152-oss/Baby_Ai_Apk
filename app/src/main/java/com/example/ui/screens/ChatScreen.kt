@@ -22,6 +22,7 @@ import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
@@ -47,12 +48,14 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.ArrowDownward
 import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.DeleteOutline
+import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.GraphicEq
@@ -63,7 +66,6 @@ import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Stop
-import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material.icons.filled.WifiOff
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -142,6 +144,13 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
+private val CHAT_TIME_FORMATTER = object : ThreadLocal<SimpleDateFormat>() {
+    override fun initialValue(): SimpleDateFormat = SimpleDateFormat("hh:mm a", Locale.getDefault())
+}
+
+private fun formatChatTimestamp(timestampMs: Long): String =
+    CHAT_TIME_FORMATTER.get()?.format(Date(timestampMs)).orEmpty()
+
 @OptIn(ExperimentalLayoutApi::class, ExperimentalFoundationApi::class)
 @Composable
 fun ChatScreen(
@@ -171,6 +180,7 @@ fun ChatScreen(
     onSpeakMessage: (String) -> Unit = {},
     onDismissApiKeyBanner: () -> Unit = {},
     onDismissRateLimitBanner: () -> Unit = {},
+    onDismissError: () -> Unit = {},
     onToggleQuickCommandPin: (String) -> Unit = {},
     onEditQuickCommandPhrase: (String, String) -> Unit = { _, _ -> },
     onWakeWordToggle: (Boolean) -> Unit = {},
@@ -183,6 +193,7 @@ fun ChatScreen(
     var inputText by remember { mutableStateOf("") }
     var showQuickStatusSheet by remember { mutableStateOf(false) }
     var editingQuickCommand by remember { mutableStateOf<QuickCommandItem?>(null) }
+    var hasPerformedInitialScroll by remember { mutableStateOf(false) }
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
     val haptic = LocalHapticFeedback.current
@@ -214,7 +225,14 @@ fun ChatScreen(
 
     LaunchedEffect(messages.size) {
         if (messages.isNotEmpty()) {
-            listState.animateScrollToItem(messages.lastIndex)
+            if (!hasPerformedInitialScroll) {
+                hasPerformedInitialScroll = true
+                listState.scrollToItem(messages.lastIndex)
+            } else {
+                listState.animateScrollToItem(messages.lastIndex)
+            }
+        } else {
+            hasPerformedInitialScroll = false
         }
     }
 
@@ -371,7 +389,7 @@ fun ChatScreen(
                         Icon(
                             imageVector = Icons.Default.Key,
                             contentDescription = null,
-                            tint = ext.warning,
+                            tint = ext.onWarningContainer,
                             modifier = Modifier.size(20.dp)
                         )
                         Spacer(Modifier.width(spacing.xs))
@@ -387,7 +405,7 @@ fun ChatScreen(
                         ) {
                             Text(
                                 text = stringResource(R.string.banner_no_key_cta),
-                                color = ext.warning,
+                                color = ext.onWarningContainer,
                                 style = MaterialTheme.typography.labelLarge
                             )
                         }
@@ -455,8 +473,71 @@ fun ChatScreen(
                         TextButton(onClick = onNavigateToSettings) {
                             Text("Switch", color = MaterialTheme.colorScheme.error)
                         }
-                        IconButton(onClick = onDismissRateLimitBanner) {
+                        IconButton(
+                            onClick = onDismissRateLimitBanner,
+                            modifier = Modifier.minimumInteractiveComponentSize()
+                        ) {
                             Icon(Icons.Default.Close, contentDescription = "Dismiss rate limit banner", modifier = Modifier.size(16.dp))
+                        }
+                    }
+                }
+            }
+
+            AnimatedVisibility(visible = !agentState.isRunning && !agentState.lastError.isNullOrBlank()) {
+                val lastUserCommand = remember(messages) {
+                    messages.lastOrNull { it.role == "user" }?.content
+                }
+                Surface(
+                    color = MaterialTheme.colorScheme.errorContainer,
+                    contentColor = MaterialTheme.colorScheme.onErrorContainer,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = spacing.md, vertical = spacing.xxs)
+                        .clip(RoundedCornerShape(spacing.chipRadius))
+                        .testTag("agent_error_banner")
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = spacing.sm, vertical = spacing.xs),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.ErrorOutline,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.onErrorContainer,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(Modifier.width(spacing.xs))
+                        Text(
+                            text = agentState.lastError.orEmpty().withDevanagariFallback(),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onErrorContainer,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f)
+                        )
+                        if (!lastUserCommand.isNullOrBlank()) {
+                            TextButton(
+                                onClick = {
+                                    onDismissError()
+                                    onSendCommand(lastUserCommand)
+                                },
+                                modifier = Modifier.testTag("agent_error_retry_button")
+                            ) {
+                                Text("Retry", color = MaterialTheme.colorScheme.onErrorContainer)
+                            }
+                        }
+                        IconButton(
+                            onClick = onDismissError,
+                            modifier = Modifier
+                                .minimumInteractiveComponentSize()
+                                .testTag("agent_error_dismiss_button")
+                        ) {
+                            Icon(
+                                Icons.Default.Close,
+                                contentDescription = "Dismiss error",
+                                tint = MaterialTheme.colorScheme.onErrorContainer,
+                                modifier = Modifier.size(16.dp)
+                            )
                         }
                     }
                 }
@@ -744,119 +825,123 @@ private fun CompactGreetingAndQuickCommands(
     onOpenPermissions: () -> Unit
 ) {
     val spacing = BabyThemeTokens.spacing
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .verticalScroll(rememberScrollState())
-            .padding(horizontal = spacing.md, vertical = spacing.sm),
-        verticalArrangement = Arrangement.spacedBy(spacing.md)
-    ) {
-        // Compact Greeting Card (<= 25% screen height)
-        Card(
-            shape = RoundedCornerShape(spacing.cardRadius),
-            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+    BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
+        val compactHeight = maxHeight < 520.dp
+        Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .heightIn(max = 165.dp)
-                .testTag("compact_greeting_card")
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = spacing.md, vertical = spacing.sm),
+            verticalArrangement = Arrangement.spacedBy(if (compactHeight) spacing.sm else spacing.md)
         ) {
-            Row(
-                modifier = Modifier.padding(spacing.md),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(spacing.md)
+            // Compact Greeting Card (responsive height so it never crowds small/landscape screens)
+            Card(
+                shape = RoundedCornerShape(spacing.cardRadius),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = if (compactHeight) 112.dp else 152.dp)
+                    .testTag("compact_greeting_card")
             ) {
-                BabyOrb(
-                    state = BabyOrbState.IDLE,
-                    size = 58.dp,
-                    showIcon = true,
-                    contentDesc = "Baby companion orb"
-                )
-                Column(
-                    modifier = Modifier.weight(1f),
-                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                Row(
+                    modifier = Modifier.padding(if (compactHeight) spacing.sm else spacing.md),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(spacing.md)
                 ) {
-                    Text(
-                        text = stringResource(R.string.chat_greeting_title).withDevanagariFallback(),
-                        style = MaterialTheme.typography.titleLarge
+                    BabyOrb(
+                        state = BabyOrbState.IDLE,
+                        size = if (compactHeight) 44.dp else 56.dp,
+                        showIcon = true,
+                        contentDesc = "Baby companion orb"
                     )
-                    Text(
-                        text = stringResource(R.string.chat_greeting_subtitle).withDevanagariFallback(),
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = 3,
-                        overflow = TextOverflow.Ellipsis
-                    )
+                    Column(
+                        modifier = Modifier.weight(1f),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Text(
+                            text = stringResource(R.string.chat_greeting_title).withDevanagariFallback(),
+                            style = if (compactHeight) MaterialTheme.typography.titleMedium else MaterialTheme.typography.titleLarge,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Text(
+                            text = stringResource(R.string.chat_greeting_subtitle).withDevanagariFallback(),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = if (compactHeight) 2 else 3,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
                 }
             }
-        }
 
-        Column(verticalArrangement = Arrangement.spacedBy(spacing.xs)) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(
-                    text = "Quick Commands",
-                    style = MaterialTheme.typography.titleSmall,
-                    color = MaterialTheme.colorScheme.secondary
-                )
-                Text(
-                    text = "Hold to edit or pin",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
+            Column(verticalArrangement = Arrangement.spacedBy(spacing.xs)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "Quick Commands",
+                        style = MaterialTheme.typography.titleSmall,
+                        color = MaterialTheme.colorScheme.secondary
+                    )
+                    Text(
+                        text = "Hold to edit or pin",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
 
-            FlowRow(
-                horizontalArrangement = Arrangement.spacedBy(spacing.xs),
-                verticalArrangement = Arrangement.spacedBy(spacing.xs),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                quickCommands.forEach { cmd ->
-                    Surface(
-                        color = if (cmd.isPinned) {
-                            MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.65f)
-                        } else {
-                            MaterialTheme.colorScheme.surfaceVariant
-                        },
-                        shape = RoundedCornerShape(spacing.chipRadius),
-                        modifier = Modifier
-                            .heightIn(min = 44.dp)
-                            .clip(RoundedCornerShape(spacing.chipRadius))
-                            .border(
-                                width = 1.dp,
-                                color = if (cmd.isPinned) MaterialTheme.colorScheme.primary.copy(alpha = 0.55f)
-                                else MaterialTheme.colorScheme.outline.copy(alpha = 0.6f),
-                                shape = RoundedCornerShape(spacing.chipRadius)
-                            )
-                            .combinedClickable(
-                                onClick = { onSendCommand(cmd.phrase) },
-                                onLongClick = { onLongPressCommand(cmd) }
-                            )
-                            .testTag("quick_command_${cmd.id}")
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(horizontal = spacing.sm, vertical = spacing.xs),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(spacing.xs),
+                    verticalArrangement = Arrangement.spacedBy(spacing.xs),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    quickCommands.forEach { cmd ->
+                        Surface(
+                            color = if (cmd.isPinned) {
+                                MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.65f)
+                            } else {
+                                MaterialTheme.colorScheme.surfaceVariant
+                            },
+                            shape = RoundedCornerShape(spacing.chipRadius),
+                            modifier = Modifier
+                                .heightIn(min = 48.dp)
+                                .clip(RoundedCornerShape(spacing.chipRadius))
+                                .border(
+                                    width = 1.dp,
+                                    color = if (cmd.isPinned) MaterialTheme.colorScheme.primary.copy(alpha = 0.55f)
+                                    else MaterialTheme.colorScheme.outline.copy(alpha = 0.6f),
+                                    shape = RoundedCornerShape(spacing.chipRadius)
+                                )
+                                .combinedClickable(
+                                    onClick = { onSendCommand(cmd.phrase) },
+                                    onLongClick = { onLongPressCommand(cmd) }
+                                )
+                                .testTag("quick_command_${cmd.id}")
                         ) {
-                            Icon(
-                                imageVector = if (cmd.isPinned) Icons.Default.PushPin else Icons.Default.Bolt,
-                                contentDescription = null,
-                                tint = MaterialTheme.colorScheme.primary,
-                                modifier = Modifier.size(15.dp)
-                            )
-                            Text(
-                                text = cmd.phrase.withDevanagariFallback(),
-                                style = MaterialTheme.typography.labelLarge,
-                                color = MaterialTheme.colorScheme.onSurface
-                            )
+                            Row(
+                                modifier = Modifier.padding(horizontal = spacing.sm, vertical = spacing.xs),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                Icon(
+                                    imageVector = if (cmd.isPinned) Icons.Default.PushPin else Icons.Default.Bolt,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.size(15.dp)
+                                )
+                                Text(
+                                    text = cmd.phrase.withDevanagariFallback(),
+                                    style = MaterialTheme.typography.labelLarge,
+                                    color = MaterialTheme.colorScheme.onSurface
+                                )
+                            }
                         }
                     }
                 }
             }
-        }
 
         if (!permissions.accessibility) {
             Surface(
@@ -882,6 +967,7 @@ private fun CompactGreetingAndQuickCommands(
                 }
             }
         }
+        }
     }
 }
 
@@ -900,7 +986,7 @@ private fun ChatBubbleItem(
     val clipboard = LocalClipboardManager.current
     val context = LocalContext.current
     val haptic = LocalHapticFeedback.current
-    val timeFormatter = remember { SimpleDateFormat("hh:mm a", Locale.getDefault()) }
+    val formattedTime = remember(msg.timestamp) { formatChatTimestamp(msg.timestamp) }
     var showTimestamp by remember { mutableStateOf(false) }
     var showMenu by remember { mutableStateOf(false) }
 
@@ -970,7 +1056,7 @@ private fun ChatBubbleItem(
                 }
                 AnimatedVisibility(visible = showTimestamp) {
                     Text(
-                        text = timeFormatter.format(Date(msg.timestamp)),
+                        text = formattedTime,
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.padding(top = 3.dp, end = 4.dp)
@@ -1147,7 +1233,7 @@ private fun ChatBubbleItem(
                         )
                         DropdownMenuItem(
                             text = { Text(stringResource(R.string.chat_action_speak)) },
-                            leadingIcon = { Icon(Icons.Default.VolumeUp, contentDescription = null) },
+                            leadingIcon = { Icon(Icons.AutoMirrored.Filled.VolumeUp, contentDescription = null) },
                             onClick = {
                                 showMenu = false
                                 onSpeak()
@@ -1157,7 +1243,7 @@ private fun ChatBubbleItem(
                 }
                 AnimatedVisibility(visible = showTimestamp) {
                     Text(
-                        text = timeFormatter.format(Date(msg.timestamp)),
+                        text = formattedTime,
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.padding(top = 3.dp, start = 4.dp)
@@ -1312,6 +1398,9 @@ private fun ConfirmationGateCard(
                     value = pinInput,
                     onValueChange = { pinInput = it },
                     label = { Text("Enter Safety Voice PIN") },
+                    supportingText = if (pinInput.isBlank()) {
+                        { Text("Voice PIN required to authorize this action") }
+                    } else null,
                     singleLine = true,
                     modifier = Modifier
                         .fillMaxWidth()
@@ -1335,6 +1424,7 @@ private fun ConfirmationGateCard(
                 }
                 Button(
                     onClick = { onApprove(if (request.requiresVoicePin) pinInput else null) },
+                    enabled = !request.requiresVoicePin || pinInput.isNotBlank(),
                     modifier = Modifier
                         .weight(1f)
                         .minimumInteractiveComponentSize()

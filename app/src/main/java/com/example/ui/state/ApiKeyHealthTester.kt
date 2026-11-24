@@ -1,9 +1,13 @@
 package com.example.ui.state
 
+import com.example.core.security.SensitiveDataSanitizer
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import java.net.SocketTimeoutException
+import java.net.UnknownHostException
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -23,7 +27,7 @@ class ApiKeyHealthTester @Inject constructor(
         if (key.isBlank()) {
             return@withContext KeyTestResult.Invalid("Groq key khali hai")
         }
-        runCatching {
+        try {
             val request = Request.Builder()
                 .url("https://api.groq.com/openai/v1/models")
                 .header("Authorization", "Bearer $key")
@@ -37,8 +41,15 @@ class ApiKeyHealthTester @Inject constructor(
                     else -> KeyTestResult.Invalid("Groq check failed (HTTP ${resp.code})")
                 }
             }
-        }.getOrElse { err ->
-            KeyTestResult.Invalid("Network error: ${err.localizedMessage ?: "Offline"}")
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (e: Exception) {
+            val msg = when (e) {
+                is SocketTimeoutException -> "Connection timed out"
+                is UnknownHostException -> "Offline / No internet"
+                else -> SensitiveDataSanitizer.sanitizeError(e.localizedMessage, key)
+            }
+            KeyTestResult.Invalid("Network error: $msg")
         }
     }
 
@@ -47,7 +58,7 @@ class ApiKeyHealthTester @Inject constructor(
         if (key.isBlank()) {
             return@withContext KeyTestResult.Invalid("Gemini key khali hai")
         }
-        runCatching {
+        try {
             val request = Request.Builder()
                 .url("https://generativelanguage.googleapis.com/v1beta/models?pageSize=1")
                 .header("x-goog-api-key", key)
@@ -62,8 +73,15 @@ class ApiKeyHealthTester @Inject constructor(
                     else -> KeyTestResult.Invalid("Gemini check failed (HTTP ${resp.code})")
                 }
             }
-        }.getOrElse { err ->
-            KeyTestResult.Invalid("Network error: ${err.localizedMessage ?: "Offline"}")
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (e: Exception) {
+            val msg = when (e) {
+                is SocketTimeoutException -> "Connection timed out"
+                is UnknownHostException -> "Offline / No internet"
+                else -> SensitiveDataSanitizer.sanitizeError(e.localizedMessage, key)
+            }
+            KeyTestResult.Invalid("Network error: $msg")
         }
     }
 }

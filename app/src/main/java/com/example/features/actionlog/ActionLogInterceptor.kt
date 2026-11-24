@@ -1,6 +1,8 @@
 package com.example.features.actionlog
 
+import com.example.core.security.SensitiveDataSanitizer
 import com.example.domain.tools.ToolExecutionResult
+import kotlinx.coroutines.CancellationException
 import org.json.JSONObject
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -23,8 +25,13 @@ class ActionLogInterceptor @Inject constructor(
     ): ToolExecutionResult {
         val result = try {
             block()
+        } catch (ce: CancellationException) {
+            throw ce
         } catch (t: Throwable) {
-            val errRes = ToolExecutionResult(false, "Tool error ($toolName): ${t.message ?: "unknown"}")
+            val errRes = ToolExecutionResult(
+                false,
+                "Tool error ($toolName): ${SensitiveDataSanitizer.sanitizeError(t.message)}"
+            )
             recordResult(commandText, toolName, args, source, errRes)
             return errRes
         }
@@ -39,7 +46,14 @@ class ActionLogInterceptor @Inject constructor(
         source: String,
         result: ToolExecutionResult
     ) {
-        val argsJson = runCatching { JSONObject(args).toString() }.getOrDefault(args.toString())
+        val sanitizedArgs = args.mapValues { (k, v) ->
+            if (v is String && (k == "message" || (toolName == "type_text" && k == "text"))) {
+                "[private (${v.length} chars)]"
+            } else if (v is String) {
+                SensitiveDataSanitizer.sanitizeForLogs(v)
+            } else v
+        }
+        val argsJson = runCatching { JSONObject(sanitizedArgs).toString() }.getOrDefault(sanitizedArgs.toString())
         val targetApp = args["app_name"]?.toString()
             ?: args["recipient"]?.toString()
             ?: args["target"]?.toString()

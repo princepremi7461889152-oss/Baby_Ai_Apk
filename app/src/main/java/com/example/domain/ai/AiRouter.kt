@@ -3,6 +3,7 @@ package com.example.domain.ai
 import com.example.core.security.BabySettings
 import com.example.core.security.PreferredBrain
 import com.example.core.security.SecureKeyStore
+import com.example.core.security.SensitiveDataSanitizer
 import com.example.data.remote.GeminiApiService
 import com.example.data.remote.GeminiContent
 import com.example.data.remote.GeminiFunctionResponse
@@ -15,9 +16,14 @@ import com.example.data.remote.GroqMessage
 import com.example.domain.tools.ToolDefinitions
 import com.squareup.moshi.Moshi
 import com.squareup.moshi.Types
+import kotlinx.coroutines.CancellationException
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MultipartBody
 import okhttp3.RequestBody.Companion.toRequestBody
+import java.io.IOException
+import java.net.ConnectException
+import java.net.SocketTimeoutException
+import java.net.UnknownHostException
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -92,11 +98,13 @@ class AiRouter @Inject constructor(
                 val body = resp.body()!!
                 Result.success(WhisperTranscriptResult(body.text.trim(), body.language))
             } else {
-                val err = resp.errorBody()?.string()?.take(200) ?: "HTTP ${resp.code()}"
-                Result.failure(IllegalStateException("Whisper error: $err"))
+                val errBody = runCatching { resp.errorBody()?.string()?.take(200) }.getOrNull()
+                Result.failure(classifyHttpFailure("Whisper", resp.code(), errBody, groqKey))
             }
+        } catch (ce: CancellationException) {
+            throw ce
         } catch (e: Exception) {
-            Result.failure(e)
+            Result.failure(classifyNetworkFailure("Whisper", e, groqKey))
         }
     }
 
@@ -126,32 +134,56 @@ class AiRouter @Inject constructor(
         )
         val secondary = if (primary == BrainType.GROQ) BrainType.GEMINI else BrainType.GROQ
 
+        val safeScreenContext = screenContext?.let { SensitiveDataSanitizer.sanitizeForRemoteAi(it) }
+        val safeMemoryBlock = memoryBlock?.let { SensitiveDataSanitizer.sanitizeForRemoteAi(it) }
+        val safeTurns = sanitizeTurnsForRemoteAi(turns)
+
         val systemPrompt = buildSystemPrompt(
             settings = settings,
-            screenContext = screenContext,
+            screenContext = safeScreenContext,
             isLocked = isLocked,
             userLanguageHint = userLanguageHint,
             stepIndex = stepIndex,
-            memoryBlock = memoryBlock
+            memoryBlock = safeMemoryBlock
         )
 
-        val firstAttempt = invokeBrain(primary, settings, systemPrompt, turns, effectiveScreenshot)
+        val firstAttempt = invokeBrain(primary, settings, systemPrompt, safeTurns, effectiveScreenshot)
         if (firstAttempt.isSuccess) return firstAttempt
 
-        val firstErr = firstAttempt.exceptionOrNull()?.message ?: "Primary brain error"
+        val firstErr = SensitiveDataSanitizer.sanitizeError(
+            firstAttempt.exceptionOrNull()?.message ?: "Primary brain error",
+            settings.groqApiKey,
+            settings.geminiApiKey
+        )
         if (settings.autoFallbackEnabled && hasKeyFor(secondary, settings)) {
-            val fallbackAttempt = invokeBrain(secondary, settings, systemPrompt, turns, effectiveScreenshot)
+            val fallbackAttempt = invokeBrain(secondary, settings, systemPrompt, safeTurns, effectiveScreenshot)
             if (fallbackAttempt.isSuccess) {
                 val plan = fallbackAttempt.getOrThrow()
                 return Result.success(
                     plan.copy(fallbackNote = "Auto-switched from ${primary.label} ($firstErr) to ${secondary.label}")
                 )
             }
-            val secondErr = fallbackAttempt.exceptionOrNull()?.message ?: "Fallback error"
+            val secondErr = SensitiveDataSanitizer.sanitizeError(
+                fallbackAttempt.exceptionOrNull()?.message ?: "Fallback error",
+                settings.groqApiKey,
+                settings.geminiApiKey
+            )
             return Result.failure(IllegalStateException("${primary.label} failed ($firstErr); ${secondary.label} failed ($secondErr)"))
         }
 
-        return firstAttempt
+        return Result.failure(IllegalStateException(firstErr))
+    }
+
+    private fun sanitizeTurnsForRemoteAi(turns: List<AgentStepTurn>): List<AgentStepTurn> {
+        return turns.map { turn ->
+            turn.copy(
+                text = turn.text?.let { SensitiveDataSanitizer.sanitizeForRemoteAi(it) },
+                toolArgs = turn.toolArgs?.mapValues { (_, v) ->
+                    if (v is String) SensitiveDataSanitizer.sanitizeForRemoteAi(v) else v
+                },
+                toolResult = turn.toolResult?.let { SensitiveDataSanitizer.sanitizeForRemoteAi(it) }
+            )
+        }
     }
 
     private fun choosePrimaryBrain(
@@ -216,7 +248,8 @@ class AiRouter @Inject constructor(
                 "assistant" -> {
                     if (!turn.toolName.isNullOrBlank()) {
                         val callId = turn.toolCallId ?: "call_${turn.toolName}"
-                        val argsJson = mapAdapter.toJson(turn.toolArgs ?: emptyMap())
+                        val argsJson = runCatching { mapAdapter.toJson(turn.toolArgs ?: emptyMap()) }
+                            .getOrDefault("{}")
                         messages.add(
                             GroqMessage(
                                 role = "assistant",
@@ -261,31 +294,36 @@ class AiRouter @Inject constructor(
                 )
             )
             if (!resp.isSuccessful || resp.body() == null) {
-                val err = resp.errorBody()?.string()?.take(220) ?: "HTTP ${resp.code()}"
-                return Result.failure(IllegalStateException("HTTP ${resp.code()}: $err"))
+                val errBody = runCatching { resp.errorBody()?.string()?.take(220) }.getOrNull()
+                return Result.failure(classifyHttpFailure("Groq", resp.code(), errBody, key))
             }
             val msg = resp.body()?.choices?.firstOrNull()?.message
                 ?: return Result.failure(IllegalStateException("Empty Groq response"))
 
-            val toolCalls = msg.toolCalls.orEmpty().map { tc ->
-                val parsedArgs = runCatching {
-                    mapAdapter.fromJson(tc.function.arguments) ?: emptyMap()
-                }.getOrDefault(emptyMap())
-                PlannedToolCall(
-                    id = tc.id,
-                    name = tc.function.name,
-                    args = parsedArgs
-                )
+            val toolCalls = msg.toolCalls.orEmpty()
+                .filter { it.function.name.isNotBlank() }
+                .mapIndexed { idx, tc ->
+                    PlannedToolCall(
+                        id = tc.id.ifBlank { "groq_call_$idx" },
+                        name = tc.function.name.trim(),
+                        args = parseToolArgsSafely(tc.function.arguments)
+                    )
+                }
+            val replyText = msg.content?.trim()?.takeIf { it.isNotEmpty() }
+            if (replyText == null && toolCalls.isEmpty()) {
+                return Result.failure(IllegalStateException("Groq returned empty output"))
             }
             Result.success(
                 AiPlanResult(
                     brainUsed = BrainType.GROQ,
-                    replyText = msg.content?.trim()?.takeIf { it.isNotEmpty() },
+                    replyText = replyText,
                     toolCalls = toolCalls
                 )
             )
+        } catch (ce: CancellationException) {
+            throw ce
         } catch (e: Exception) {
-            Result.failure(e)
+            Result.failure(classifyNetworkFailure("Groq", e, key))
         }
     }
 
@@ -370,17 +408,31 @@ class AiRouter @Inject constructor(
                 )
             )
             if (!resp.isSuccessful || resp.body() == null) {
-                val err = resp.errorBody()?.string()?.take(220) ?: "HTTP ${resp.code()}"
-                return Result.failure(IllegalStateException("HTTP ${resp.code()}: $err"))
+                val errBody = runCatching { resp.errorBody()?.string()?.take(220) }.getOrNull()
+                return Result.failure(classifyHttpFailure("Gemini", resp.code(), errBody, key))
             }
-            val parts = resp.body()?.candidates?.firstOrNull()?.content?.parts.orEmpty()
-            val textParts = parts.mapNotNull { it.text?.trim() }.filter { it.isNotEmpty() }
-            val calls = parts.mapNotNull { it.functionCall }.mapIndexed { index, fc ->
-                PlannedToolCall(
-                    id = "gem_call_$index",
-                    name = fc.name,
-                    args = fc.args ?: emptyMap()
+            val body = resp.body()!!
+            body.error?.message?.takeIf { it.isNotBlank() }?.let { apiErr ->
+                return Result.failure(
+                    IllegalStateException("Gemini API error: ${SensitiveDataSanitizer.sanitizeError(apiErr, key)}")
                 )
+            }
+            val firstCandidate = body.candidates?.firstOrNull()
+                ?: return Result.failure(IllegalStateException("Empty Gemini response"))
+            val parts = firstCandidate.content?.parts.orEmpty()
+            val textParts = parts.mapNotNull { it.text?.trim() }.filter { it.isNotEmpty() }
+            val calls = parts.mapNotNull { it.functionCall }
+                .filter { it.name.isNotBlank() }
+                .mapIndexed { index, fc ->
+                    PlannedToolCall(
+                        id = "gem_call_$index",
+                        name = fc.name.trim(),
+                        args = fc.args ?: emptyMap()
+                    )
+                }
+            if (textParts.isEmpty() && calls.isEmpty()) {
+                val reason = firstCandidate.finishReason ?: "EMPTY"
+                return Result.failure(IllegalStateException("Gemini returned no content ($reason)"))
             }
             Result.success(
                 AiPlanResult(
@@ -389,9 +441,61 @@ class AiRouter @Inject constructor(
                     toolCalls = calls
                 )
             )
+        } catch (ce: CancellationException) {
+            throw ce
         } catch (e: Exception) {
-            Result.failure(e)
+            Result.failure(classifyNetworkFailure("Gemini", e, key))
         }
+    }
+
+    internal fun parseToolArgsSafely(rawJson: String?): Map<String, Any?> {
+        if (rawJson.isNullOrBlank()) return emptyMap()
+        val cleaned = rawJson.trim()
+            .removePrefix("```json")
+            .removePrefix("```")
+            .removeSuffix("```")
+            .trim()
+        val jsonCandidate = if (cleaned.startsWith("{")) {
+            cleaned
+        } else {
+            val start = cleaned.indexOf('{')
+            val end = cleaned.lastIndexOf('}')
+            if (start >= 0 && end > start) cleaned.substring(start, end + 1) else return emptyMap()
+        }
+        return runCatching {
+            mapAdapter.fromJson(jsonCandidate).orEmpty()
+        }.getOrDefault(emptyMap())
+    }
+
+    private fun classifyHttpFailure(
+        provider: String,
+        code: Int,
+        rawError: String?,
+        secretKey: String
+    ): IllegalStateException {
+        val cleanErr = SensitiveDataSanitizer.sanitizeError(rawError, secretKey).take(160)
+        val msg = when (code) {
+            400 -> "$provider rejected request (HTTP 400): $cleanErr"
+            401, 403 -> "$provider API key invalid or unauthorized (HTTP $code)."
+            429 -> "$provider rate limit exceeded (HTTP 429). Switching or retry shortly."
+            in 500..599 -> "$provider service temporarily unavailable (HTTP $code)."
+            else -> "$provider HTTP $code: $cleanErr"
+        }
+        return IllegalStateException(msg)
+    }
+
+    private fun classifyNetworkFailure(
+        provider: String,
+        err: Exception,
+        secretKey: String
+    ): IllegalStateException {
+        val msg = when (err) {
+            is SocketTimeoutException -> "$provider request timed out."
+            is UnknownHostException, is ConnectException -> "No internet connection while contacting $provider."
+            is IOException -> "$provider network error: ${SensitiveDataSanitizer.sanitizeError(err.message, secretKey)}"
+            else -> SensitiveDataSanitizer.sanitizeError(err.message, secretKey)
+        }
+        return IllegalStateException(msg, err)
     }
 
     private fun buildSystemPrompt(

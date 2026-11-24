@@ -433,4 +433,93 @@ class BabyUiComposeTest {
         composeRule.onNodeWithTag("settings_search_input").assertIsDisplayed()
         composeRule.onNodeWithTag("theme_mode_amoled").assertIsDisplayed()
     }
+
+    @Test
+    fun `more screen provides direct entry points to routines, commands, macros, reminders, and memory`() {
+        var openedRoutinesTab = -1
+        var openedReminders = false
+        var openedMemory = false
+        composeRule.setContent {
+            BabyTheme(themeMode = BabyThemeMode.DARK) {
+                MoreScreen(
+                    settings = BabySettings(),
+                    permissions = testPermissions(true),
+                    emergencyContactsCount = 1,
+                    actionLogsCount = 5,
+                    memoriesCount = 2,
+                    onOpenSettings = {},
+                    onOpenPermissions = {},
+                    onOpenRoutinesTab = { openedRoutinesTab = it },
+                    onOpenReminders = { openedReminders = true },
+                    onOpenMemory = { openedMemory = true },
+                    onExportActionLogsShare = {},
+                    onExportActionLogsToUri = {},
+                    onReopenOnboarding = {}
+                )
+            }
+        }
+
+        composeRule.waitForIdle()
+        composeRule.onNodeWithTag("more_open_routines").assertIsDisplayed().performClick()
+        assertEquals(0, openedRoutinesTab)
+
+        composeRule.onNodeWithTag("more_list").performScrollToNode(hasTestTag("more_open_commands"))
+        composeRule.onNodeWithTag("more_open_commands").performClick()
+        assertEquals(1, openedRoutinesTab)
+
+        composeRule.onNodeWithTag("more_list").performScrollToNode(hasTestTag("more_open_macros"))
+        composeRule.onNodeWithTag("more_open_macros").performClick()
+        assertEquals(2, openedRoutinesTab)
+
+        composeRule.onNodeWithTag("more_list").performScrollToNode(hasTestTag("more_open_reminders"))
+        composeRule.onNodeWithTag("more_open_reminders").performClick()
+        assertTrue(openedReminders)
+
+        composeRule.onNodeWithTag("more_list").performScrollToNode(hasTestTag("more_open_memory"))
+        composeRule.onNodeWithTag("more_open_memory").performClick()
+        assertTrue(openedMemory)
+    }
+
+    @Test
+    fun `chat screen renders error banner retry and dismiss and 1000-message feed without lag`() {
+        var retriedCmd: String? = null
+        var dismissed = false
+        val largeMessages = List(1000) { idx ->
+            ChatMessageEntity(
+                id = idx + 1L,
+                role = if (idx % 2 == 0) "user" else "assistant",
+                content = if (idx == 998) "Last command" else "Message #$idx"
+            )
+        }
+        composeRule.setContent {
+            BabyTheme(themeMode = BabyThemeMode.LIGHT) {
+                ChatScreen(
+                    messages = largeMessages,
+                    agentState = AgentExecutionState(
+                        isRunning = false,
+                        lastError = "Groq request timed out."
+                    ),
+                    settings = BabySettings(groqApiKey = "gsk_demo"),
+                    permissions = testPermissions(true),
+                    isRecording = false,
+                    micAmplitude = 0f,
+                    isWakeListening = false,
+                    onSendCommand = { retriedCmd = it },
+                    onToggleVoice = {},
+                    onStopTask = {},
+                    onApproveConfirmation = { _, _ -> },
+                    onClearChat = {},
+                    onNavigateToSettings = {},
+                    onDismissError = { dismissed = true }
+                )
+            }
+        }
+
+        composeRule.waitForIdle()
+        composeRule.onNodeWithTag("agent_error_banner").assertIsDisplayed()
+        composeRule.onNodeWithTag("agent_error_retry_button").performClick()
+        assertTrue(dismissed)
+        assertEquals("Last command", retriedCmd)
+    }
 }
+

@@ -1,6 +1,7 @@
 package com.example.util
 
 import android.Manifest
+import android.app.Activity
 import android.app.AlarmManager
 import android.app.KeyguardManager
 import android.app.NotificationManager
@@ -13,6 +14,7 @@ import android.os.Build
 import android.os.PowerManager
 import android.provider.Settings
 import android.text.TextUtils
+import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.example.service.BabyAccessibilityService
 import com.example.service.BabyNotificationListenerService
@@ -75,12 +77,30 @@ class PermissionHelper @Inject constructor(
 
     fun hasExactAlarmPermission(): Boolean {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return true
-        val am = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
-        return am.canScheduleExactAlarms()
+        val am = context.getSystemService(Context.ALARM_SERVICE) as? AlarmManager ?: return false
+        return runCatching { am.canScheduleExactAlarms() }.getOrDefault(false)
     }
 
     fun hasPermission(permission: String): Boolean =
         ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED
+
+    private val permHistoryPrefs by lazy {
+        context.getSharedPreferences("baby_perm_history", Context.MODE_PRIVATE)
+    }
+
+    fun markPermissionRequested(permission: String) {
+        permHistoryPrefs.edit().putBoolean("req_$permission", true).apply()
+    }
+
+    fun wasPermissionRequestedBefore(permission: String): Boolean =
+        permHistoryPrefs.getBoolean("req_$permission", false)
+
+    fun isPermanentlyDenied(activity: Activity?, permission: String): Boolean {
+        if (hasPermission(permission)) return false
+        if (activity == null) return false
+        return wasPermissionRequestedBefore(permission) &&
+            !ActivityCompat.shouldShowRequestPermissionRationale(activity, permission)
+    }
 
     fun isAccessibilityEnabled(): Boolean {
         val expectedComponent = ComponentName(context, BabyAccessibilityService::class.java)
@@ -107,18 +127,18 @@ class PermissionHelper @Inject constructor(
     }
 
     fun isIgnoringBatteryOptimizations(): Boolean {
-        val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
-        return pm.isIgnoringBatteryOptimizations(context.packageName)
+        val pm = context.getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return false
+        return runCatching { pm.isIgnoringBatteryOptimizations(context.packageName) }.getOrDefault(false)
     }
 
     fun hasDndAccess(): Boolean {
-        val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        return nm.isNotificationPolicyAccessGranted
+        val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return false
+        return runCatching { nm.isNotificationPolicyAccessGranted }.getOrDefault(false)
     }
 
     fun isDeviceLocked(): Boolean {
-        val km = context.getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
-        return km.isKeyguardLocked
+        val km = context.getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager ?: return false
+        return runCatching { km.isKeyguardLocked }.getOrDefault(false)
     }
 
     fun openAccessibilitySettings() {

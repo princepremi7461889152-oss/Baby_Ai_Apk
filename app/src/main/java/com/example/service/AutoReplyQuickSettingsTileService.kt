@@ -47,7 +47,7 @@ class AutoReplyQuickSettingsTileService : TileService() {
             label = "Baby Auto-Reply"
             state = if (isOn) Tile.STATE_ACTIVE else Tile.STATE_INACTIVE
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                subtitle = if (isOn) "ON (${settings?.autoReplyMode?.label})" else "OFF"
+                subtitle = if (isOn) "ON (${settings.autoReplyMode.label})" else "OFF"
             }
             updateTile()
         }

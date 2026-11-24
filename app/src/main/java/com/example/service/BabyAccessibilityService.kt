@@ -53,7 +53,7 @@ class BabyAccessibilityService : AccessibilityService() {
 
         if (!macroManager.isRecordingMacro.value) return
 
-        val evText = ev.text?.joinToString(" ")?.trim().orEmpty()
+        val evText = ev.text.joinToString(" ").trim()
         SafetyManager.isBlockedScreen(pkg, evText)?.let { reason ->
             macroManager.reportSensitiveSkipped("$reason macro mein record nahi hoga.")
             return
@@ -67,7 +67,7 @@ class BabyAccessibilityService : AccessibilityService() {
                 val viewId = src.viewIdResourceName?.take(120)
                 val nodeText = src.text?.toString()?.trim()?.take(60)
                 val nodeDesc = src.contentDescription?.toString()?.trim()?.take(60)
-                val hint = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) src.hintText?.toString() else null
+                val hint = src.hintText?.toString()
                 val isSensitive = SafetyManager.isSensitiveField(viewId, nodeText, hint, src.isPassword) || ev.isPassword
                 @Suppress("DEPRECATION")
                 src.recycle()
@@ -80,8 +80,7 @@ class BabyAccessibilityService : AccessibilityService() {
                 val label = nodeText?.takeIf { it.isNotBlank() }
                     ?: nodeDesc?.takeIf { it.isNotBlank() }
                     ?: viewId?.substringAfterLast('/')
-                    ?: pkg.substringAfterLast('.')
-                    ?: "Tap"
+                    ?: pkg.substringAfterLast('.').ifBlank { "Tap" }
 
                 if (rect.width() > 0 && rect.height() > 0) {
                     macroManager.recordAccessibilityStep(
@@ -128,7 +127,7 @@ class BabyAccessibilityService : AccessibilityService() {
                 val src = ev.source
                 val viewId = src?.viewIdResourceName?.take(120)
                 val nodeDesc = src?.contentDescription?.toString()?.trim()?.take(60)
-                val hint = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) src?.hintText?.toString() else null
+                val hint = src?.hintText?.toString()
                 val isSensitive = SafetyManager.isSensitiveField(viewId, evText, hint, src?.isPassword == true) || ev.isPassword
                 @Suppress("DEPRECATION")
                 src?.recycle()

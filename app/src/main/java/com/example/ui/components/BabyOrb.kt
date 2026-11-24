@@ -21,11 +21,11 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.Mic
-import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
@@ -221,7 +221,7 @@ fun BabyOrb(
                 BabyOrbState.IDLE -> Icons.Default.Mic
                 BabyOrbState.LISTENING -> Icons.Default.GraphicEq
                 BabyOrbState.THINKING -> Icons.Default.AutoAwesome
-                BabyOrbState.SPEAKING -> Icons.Default.VolumeUp
+                BabyOrbState.SPEAKING -> Icons.AutoMirrored.Filled.VolumeUp
                 BabyOrbState.ERROR -> Icons.Default.ErrorOutline
             }
             Icon(

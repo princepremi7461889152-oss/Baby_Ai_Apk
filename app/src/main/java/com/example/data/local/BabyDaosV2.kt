@@ -78,6 +78,41 @@ interface ActionLogDao {
     @Query("SELECT * FROM action_logs ORDER BY timestamp DESC LIMIT 300")
     fun observeRecent(): Flow<List<ActionLogEntity>>
 
+    @Query("SELECT COUNT(*) FROM action_logs")
+    fun observeTotalCount(): Flow<Int>
+
+    @Query("SELECT DISTINCT targetApp FROM action_logs WHERE targetApp != '' ORDER BY targetApp COLLATE NOCASE ASC")
+    fun observeDistinctTargetApps(): Flow<List<String>>
+
+    @Query(
+        """
+        SELECT * FROM action_logs
+        WHERE (:status = 'ALL' OR status = :status)
+          AND (:source = 'ALL' OR source = :source)
+          AND (:targetApp = 'ALL' OR targetApp = :targetApp)
+          AND timestamp >= :minTimestamp
+          AND (
+            :query = ''
+            OR commandText LIKE '%' || :query || '%'
+            OR toolName LIKE '%' || :query || '%'
+            OR argsSummary LIKE '%' || :query || '%'
+            OR resultText LIKE '%' || :query || '%'
+            OR targetApp LIKE '%' || :query || '%'
+          )
+        ORDER BY timestamp DESC
+        LIMIT :limit OFFSET :offset
+        """
+    )
+    suspend fun getPagedFiltered(
+        query: String,
+        status: String,
+        source: String,
+        targetApp: String,
+        minTimestamp: Long,
+        limit: Int,
+        offset: Int
+    ): List<ActionLogEntity>
+
     @Query("SELECT * FROM action_logs ORDER BY timestamp DESC")
     suspend fun getAllForExport(): List<ActionLogEntity>
 

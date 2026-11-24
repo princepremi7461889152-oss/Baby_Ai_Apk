@@ -25,6 +25,7 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.ContentPaste
@@ -33,7 +34,6 @@ import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.Mic
-import androidx.compose.material.icons.filled.OpenInNew
 import androidx.compose.material.icons.filled.Palette
 import androidx.compose.material.icons.filled.RadioButtonUnchecked
 import androidx.compose.material.icons.filled.Search
@@ -982,7 +982,7 @@ private fun KeyHealthRow(
         ) {
             Text(linkText, style = MaterialTheme.typography.labelSmall)
             Spacer(Modifier.width(4.dp))
-            Icon(Icons.Default.OpenInNew, contentDescription = null, modifier = Modifier.size(14.dp))
+            Icon(Icons.AutoMirrored.Filled.OpenInNew, contentDescription = null, modifier = Modifier.size(14.dp))
         }
     }
 }

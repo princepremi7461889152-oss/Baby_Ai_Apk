@@ -74,7 +74,7 @@ val OnBabyErrorLight = Color(0xFFFFFFFF)
 val BabyErrorContainerLight = Color(0xFFFEE2E2)
 val OnBabyErrorContainerLight = Color(0xFF7F1D1D)
 
-val BabyWarningLight = Color(0xFFB45309)
+val BabyWarningLight = Color(0xFF92400E)
 val OnBabyWarningLight = Color(0xFFFFFFFF)
 val BabyWarningContainerLight = Color(0xFFFEF3C7)
 val OnBabyWarningContainerLight = Color(0xFF78350F)

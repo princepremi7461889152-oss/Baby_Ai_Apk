@@ -1,5 +1,6 @@
 package com.example.service
 
+import android.annotation.SuppressLint
 import android.content.Intent
 import android.os.Build
 import android.service.quicksettings.Tile
@@ -57,9 +58,14 @@ class BabyQuickSettingsTileService : TileService() {
             )
             startActivityAndCollapse(pi)
         } else {
-            @Suppress("DEPRECATION")
-            startActivityAndCollapse(openIntent)
+            launchLegacyAndCollapse(openIntent)
         }
+    }
+
+    @SuppressLint("StartActivityAndCollapseDeprecated")
+    @Suppress("DEPRECATION")
+    private fun launchLegacyAndCollapse(intent: Intent) {
+        startActivityAndCollapse(intent)
     }
 
     companion object {

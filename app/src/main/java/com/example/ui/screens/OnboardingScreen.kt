@@ -1,6 +1,7 @@
 package com.example.ui.screens
 
 import android.Manifest
+import android.app.Activity
 import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -33,6 +34,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
+import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.filled.AccessibilityNew
 import androidx.compose.material.icons.filled.BatteryChargingFull
 import androidx.compose.material.icons.filled.BubbleChart
@@ -40,7 +42,6 @@ import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.ContentPaste
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.NotificationsActive
-import androidx.compose.material.icons.filled.OpenInNew
 import androidx.compose.material.icons.filled.Phone
 import androidx.compose.material.icons.filled.RadioButtonUnchecked
 import androidx.compose.material.icons.filled.Verified
@@ -146,10 +147,35 @@ fun OnboardingScreen(
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
+    val context = LocalContext.current
+    val activity = context as? Activity
+    var onboardingPermNotice by remember { mutableStateOf<String?>(null) }
+
     val runtimePermLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
-    ) {
+    ) { results ->
+        val deniedPerms = results.filterValues { !it }.keys
+        onboardingPermNotice = if (deniedPerms.isNotEmpty()) {
+            val permanent = deniedPerms.any { perm ->
+                permissionHelper?.isPermanentlyDenied(activity, perm) == true
+            }
+            if (permanent) {
+                "Permission 'Don't ask again' se block hai — Open App Settings dabakar ON karein ya baad mein More > Permissions se enable karein."
+            } else {
+                "Kuch permissions skip ki gayi — Baby unke bina bhi safely kaam karegi."
+            }
+        } else null
         onRefreshPermissions()
+    }
+
+    fun requestOnboardingRuntimePerms(perms: Array<String>) {
+        perms.forEach { permissionHelper?.markPermissionRequested(it) }
+        val permanent = perms.any { permissionHelper?.isPermanentlyDenied(activity, it) == true }
+        if (permanent) {
+            permissionHelper?.openAppDetailsSettings()
+        } else {
+            runtimePermLauncher.launch(perms)
+        }
     }
 
     Scaffold(
@@ -302,7 +328,7 @@ fun OnboardingScreen(
                                     }) {
                                         Text("Free Groq Key")
                                         Spacer(Modifier.width(4.dp))
-                                        Icon(Icons.Default.OpenInNew, contentDescription = null, modifier = Modifier.size(14.dp))
+                                        Icon(Icons.AutoMirrored.Filled.OpenInNew, contentDescription = null, modifier = Modifier.size(14.dp))
                                     }
                                 }
                                 KeyTestStatusLine(groqKeyTest)
@@ -347,7 +373,7 @@ fun OnboardingScreen(
                                     }) {
                                         Text("Free Gemini Key")
                                         Spacer(Modifier.width(4.dp))
-                                        Icon(Icons.Default.OpenInNew, contentDescription = null, modifier = Modifier.size(14.dp))
+                                        Icon(Icons.AutoMirrored.Filled.OpenInNew, contentDescription = null, modifier = Modifier.size(14.dp))
                                     }
                                 }
                                 KeyTestStatusLine(geminiKeyTest)
@@ -361,25 +387,56 @@ fun OnboardingScreen(
                                     style = MaterialTheme.typography.bodyMedium,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
+                                if (!onboardingPermNotice.isNullOrBlank()) {
+                                    Surface(
+                                        color = ext.warningContainer,
+                                        contentColor = ext.onWarningContainer,
+                                        shape = RoundedCornerShape(spacing.chipRadius),
+                                        modifier = Modifier.fillMaxWidth()
+                                    ) {
+                                        Text(
+                                            text = onboardingPermNotice.orEmpty(),
+                                            style = MaterialTheme.typography.bodySmall,
+                                            modifier = Modifier.padding(spacing.sm)
+                                        )
+                                    }
+                                }
+                                val micPermanent = !permissions.recordAudio &&
+                                    (permissionHelper?.isPermanentlyDenied(activity, Manifest.permission.RECORD_AUDIO) == true)
+                                val notifPermanent = !permissions.postNotifications &&
+                                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                                    (permissionHelper?.isPermanentlyDenied(activity, Manifest.permission.POST_NOTIFICATIONS) == true)
+                                val phonePerms = arrayOf(
+                                    Manifest.permission.CALL_PHONE,
+                                    Manifest.permission.READ_CONTACTS,
+                                    Manifest.permission.SEND_SMS
+                                )
+                                val phonePermanent = !(permissions.callPhone && permissions.readContacts && permissions.sendSms) &&
+                                    phonePerms.any { permissionHelper?.isPermanentlyDenied(activity, it) == true }
+
                                 PermissionStepCard(
                                     icon = Icons.Default.Mic,
                                     title = "Microphone",
                                     subtitle = "\"Hey Baby\" wake word aur voice commands sunne ke liye.",
                                     granted = permissions.recordAudio,
-                                    buttonLabel = "Grant Mic",
+                                    buttonLabel = if (micPermanent) "Open App Settings" else "Grant Mic",
                                     testTag = "grant_mic_button",
-                                    onClick = { runtimePermLauncher.launch(arrayOf(Manifest.permission.RECORD_AUDIO)) }
+                                    onClick = { requestOnboardingRuntimePerms(arrayOf(Manifest.permission.RECORD_AUDIO)) }
                                 )
                                 PermissionStepCard(
                                     icon = Icons.Default.NotificationsActive,
                                     title = "Notifications & Listener",
                                     subtitle = "Persistent status bar aur WhatsApp/SMS notifications padhne ke liye.",
                                     granted = permissions.postNotifications && permissions.notificationListener,
-                                    buttonLabel = if (!permissions.postNotifications) "Grant Notifications" else "Notification Access",
+                                    buttonLabel = when {
+                                        !permissions.postNotifications && notifPermanent -> "Open App Settings"
+                                        !permissions.postNotifications -> "Grant Notifications"
+                                        else -> "Notification Access"
+                                    },
                                     testTag = "grant_notif_button",
                                     onClick = {
                                         if (!permissions.postNotifications && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                                            runtimePermLauncher.launch(arrayOf(Manifest.permission.POST_NOTIFICATIONS))
+                                            requestOnboardingRuntimePerms(arrayOf(Manifest.permission.POST_NOTIFICATIONS))
                                         } else {
                                             permissionHelper?.openNotificationListenerSettings()
                                         }
@@ -399,17 +456,9 @@ fun OnboardingScreen(
                                     title = "Calls, Contacts & SMS",
                                     subtitle = "\"Mummy ko call karo\" jaise commands ke liye.",
                                     granted = permissions.callPhone && permissions.readContacts && permissions.sendSms,
-                                    buttonLabel = "Grant Phone Access",
+                                    buttonLabel = if (phonePermanent) "Open App Settings" else "Grant Phone Access",
                                     testTag = "grant_phone_button",
-                                    onClick = {
-                                        runtimePermLauncher.launch(
-                                            arrayOf(
-                                                Manifest.permission.CALL_PHONE,
-                                                Manifest.permission.READ_CONTACTS,
-                                                Manifest.permission.SEND_SMS
-                                            )
-                                        )
-                                    }
+                                    onClick = { requestOnboardingRuntimePerms(phonePerms) }
                                 )
                                 PermissionStepCard(
                                     icon = Icons.Default.BatteryChargingFull,

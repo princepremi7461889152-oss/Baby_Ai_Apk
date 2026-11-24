@@ -939,7 +939,7 @@ private fun RoutineBuilderSheet(
                                         val moved = steps.removeAt(index)
                                         steps.add(index - 1, moved)
                                     },
-                                    modifier = Modifier.size(36.dp)
+                                    modifier = Modifier.minimumInteractiveComponentSize()
                                 ) {
                                     Icon(Icons.Default.ArrowUpward, contentDescription = "Move step up", modifier = Modifier.size(18.dp))
                                 }
@@ -949,13 +949,13 @@ private fun RoutineBuilderSheet(
                                         val moved = steps.removeAt(index)
                                         steps.add(index + 1, moved)
                                     },
-                                    modifier = Modifier.size(36.dp)
+                                    modifier = Modifier.minimumInteractiveComponentSize()
                                 ) {
                                     Icon(Icons.Default.ArrowDownward, contentDescription = "Move step down", modifier = Modifier.size(18.dp))
                                 }
                                 IconButton(
                                     onClick = { steps.removeAt(index) },
-                                    modifier = Modifier.size(36.dp)
+                                    modifier = Modifier.minimumInteractiveComponentSize()
                                 ) {
                                     Icon(Icons.Default.Close, contentDescription = "Remove step", modifier = Modifier.size(18.dp))
                                 }

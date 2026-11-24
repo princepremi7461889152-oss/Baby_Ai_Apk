@@ -59,11 +59,15 @@ class BabyTtsManager @Inject constructor(
 
         val locale = when {
             languageHint.equals("english", ignoreCase = true) ||
-                languageHint.startsWith("en", ignoreCase = true) -> Locale("en", "IN")
+                languageHint.startsWith("en", ignoreCase = true) ->
+                Locale.Builder().setLanguage("en").setRegion("IN").build()
             languageHint.equals("hindi", ignoreCase = true) ||
-                languageHint.startsWith("hi", ignoreCase = true) -> Locale("hi", "IN")
-            containsDevanagari(clean) -> Locale("hi", "IN")
-            else -> Locale("hi", "IN")
+                languageHint.startsWith("hi", ignoreCase = true) ->
+                Locale.Builder().setLanguage("hi").setRegion("IN").build()
+            containsDevanagari(clean) ->
+                Locale.Builder().setLanguage("hi").setRegion("IN").build()
+            else ->
+                Locale.Builder().setLanguage("hi").setRegion("IN").build()
         }
 
         val engine = tts ?: return
@@ -74,8 +78,8 @@ class BabyTtsManager @Inject constructor(
             engine.language = Locale.US
         }
 
-        _isSpeaking.value = true
-        engine.speak(clean, TextToSpeech.QUEUE_FLUSH, null, UUID.randomUUID().toString())
+        val res = engine.speak(clean, TextToSpeech.QUEUE_FLUSH, null, UUID.randomUUID().toString())
+        _isSpeaking.value = (res == TextToSpeech.SUCCESS)
     }
 
     fun stop() {

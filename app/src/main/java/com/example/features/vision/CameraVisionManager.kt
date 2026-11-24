@@ -1,6 +1,7 @@
 package com.example.features.vision
 
 import com.example.core.security.SecureKeyStore
+import com.example.core.security.SensitiveDataSanitizer
 import com.example.data.remote.GeminiApiService
 import com.example.data.remote.GeminiContent
 import com.example.data.remote.GeminiGenerateRequest
@@ -10,6 +11,7 @@ import com.example.domain.tools.ToolExecutionResult
 import com.example.util.PermissionHelper
 import com.example.voice.BabyTtsManager
 import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.CancellationException
 import android.content.Context
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -51,7 +53,10 @@ class CameraVisionManager @Inject constructor(
             ?: return ToolExecutionResult(false, "Camera photo capture cancel ho gaya ya camera permission missing hai.")
 
         return try {
-            val promptText = question.ifBlank { "Ye kya hai? Hinglish mein short aur helpful jawab do." }
+            val promptText = SensitiveDataSanitizer.sanitizeForRemoteAi(
+                question.ifBlank { "Ye kya hai? Hinglish mein short aur helpful jawab do." }
+            )
+            val photoData = base64Photo ?: return ToolExecutionResult(false, "Camera image missing.")
             val resp = geminiApi.generateContent(
                 model = settings.geminiModel,
                 apiKey = key,
@@ -66,7 +71,7 @@ class CameraVisionManager @Inject constructor(
                             role = "user",
                             parts = listOf(
                                 GeminiPart(text = promptText),
-                                GeminiPart(inlineData = GeminiInlineData("image/jpeg", base64Photo!!))
+                                GeminiPart(inlineData = GeminiInlineData("image/jpeg", photoData))
                             )
                         )
                     )
@@ -75,12 +80,11 @@ class CameraVisionManager @Inject constructor(
 
             // Immediately release base64 payload reference after API call
             base64Photo = null
-            // Clean any leftover vision temp files just in case
-            CameraCaptureActivity.purgeTempCacheFiles(context)
 
             if (!resp.isSuccessful || resp.body() == null) {
-                val err = resp.errorBody()?.string()?.take(180) ?: "HTTP ${resp.code()}"
-                return ToolExecutionResult(false, "Gemini Vision error: $err")
+                val errBody = runCatching { resp.errorBody()?.string()?.take(180) }.getOrNull()
+                val safeErr = SensitiveDataSanitizer.sanitizeError(errBody ?: "HTTP ${resp.code()}", key)
+                return ToolExecutionResult(false, "Gemini Vision error: $safeErr")
             }
 
             val answer = resp.body()?.candidates?.firstOrNull()?.content?.parts
@@ -94,10 +98,16 @@ class CameraVisionManager @Inject constructor(
                 ttsManager.speak(answer, "hinglish")
             }
             ToolExecutionResult(true, answer)
+        } catch (ce: CancellationException) {
+            throw ce
         } catch (e: Exception) {
+            ToolExecutionResult(
+                false,
+                "Camera Vision failed: ${SensitiveDataSanitizer.sanitizeError(e.message, key)}"
+            )
+        } finally {
             base64Photo = null
             CameraCaptureActivity.purgeTempCacheFiles(context)
-            ToolExecutionResult(false, "Camera Vision failed: ${e.message ?: "unknown"}")
         }
     }
 }

@@ -67,6 +67,7 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.paging.LoadState
+import androidx.paging.PagingData
 import androidx.paging.compose.collectAsLazyPagingItems
 import androidx.paging.compose.itemContentType
 import androidx.paging.compose.itemKey
@@ -74,16 +75,28 @@ import com.example.data.local.ActionLogEntity
 import com.example.data.local.TaskRunEntity
 import com.example.ui.components.BabyEmptyStateCard
 import com.example.ui.components.BabyShimmerCard
+import com.example.ui.state.ActionLogFilterState
 import com.example.ui.state.createSnapshotPagerFlow
 import com.example.ui.theme.BabyTheme
 import com.example.ui.theme.BabyThemeMode
 import com.example.ui.theme.BabyThemeTokens
 import com.example.ui.theme.withDevanagariFallback
+import kotlinx.coroutines.flow.Flow
 import org.json.JSONArray
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
 import java.util.Locale
+
+private val HISTORY_TIME_FMT = object : ThreadLocal<SimpleDateFormat>() {
+    override fun initialValue(): SimpleDateFormat = SimpleDateFormat("hh:mm a", Locale.getDefault())
+}
+private val HISTORY_DAY_FMT = object : ThreadLocal<SimpleDateFormat>() {
+    override fun initialValue(): SimpleDateFormat = SimpleDateFormat("dd MMM yyyy", Locale.getDefault())
+}
+private val HISTORY_FULL_FMT = object : ThreadLocal<SimpleDateFormat>() {
+    override fun initialValue(): SimpleDateFormat = SimpleDateFormat("dd MMM yyyy, hh:mm:ss a", Locale.getDefault())
+}
 
 private sealed interface HistoryDetailItem {
     data class Task(val entity: TaskRunEntity) : HistoryDetailItem
@@ -95,6 +108,11 @@ private sealed interface HistoryDetailItem {
 fun HistoryScreen(
     taskRuns: List<TaskRunEntity>,
     actionLogs: List<ActionLogEntity> = emptyList(),
+    pagedActionLogsFlow: Flow<PagingData<ActionLogEntity>>? = null,
+    totalActionLogCount: Int? = null,
+    availableActionApps: List<String> = emptyList(),
+    externalActionFilter: ActionLogFilterState? = null,
+    onActionFilterChange: ((ActionLogFilterState) -> Unit)? = null,
     dismissedTaskIds: Set<Long> = emptySet(),
     dismissedLogIds: Set<Long> = emptySet(),
     isRefreshing: Boolean = false,
@@ -111,13 +129,37 @@ fun HistoryScreen(
 ) {
     val spacing = BabyThemeTokens.spacing
     var selectedTab by remember { mutableIntStateOf(0) } // 0 = Tasks, 1 = Action Log
-    var searchQuery by remember { mutableStateOf("") }
-    var statusFilter by remember { mutableStateOf("ALL") }
-    var dateFilter by remember { mutableStateOf("ALL") } // ALL, TODAY, 7D
-    var sourceFilter by remember { mutableStateOf("ALL") } // ALL, voice, text, routine, auto-reply
-    var appFilter by remember { mutableStateOf("ALL") }
+    var localSearchQuery by remember { mutableStateOf("") }
+    var localStatusFilter by remember { mutableStateOf("ALL") }
+    var localDateFilter by remember { mutableStateOf("ALL") } // ALL, TODAY, 7D
+    var localSourceFilter by remember { mutableStateOf("ALL") } // ALL, voice, text, routine, auto-reply
+    var localAppFilter by remember { mutableStateOf("ALL") }
     var detailSheetItem by remember { mutableStateOf<HistoryDetailItem?>(null) }
     var lastDismissedUndo by remember { mutableStateOf<Pair<Boolean, Long>?>(null) }
+
+    val useDbPaging = pagedActionLogsFlow != null && externalActionFilter != null && onActionFilterChange != null
+    val searchQuery = if (useDbPaging) externalActionFilter!!.query else localSearchQuery
+    val statusFilter = if (useDbPaging) externalActionFilter!!.status else localStatusFilter
+    val dateFilter = if (useDbPaging) externalActionFilter!!.dateFilter else localDateFilter
+    val sourceFilter = if (useDbPaging) externalActionFilter!!.source else localSourceFilter
+    val appFilter = if (useDbPaging) externalActionFilter!!.targetApp else localAppFilter
+
+    val updateSearch: (String) -> Unit = { q ->
+        localSearchQuery = q
+        if (useDbPaging) onActionFilterChange!!(externalActionFilter!!.copy(query = q))
+    }
+    val updateStatus: (String) -> Unit = { s ->
+        if (useDbPaging) onActionFilterChange!!(externalActionFilter!!.copy(status = s)) else localStatusFilter = s
+    }
+    val updateDate: (String) -> Unit = { d ->
+        if (useDbPaging) onActionFilterChange!!(externalActionFilter!!.copy(dateFilter = d)) else localDateFilter = d
+    }
+    val updateSource: (String) -> Unit = { src ->
+        if (useDbPaging) onActionFilterChange!!(externalActionFilter!!.copy(source = src)) else localSourceFilter = src
+    }
+    val updateApp: (String) -> Unit = { app ->
+        if (useDbPaging) onActionFilterChange!!(externalActionFilter!!.copy(targetApp = app)) else localAppFilter = app
+    }
 
     val saveTxtLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.CreateDocument("text/plain")
@@ -137,43 +179,50 @@ fun HistoryScreen(
         }
     }
 
-    val availableApps = remember(actionLogs) {
-        actionLogs.map { it.targetApp.trim() }
-            .filter { it.isNotBlank() }
-            .distinct()
-            .sorted()
-            .take(8)
+    val availableApps = remember(availableActionApps, actionLogs) {
+        if (availableActionApps.isNotEmpty()) {
+            availableActionApps.filter { it.isNotBlank() }.take(8)
+        } else {
+            actionLogs.map { it.targetApp.trim() }
+                .filter { it.isNotBlank() }
+                .distinct()
+                .sorted()
+                .take(8)
+        }
     }
 
     val filteredLogs = remember(
-        actionLogs, dismissedLogIds, searchQuery, statusFilter, dateFilter, sourceFilter, appFilter
+        useDbPaging, actionLogs, dismissedLogIds, searchQuery, statusFilter, dateFilter, sourceFilter, appFilter
     ) {
-        val todayStart = Calendar.getInstance().apply {
-            set(Calendar.HOUR_OF_DAY, 0)
-            set(Calendar.MINUTE, 0)
-            set(Calendar.SECOND, 0)
-            set(Calendar.MILLISECOND, 0)
-        }.timeInMillis
-        val sevenDaysAgo = System.currentTimeMillis() - (7L * 24L * 60L * 60L * 1000L)
+        if (useDbPaging) emptyList()
+        else {
+            val todayStart = Calendar.getInstance().apply {
+                set(Calendar.HOUR_OF_DAY, 0)
+                set(Calendar.MINUTE, 0)
+                set(Calendar.SECOND, 0)
+                set(Calendar.MILLISECOND, 0)
+            }.timeInMillis
+            val sevenDaysAgo = System.currentTimeMillis() - (7L * 24L * 60L * 60L * 1000L)
 
-        actionLogs.filter { log ->
-            if (log.id in dismissedLogIds) return@filter false
-            val matchStatus = statusFilter == "ALL" || log.status.equals(statusFilter, ignoreCase = true)
-            val matchDate = when (dateFilter) {
-                "TODAY" -> log.timestamp >= todayStart
-                "7D" -> log.timestamp >= sevenDaysAgo
-                else -> true
+            actionLogs.filter { log ->
+                if (log.id in dismissedLogIds) return@filter false
+                val matchStatus = statusFilter == "ALL" || log.status.equals(statusFilter, ignoreCase = true)
+                val matchDate = when (dateFilter) {
+                    "TODAY" -> log.timestamp >= todayStart
+                    "7D" -> log.timestamp >= sevenDaysAgo
+                    else -> true
+                }
+                val matchSource = sourceFilter == "ALL" || log.source.equals(sourceFilter, ignoreCase = true)
+                val matchApp = appFilter == "ALL" || log.targetApp.equals(appFilter, ignoreCase = true)
+                val q = searchQuery.trim().lowercase()
+                val matchQuery = q.isEmpty() ||
+                    log.commandText.lowercase().contains(q) ||
+                    log.toolName.lowercase().contains(q) ||
+                    log.resultText.lowercase().contains(q) ||
+                    log.targetApp.lowercase().contains(q) ||
+                    log.source.lowercase().contains(q)
+                matchStatus && matchDate && matchSource && matchApp && matchQuery
             }
-            val matchSource = sourceFilter == "ALL" || log.source.equals(sourceFilter, ignoreCase = true)
-            val matchApp = appFilter == "ALL" || log.targetApp.equals(appFilter, ignoreCase = true)
-            val q = searchQuery.trim().lowercase()
-            val matchQuery = q.isEmpty() ||
-                log.commandText.lowercase().contains(q) ||
-                log.toolName.lowercase().contains(q) ||
-                log.resultText.lowercase().contains(q) ||
-                log.targetApp.lowercase().contains(q) ||
-                log.source.lowercase().contains(q)
-            matchStatus && matchDate && matchSource && matchApp && matchQuery
         }
     }
 
@@ -182,9 +231,15 @@ fun HistoryScreen(
         createSnapshotPagerFlow(visibleTasks, pageSize = 25)
     }.collectAsLazyPagingItems()
 
-    val logPagingItems = remember(filteredLogs) {
+    val fallbackLogFlow = remember(filteredLogs) {
         createSnapshotPagerFlow(filteredLogs, pageSize = 30)
-    }.collectAsLazyPagingItems()
+    }
+    val logPagingItems = (pagedActionLogsFlow ?: fallbackLogFlow).collectAsLazyPagingItems()
+    val displayedActionCount = if (useDbPaging) {
+        (totalActionLogCount ?: logPagingItems.itemCount)
+    } else {
+        filteredLogs.size
+    }
 
     Box(
         modifier = Modifier.fillMaxSize(),
@@ -210,13 +265,13 @@ fun HistoryScreen(
                         Column {
                             Text("History & Action Log", style = MaterialTheme.typography.titleLarge)
                             Text(
-                                "${visibleTasks.size} tasks • ${filteredLogs.size} tool actions",
+                                "${visibleTasks.size} tasks • $displayedActionCount tool actions",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
                         Row {
-                            if (selectedTab == 1 && actionLogs.isNotEmpty()) {
+                            if (selectedTab == 1 && (displayedActionCount > 0 || actionLogs.isNotEmpty())) {
                                 IconButton(
                                     onClick = { saveTxtLauncher.launch("baby_action_log.txt") },
                                     modifier = Modifier
@@ -255,7 +310,7 @@ fun HistoryScreen(
                     }
 
                     SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
-                        listOf("Task Runs (${visibleTasks.size})", "Action Log (${filteredLogs.size})")
+                        listOf("Task Runs (${visibleTasks.size})", "Action Log ($displayedActionCount)")
                             .forEachIndexed { idx, label ->
                                 SegmentedButton(
                                     selected = selectedTab == idx,
@@ -306,7 +361,7 @@ fun HistoryScreen(
                     ) {
                         OutlinedTextField(
                             value = searchQuery,
-                            onValueChange = { searchQuery = it },
+                            onValueChange = updateSearch,
                             placeholder = {
                                 Text(
                                     if (selectedTab == 0) "Search tasks or replies…"
@@ -326,14 +381,14 @@ fun HistoryScreen(
                                 listOf("ALL", "TODAY", "7D").forEach { d ->
                                     FilterChip(
                                         selected = dateFilter == d,
-                                        onClick = { dateFilter = d },
+                                        onClick = { updateDate(d) },
                                         label = { Text(if (d == "ALL") "Any Date" else d) }
                                     )
                                 }
                                 listOf("ALL", "voice", "text", "routine", "auto-reply").forEach { src ->
                                     FilterChip(
                                         selected = sourceFilter == src,
-                                        onClick = { sourceFilter = src },
+                                        onClick = { updateSource(src) },
                                         label = { Text(if (src == "ALL") "All Sources" else src) }
                                     )
                                 }
@@ -342,20 +397,20 @@ fun HistoryScreen(
                                 listOf("ALL", "OK", "ERR", "AUTO_REPLY", "BLOCKED").forEach { chip ->
                                     FilterChip(
                                         selected = statusFilter == chip,
-                                        onClick = { statusFilter = chip },
+                                        onClick = { updateStatus(chip) },
                                         label = { Text(chip) }
                                     )
                                 }
                                 if (availableApps.isNotEmpty()) {
                                     FilterChip(
                                         selected = appFilter == "ALL",
-                                        onClick = { appFilter = "ALL" },
+                                        onClick = { updateApp("ALL") },
                                         label = { Text("All Apps") }
                                     )
                                     availableApps.forEach { app ->
                                         FilterChip(
                                             selected = appFilter == app,
-                                            onClick = { appFilter = if (appFilter == app) "ALL" else app },
+                                            onClick = { updateApp(if (appFilter == app) "ALL" else app) },
                                             label = { Text(app) }
                                         )
                                     }
@@ -418,7 +473,7 @@ fun HistoryScreen(
                         }
                     } else {
                         when {
-                            logPagingItems.loadState.refresh is LoadState.Loading -> {
+                            logPagingItems.loadState.refresh is LoadState.Loading && logPagingItems.itemCount == 0 -> {
                                 LazyColumn(
                                     contentPadding = PaddingValues(spacing.md),
                                     verticalArrangement = Arrangement.spacedBy(spacing.sm)
@@ -426,13 +481,13 @@ fun HistoryScreen(
                                     items(4) { BabyShimmerCard() }
                                 }
                             }
-                            filteredLogs.isEmpty() -> {
+                            logPagingItems.itemCount == 0 -> {
                                 BabyEmptyStateCard(
                                     icon = Icons.Default.History,
                                     title = "Koi matching action log nahi",
                                     subtitle = "Har tool call aur auto-reply timestamp, source aur app ke saath record hota hai.",
                                     ctaLabel = if (searchQuery.isNotEmpty()) "Clear Search" else null,
-                                    onCtaClick = { searchQuery = "" }
+                                    onCtaClick = { updateSearch("") }
                                 )
                             }
                             else -> {
@@ -447,6 +502,7 @@ fun HistoryScreen(
                                         contentType = logPagingItems.itemContentType { "action_log" }
                                     ) { index ->
                                         val log = logPagingItems[index] ?: return@items
+                                        if (log.id in dismissedLogIds) return@items
                                         val prev = if (index > 0) logPagingItems.peek(index - 1) else null
                                         val dayLabel = formatDayHeader(log.timestamp)
                                         val prevDay = prev?.let { formatDayHeader(it.timestamp) }
@@ -537,7 +593,7 @@ private fun ActionLogCard(
     onClick: () -> Unit
 ) {
     val ext = BabyThemeTokens.colors
-    val formatter = remember { SimpleDateFormat("hh:mm a", Locale.getDefault()) }
+    val formattedTime = remember(log.timestamp) { HISTORY_TIME_FMT.get()?.format(Date(log.timestamp)).orEmpty() }
     val statusColor = when (log.status) {
         "OK" -> ext.success
         "AUTO_REPLY" -> MaterialTheme.colorScheme.secondary
@@ -560,7 +616,7 @@ private fun ActionLogCard(
                     modifier = Modifier.weight(1f)
                 )
                 Text(
-                    text = "${log.source} • ${formatter.format(Date(log.timestamp))}",
+                    text = "${log.source} • $formattedTime",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -584,7 +640,7 @@ private fun TaskRunCard(
     onClick: () -> Unit
 ) {
     val ext = BabyThemeTokens.colors
-    val formatter = remember { SimpleDateFormat("hh:mm a", Locale.getDefault()) }
+    val formattedTime = remember(run.startedAt) { HISTORY_TIME_FMT.get()?.format(Date(run.startedAt)).orEmpty() }
 
     val (statusColor, statusIcon) = when (run.status) {
         "COMPLETED" -> ext.success to Icons.Default.CheckCircle
@@ -625,7 +681,7 @@ private fun TaskRunCard(
                     color = statusColor
                 )
                 Text(
-                    text = formatter.format(Date(run.startedAt)),
+                    text = formattedTime,
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -646,7 +702,7 @@ private fun TaskRunCard(
 @Composable
 private fun HistoryDetailSheetContent(detail: HistoryDetailItem) {
     val spacing = BabyThemeTokens.spacing
-    val formatter = remember { SimpleDateFormat("dd MMM yyyy, hh:mm:ss a", Locale.getDefault()) }
+    val formatter = remember { HISTORY_FULL_FMT.get()!! }
 
     Column(
         modifier = Modifier
@@ -715,7 +771,7 @@ private fun formatDayHeader(timestampMs: Long): String {
     return when {
         sameYear && nowDay == targetDay -> "Today"
         sameYear && nowDay - targetDay == 1 -> "Yesterday"
-        else -> SimpleDateFormat("dd MMM yyyy", Locale.getDefault()).format(Date(timestampMs))
+        else -> HISTORY_DAY_FMT.get()?.format(Date(timestampMs)).orEmpty()
     }
 }
 

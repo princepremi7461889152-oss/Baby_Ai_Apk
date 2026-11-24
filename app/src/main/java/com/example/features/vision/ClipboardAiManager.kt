@@ -3,6 +3,7 @@ package com.example.features.vision
 import android.content.ClipboardManager
 import android.content.Context
 import com.example.core.security.SecureKeyStore
+import com.example.core.security.SensitiveDataSanitizer
 import com.example.data.remote.GeminiApiService
 import com.example.data.remote.GeminiContent
 import com.example.data.remote.GeminiGenerateRequest
@@ -13,6 +14,7 @@ import com.example.data.remote.GroqMessage
 import com.example.domain.tools.ToolExecutionResult
 import com.example.voice.BabyTtsManager
 import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import javax.inject.Inject
@@ -33,7 +35,8 @@ class ClipboardAiManager @Inject constructor(
 ) {
     suspend fun readClipboardText(): String? = withContext(Dispatchers.Main) {
         if (!keyStore.settings.value.clipboardAiEnabled) return@withContext null
-        val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+            ?: return@withContext null
         val clip = cm.primaryClip ?: return@withContext null
         if (clip.itemCount == 0) return@withContext null
         clip.getItemAt(0).coerceToText(context)?.toString()?.trim()?.takeIf { it.isNotEmpty() }
@@ -61,7 +64,16 @@ class ClipboardAiManager @Inject constructor(
                 return ToolExecutionResult(false, "Clipboard abhi khaali hai.")
             }
 
-        val cappedText = clipText.take(if (settings.dataSaverEnabled) 1000 else 2500)
+        val cappedText = SensitiveDataSanitizer.sanitizeForRemoteAi(
+            clipText.take(if (settings.dataSaverEnabled) 1000 else 2500)
+        )
+        if (SensitiveDataSanitizer.containsOnlyRedactedContent(cappedText)) {
+            return ToolExecutionResult(
+                false,
+                "Privacy guard: Clipboard mein sirf sensitive data (OTP/key/card/password) tha, isliye AI ko nahi bheja."
+            )
+        }
+
         val lang = targetLanguage?.takeIf { it.isNotBlank() } ?: "Hinglish"
 
         val instruction = when (normMode) {
@@ -85,7 +97,7 @@ class ClipboardAiManager @Inject constructor(
         val settings = keyStore.settings.value
         val key = settings.groqApiKey.trim()
         if (key.isBlank()) return null
-        return runCatching {
+        return try {
             val resp = groqApi.chatCompletions(
                 bearerAuth = "Bearer $key",
                 request = GroqChatRequest(
@@ -101,15 +113,21 @@ class ClipboardAiManager @Inject constructor(
                     toolChoice = null
                 )
             )
-            resp.body()?.choices?.firstOrNull()?.message?.content?.trim()
-        }.getOrNull()?.takeIf { it.isNotBlank() }
+            if (resp.isSuccessful) {
+                resp.body()?.choices?.firstOrNull()?.message?.content?.trim()?.takeIf { it.isNotBlank() }
+            } else null
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (_: Exception) {
+            null
+        }
     }
 
     private suspend fun callGeminiText(prompt: String): String? {
         val settings = keyStore.settings.value
         val key = settings.geminiApiKey.trim()
         if (key.isBlank()) return null
-        return runCatching {
+        return try {
             val resp = geminiApi.generateContent(
                 model = settings.geminiModel,
                 apiKey = key,
@@ -120,9 +138,16 @@ class ClipboardAiManager @Inject constructor(
                     contents = listOf(GeminiContent(role = "user", parts = listOf(GeminiPart(text = prompt))))
                 )
             )
-            resp.body()?.candidates?.firstOrNull()?.content?.parts
-                ?.mapNotNull { it.text }?.joinToString("\n")?.trim()
-        }.getOrNull()?.takeIf { it.isNotBlank() }
+            if (resp.isSuccessful) {
+                resp.body()?.candidates?.firstOrNull()?.content?.parts
+                    ?.mapNotNull { it.text }?.joinToString("\n")?.trim()
+                    ?.takeIf { it.isNotBlank() }
+            } else null
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (_: Exception) {
+            null
+        }
     }
 
     companion object {

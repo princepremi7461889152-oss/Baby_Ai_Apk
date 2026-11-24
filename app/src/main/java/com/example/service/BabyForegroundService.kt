@@ -31,6 +31,7 @@ import com.example.voice.AudioRecorderManager
 import com.example.voice.BabyTtsManager
 import com.example.voice.WakeWordDetector
 import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -62,6 +63,10 @@ class BabyForegroundService : Service() {
     private val recentScreenTogglesMs = ArrayDeque<Long>()
     private var activeVoiceCaptureJob: Job? = null
 
+    private var lastWakeEnabled: Boolean? = null
+    private var lastBubbleEnabled: Boolean? = null
+    private var lastClipButtonEnabled: Boolean? = null
+
     private val unlockReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action == Intent.ACTION_USER_PRESENT) {
@@ -80,7 +85,7 @@ class BabyForegroundService : Service() {
             }
             if (connected) {
                 serviceScope.launch(Dispatchers.IO) {
-                    routineManager.runHeadphoneTriggeredRoutines()
+                    runCatching { routineManager.runHeadphoneTriggeredRoutines() }
                 }
             }
         }
@@ -96,7 +101,7 @@ class BabyForegroundService : Service() {
             val now = System.currentTimeMillis()
             if (shouldTriggerPowerShortcut(recentScreenTogglesMs, now)) {
                 serviceScope.launch(Dispatchers.IO) {
-                    safetyManager.triggerEmergencyAlert()
+                    runCatching { safetyManager.triggerEmergencyAlert() }
                 }
             }
         }
@@ -106,7 +111,6 @@ class BabyForegroundService : Service() {
         super.onCreate()
         isServiceRunning = true
         createNotificationChannel()
-        acquirePartialWakeLock()
         registerUnlockReceiver()
         registerHeadphoneReceiver()
         registerPowerShortcutReceiver()
@@ -114,6 +118,7 @@ class BabyForegroundService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val fromBoot = intent?.getBooleanExtra(EXTRA_STARTED_FROM_BOOT, false) == true
         when (intent?.action) {
             ACTION_STOP_TASK -> {
                 orchestrator.stopCurrentTask("Notification Stop button")
@@ -126,7 +131,7 @@ class BabyForegroundService : Service() {
                 return START_STICKY
             }
             ACTION_TRIGGER_VOICE -> {
-                startForegroundWithNotification()
+                startForegroundWithNotification(allowMicType = true)
                 beginVoiceCapture("tile_or_notification")
                 return START_STICKY
             }
@@ -137,13 +142,16 @@ class BabyForegroundService : Service() {
             ACTION_STOP_SERVICE -> {
                 wakeWordDetector.stop()
                 floatingBubbleController.hide()
+                releaseTransientWakeLock()
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
                 return START_NOT_STICKY
             }
         }
 
-        startForegroundWithNotification()
+        // On Android 14+, BOOT_COMPLETED starts cannot claim MICROPHONE FGS type directly;
+        // use SPECIAL_USE on boot and upgrade cleanly when active in foreground/tile trigger.
+        startForegroundWithNotification(allowMicType = !fromBoot)
         if (keyStore.settings.value.wakeWordEnabled) {
             startWakeWordLoop()
         }
@@ -168,7 +176,7 @@ class BabyForegroundService : Service() {
             runCatching { unregisterReceiver(powerShortcutReceiver) }
             powerShortcutReceiverRegistered = false
         }
-        releasePartialWakeLock()
+        releaseTransientWakeLock()
         serviceScope.cancel()
         super.onDestroy()
     }
@@ -176,27 +184,36 @@ class BabyForegroundService : Service() {
     private fun observeSettingsAndAgent() {
         serviceScope.launch {
             keyStore.settings.collect { settings ->
-                if (settings.wakeWordEnabled) {
-                    startWakeWordLoop()
-                } else {
-                    wakeWordDetector.stop()
+                if (lastWakeEnabled != settings.wakeWordEnabled) {
+                    lastWakeEnabled = settings.wakeWordEnabled
+                    if (settings.wakeWordEnabled) {
+                        startWakeWordLoop()
+                    } else {
+                        wakeWordDetector.stop()
+                    }
                 }
 
-                if (settings.floatingBubbleEnabled) {
-                    floatingBubbleController.show(
-                        onBubbleClick = { beginVoiceCapture("floating_bubble") },
-                        onStopClick = { orchestrator.stopCurrentTask("Floating bubble Stop") },
-                        showClipButton = settings.clipboardAiEnabled,
-                        onClipClick = {
-                            if (settings.clipboardAiEnabled) {
-                                com.example.features.vision.ClipboardActionActivity.launch(this@BabyForegroundService)
-                            } else {
-                                ttsManager.speak("Clipboard AI Settings mein OFF hai.", "hinglish")
+                if (lastBubbleEnabled != settings.floatingBubbleEnabled ||
+                    lastClipButtonEnabled != settings.clipboardAiEnabled
+                ) {
+                    lastBubbleEnabled = settings.floatingBubbleEnabled
+                    lastClipButtonEnabled = settings.clipboardAiEnabled
+                    if (settings.floatingBubbleEnabled) {
+                        floatingBubbleController.show(
+                            onBubbleClick = { beginVoiceCapture("floating_bubble") },
+                            onStopClick = { orchestrator.stopCurrentTask("Floating bubble Stop") },
+                            showClipButton = settings.clipboardAiEnabled,
+                            onClipClick = {
+                                if (keyStore.settings.value.clipboardAiEnabled) {
+                                    com.example.features.vision.ClipboardActionActivity.launch(this@BabyForegroundService)
+                                } else {
+                                    ttsManager.speak("Clipboard AI Settings mein OFF hai.", "hinglish")
+                                }
                             }
-                        }
-                    )
-                } else {
-                    floatingBubbleController.hide()
+                        )
+                    } else {
+                        floatingBubbleController.hide()
+                    }
                 }
                 updateNotification()
             }
@@ -240,58 +257,81 @@ class BabyForegroundService : Service() {
         }
         activeVoiceCaptureJob?.cancel()
         activeVoiceCaptureJob = serviceScope.launch {
-            wakeWordDetector.pauseForRecording()
-            ttsManager.speak("Haan bolo", "hinglish")
-            delay(650L)
+            acquireTransientWakeLock(60_000L)
+            try {
+                wakeWordDetector.pauseForRecording()
+                ttsManager.speak("Haan bolo", "hinglish")
+                delay(650L)
 
-            val started = audioRecorderManager.startRecording(
-                maxDurationMs = 14_000L,
-                autoSilenceStop = true,
-                onSilenceDetected = {
-                    serviceScope.launch { finishVoiceCaptureAndTranscribe() }
+                val started = audioRecorderManager.startRecording(
+                    maxDurationMs = 14_000L,
+                    autoSilenceStop = true,
+                    onSilenceDetected = {
+                        serviceScope.launch { finishVoiceCaptureAndTranscribe() }
+                    }
+                )
+                if (!started) {
+                    wakeWordDetector.resumeAfterRecording()
+                    releaseTransientWakeLock()
+                } else {
+                    floatingBubbleController.updateStatus("Sun rahi hoon...", orchestrator.state.value.isRunning)
                 }
-            )
-            if (!started) {
+            } catch (e: CancellationException) {
+                releaseTransientWakeLock()
+                throw e
+            } catch (_: Exception) {
+                releaseTransientWakeLock()
                 wakeWordDetector.resumeAfterRecording()
-            } else {
-                floatingBubbleController.updateStatus("Sun rahi hoon...", orchestrator.state.value.isRunning)
             }
         }
     }
 
     private fun finishVoiceCaptureAndTranscribe() {
         serviceScope.launch(Dispatchers.IO) {
-            val wav = audioRecorderManager.stopAndBuildWav()
-            if (wav != null) {
-                orchestrator.handleVoiceWav(wav)
+            try {
+                val wav = audioRecorderManager.stopAndBuildWav()
+                if (wav != null) {
+                    orchestrator.handleVoiceWav(wav)
+                }
+            } finally {
+                releaseTransientWakeLock()
+                wakeWordDetector.resumeAfterRecording()
             }
-            wakeWordDetector.resumeAfterRecording()
         }
     }
 
-    private fun startForegroundWithNotification() {
+    private fun startForegroundWithNotification(allowMicType: Boolean) {
         val notification = buildNotification()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            val hasMic = ContextCompat.checkSelfPermission(
-                this,
-                android.Manifest.permission.RECORD_AUDIO
-            ) == android.content.pm.PackageManager.PERMISSION_GRANTED
-            val type = if (hasMic) {
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+        val hasMic = ContextCompat.checkSelfPermission(
+            this,
+            android.Manifest.permission.RECORD_AUDIO
+        ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+
+        runCatching {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                val type = if (allowMicType && hasMic) {
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+                } else {
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+                }
+                startForeground(NOTIFICATION_ID, notification, type)
+            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                if (allowMicType && hasMic) {
+                    startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+                } else {
+                    startForeground(NOTIFICATION_ID, notification)
+                }
             } else {
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+                startForeground(NOTIFICATION_ID, notification)
             }
-            startForeground(NOTIFICATION_ID, notification, type)
-        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
-        } else {
-            startForeground(NOTIFICATION_ID, notification)
         }
     }
 
     private fun updateNotification() {
-        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        nm.notify(NOTIFICATION_ID, buildNotification())
+        runCatching {
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            nm.notify(NOTIFICATION_ID, buildNotification())
+        }
     }
 
     private fun buildNotification(): Notification {
@@ -375,15 +415,19 @@ class BabyForegroundService : Service() {
         nm.createNotificationChannel(channel)
     }
 
-    private fun acquirePartialWakeLock() {
-        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "BabyAssistant::WakeWordLock").apply {
-            setReferenceCounted(false)
-            acquire(12 * 60 * 60 * 1000L)
+    private fun acquireTransientWakeLock(timeoutMs: Long) {
+        runCatching {
+            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+            val lock = wakeLock ?: pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "BabyAssistant::VoiceCaptureLock").apply {
+                setReferenceCounted(false)
+            }.also { wakeLock = it }
+            if (!lock.isHeld) {
+                lock.acquire(timeoutMs.coerceIn(5_000L, 120_000L))
+            }
         }
     }
 
-    private fun releasePartialWakeLock() {
+    private fun releaseTransientWakeLock() {
         runCatching {
             if (wakeLock?.isHeld == true) wakeLock?.release()
         }
@@ -438,6 +482,7 @@ class BabyForegroundService : Service() {
     companion object {
         const val CHANNEL_ID = "baby_foreground_channel"
         const val NOTIFICATION_ID = 1001
+        const val EXTRA_STARTED_FROM_BOOT = "extra_started_from_boot"
         const val ACTION_TRIGGER_VOICE = "com.example.action.TRIGGER_VOICE"
         const val ACTION_STOP_TASK = "com.example.action.STOP_TASK"
         const val ACTION_CANCEL_SOS = "com.example.action.CANCEL_SOS"
@@ -464,9 +509,13 @@ class BabyForegroundService : Service() {
         var isServiceRunning: Boolean = false
             private set
 
-        fun start(context: Context) {
-            val intent = Intent(context, BabyForegroundService::class.java)
-            ContextCompat.startForegroundService(context, intent)
+        fun start(context: Context, fromBoot: Boolean = false) {
+            runCatching {
+                val intent = Intent(context, BabyForegroundService::class.java).apply {
+                    if (fromBoot) putExtra(EXTRA_STARTED_FROM_BOOT, true)
+                }
+                ContextCompat.startForegroundService(context, intent)
+            }
         }
 
         fun refreshNotificationIfRunning(context: Context) {
@@ -480,10 +529,12 @@ class BabyForegroundService : Service() {
         }
 
         fun triggerVoice(context: Context) {
-            val intent = Intent(context, BabyForegroundService::class.java).apply {
-                action = ACTION_TRIGGER_VOICE
+            runCatching {
+                val intent = Intent(context, BabyForegroundService::class.java).apply {
+                    action = ACTION_TRIGGER_VOICE
+                }
+                ContextCompat.startForegroundService(context, intent)
             }
-            ContextCompat.startForegroundService(context, intent)
         }
     }
 }

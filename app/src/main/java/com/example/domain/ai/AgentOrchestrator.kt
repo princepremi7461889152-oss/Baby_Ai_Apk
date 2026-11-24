@@ -2,6 +2,7 @@ package com.example.domain.ai
 
 import android.content.Context
 import com.example.core.security.SecureKeyStore
+import com.example.core.security.SensitiveDataSanitizer
 import com.example.data.local.ChatMessageEntity
 import com.example.data.local.HistoryRepository
 import com.example.domain.tools.ExtendedToolRouter
@@ -22,16 +23,19 @@ import com.example.util.PermissionHelper
 import com.example.voice.BabyTtsManager
 import com.example.voice.WakeWordDetector
 import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import javax.inject.Inject
@@ -51,7 +55,8 @@ data class AgentExecutionState(
     val activeBrain: BrainType? = null,
     val statusText: String = "Ready",
     val pendingConfirmation: ConfirmationRequest? = null,
-    val queuedCount: Int = 0
+    val queuedCount: Int = 0,
+    val lastError: String? = null
 ) {
     companion object {
         const val MAX_STEPS = 15
@@ -94,6 +99,10 @@ class AgentOrchestrator @Inject constructor(
         }
     }
 
+    fun clearLastError() {
+        _state.value = _state.value.copy(lastError = null)
+    }
+
     fun submitUserCommand(
         rawCommand: String,
         source: String = "text",
@@ -116,6 +125,14 @@ class AgentOrchestrator @Inject constructor(
         // Cancel previous running task if a brand-new command arrives
         activeJob?.cancel()
         pendingConfirmDeferred?.complete(false)
+        pendingConfirmDeferred = null
+        _state.value = _state.value.copy(
+            isRunning = true,
+            currentStep = 0,
+            statusText = "Starting...",
+            lastError = null,
+            pendingConfirmation = null
+        )
 
         activeJob = scope.launch {
             runAgentLoop(command, source, languageHint ?: detectLanguageHint(command))
@@ -123,7 +140,7 @@ class AgentOrchestrator @Inject constructor(
     }
 
     suspend fun handleVoiceWav(wavBytes: ByteArray): String? {
-        _state.value = _state.value.copy(statusText = "Whisper se samajh rahi hoon...")
+        _state.value = _state.value.copy(statusText = "Whisper se samajh rahi hoon...", lastError = null)
         val res = aiRouter.transcribeAudio(wavBytes)
         return res.fold(
             onSuccess = { transcript ->
@@ -149,14 +166,17 @@ class AgentOrchestrator @Inject constructor(
                 }
             },
             onFailure = { err ->
+                if (err is CancellationException) throw err
+                val settings = keyStore.settings.value
+                val safeErr = SensitiveDataSanitizer.sanitizeError(err.message, settings.groqApiKey, settings.geminiApiKey)
                 historyRepository.addMessage(
                     ChatMessageEntity(
                         role = "assistant",
-                        content = "Voice transcribe nahi ho paya: ${err.message}",
+                        content = "Voice transcribe nahi ho paya: $safeErr",
                         brainUsed = "local"
                     )
                 )
-                _state.value = _state.value.copy(statusText = "Ready")
+                _state.value = _state.value.copy(statusText = "Ready", lastError = safeErr)
                 null
             }
         )
@@ -165,11 +185,7 @@ class AgentOrchestrator @Inject constructor(
     fun approveConfirmation(approved: Boolean, enteredPin: String? = null) {
         val currentReq = _state.value.pendingConfirmation
         val finalApproved = if (approved && currentReq?.requiresVoicePin == true) {
-            if (enteredPin != null) {
-                safetyManager.verifyVoicePin(enteredPin)
-            } else {
-                true
-            }
+            !enteredPin.isNullOrBlank() && safetyManager.verifyVoicePin(enteredPin)
         } else {
             approved
         }
@@ -180,7 +196,9 @@ class AgentOrchestrator @Inject constructor(
 
     fun stopCurrentTask(reason: String = "Stopped by user") {
         val cancelledSos = safetyManager.cancelEmergencyCountdown(reason)
-        val wasRunning = activeJob?.isActive == true || _state.value.isRunning || cancelledSos
+        val prevState = _state.value
+        val wasRunning = activeJob?.isActive == true || prevState.isRunning || cancelledSos
+        val lastStep = prevState.currentStep
         pendingConfirmDeferred?.complete(false)
         pendingConfirmDeferred = null
         activeJob?.cancel()
@@ -189,7 +207,7 @@ class AgentOrchestrator @Inject constructor(
 
         val taskId = activeTaskId
         activeTaskId = null
-        _state.value = AgentExecutionState(statusText = "Stopped")
+        _state.value = AgentExecutionState(statusText = "Stopped", queuedCount = prevState.queuedCount)
 
         if (wasRunning) {
             scope.launch {
@@ -197,7 +215,7 @@ class AgentOrchestrator @Inject constructor(
                     historyRepository.updateTaskRun(
                         id = taskId,
                         status = "STOPPED",
-                        stepsCount = _state.value.currentStep,
+                        stepsCount = lastStep,
                         brainSummary = reason,
                         finalReply = "Theek hai, ruk gayi hoon! ($reason)",
                         stepLogsJson = "[]",
@@ -216,10 +234,16 @@ class AgentOrchestrator @Inject constructor(
     }
 
     fun onDeviceUnlocked() {
+        _state.value = _state.value.copy(isRunning = true, statusText = "Unlock ho gaya, checking queue...")
         scope.launch {
             val queued = historyRepository.popAllQueuedTasks()
-            if (queued.isEmpty()) return@launch
-            _state.value = _state.value.copy(queuedCount = 0)
+            if (queued.isEmpty()) {
+                if (activeTaskId == null) {
+                    _state.value = _state.value.copy(isRunning = false, statusText = "Ready")
+                }
+                return@launch
+            }
+            _state.value = _state.value.copy(isRunning = true, queuedCount = 0)
             for (task in queued) {
                 runAgentLoop(
                     command = task.commandText,
@@ -235,7 +259,7 @@ class AgentOrchestrator @Inject constructor(
         source: String,
         languageHint: String
     ) {
-        val taskId = historyRepository.startTaskRun(command)
+        val taskId = historyRepository.startTaskRun(SensitiveDataSanitizer.sanitizeForLogs(command))
         activeTaskId = taskId
         val stepLogs = JSONArray()
         val brainsUsed = linkedSetOf<String>()
@@ -312,9 +336,12 @@ class AgentOrchestrator @Inject constructor(
         turns.add(AgentStepTurn(role = "user", text = turnsPrompt))
 
         var finalReply = ""
+        var stepFailedError: String? = null
+        var lastStepCompleted = 0
 
         try {
             for (step in 0 until AgentExecutionState.MAX_STEPS) {
+                lastStepCompleted = step + 1
                 val isLocked = permissionHelper.isDeviceLocked()
                 val screenContext = if (!isLocked) {
                     val acc = BabyAccessibilityService.instance
@@ -333,7 +360,8 @@ class AgentOrchestrator @Inject constructor(
                     isRunning = true,
                     currentStep = step + 1,
                     activeBrain = _state.value.activeBrain,
-                    statusText = "Soch rahi hoon (${step + 1}/15)..."
+                    statusText = "Soch rahi hoon (${step + 1}/15)...",
+                    queuedCount = _state.value.queuedCount
                 )
 
                 val planRes = aiRouter.planNextStep(
@@ -348,7 +376,13 @@ class AgentOrchestrator @Inject constructor(
                 latestScreenshot = null
 
                 if (planRes.isFailure) {
-                    val errMsg = planRes.exceptionOrNull()?.message ?: "AI error"
+                    val curKeys = keyStore.settings.value
+                    val errMsg = SensitiveDataSanitizer.sanitizeError(
+                        planRes.exceptionOrNull()?.message ?: "AI error",
+                        curKeys.groqApiKey,
+                        curKeys.geminiApiKey
+                    )
+                    stepFailedError = errMsg
                     finalReply = "Oops, issue aa gaya: $errMsg"
                     historyRepository.addMessage(
                         ChatMessageEntity(role = "assistant", content = finalReply, brainUsed = "local")
@@ -436,7 +470,7 @@ class AgentOrchestrator @Inject constructor(
                             pendingConfirmation = ConfirmationRequest(
                                 toolName = call.name,
                                 summary = summary,
-                                argsPreview = JSONObject(call.args).toString(),
+                                argsPreview = SensitiveDataSanitizer.sanitizeForLogs(JSONObject(call.args).toString()),
                                 requiresVoicePin = needsPin
                             )
                         )
@@ -496,7 +530,7 @@ class AgentOrchestrator @Inject constructor(
                         memoryManager.recordAppUsageHabit(call.args["app_name"]?.toString().orEmpty())
                     }
 
-                    val argsJson = JSONObject(call.args).toString()
+                    val argsJson = SensitiveDataSanitizer.sanitizeForLogs(JSONObject(call.args).toString())
 
                     stepLogs.put(
                         JSONObject().apply {
@@ -505,7 +539,7 @@ class AgentOrchestrator @Inject constructor(
                             put("tool", call.name)
                             put("args", argsJson)
                             put("ok", result.ok)
-                            put("output", result.output.take(300))
+                            put("output", SensitiveDataSanitizer.sanitizeForLogs(result.output).take(300))
                         }
                     )
 
@@ -561,10 +595,48 @@ class AgentOrchestrator @Inject constructor(
             )
             speakIfEnabled(finalReply, languageHint)
             updateWidgetLastTask(command, finalReply)
+        } catch (ce: CancellationException) {
+            withContext(NonCancellable) {
+                if (activeTaskId == taskId) {
+                    historyRepository.updateTaskRun(
+                        id = taskId,
+                        status = "STOPPED",
+                        stepsCount = lastStepCompleted,
+                        brainSummary = brainsUsed.joinToString(" -> "),
+                        finalReply = "Cancelled before completion.",
+                        stepLogsJson = stepLogs.toString(),
+                        finishedAt = System.currentTimeMillis()
+                    )
+                }
+            }
+            throw ce
+        } catch (t: Throwable) {
+            val curKeys = keyStore.settings.value
+            val safeErr = SensitiveDataSanitizer.sanitizeError(t.message, curKeys.groqApiKey, curKeys.geminiApiKey)
+            stepFailedError = safeErr
+            finalReply = "Task ruk gaya: $safeErr"
+            withContext(NonCancellable) {
+                historyRepository.addMessage(
+                    ChatMessageEntity(role = "assistant", content = finalReply, brainUsed = "local")
+                )
+                historyRepository.updateTaskRun(
+                    id = taskId,
+                    status = "FAILED",
+                    stepsCount = lastStepCompleted,
+                    brainSummary = brainsUsed.joinToString(" -> "),
+                    finalReply = finalReply,
+                    stepLogsJson = stepLogs.toString(),
+                    finishedAt = System.currentTimeMillis()
+                )
+            }
         } finally {
             if (activeTaskId == taskId) {
                 activeTaskId = null
-                _state.value = AgentExecutionState(statusText = "Ready")
+                _state.value = AgentExecutionState(
+                    statusText = if (stepFailedError != null) "Error" else "Ready",
+                    queuedCount = _state.value.queuedCount,
+                    lastError = stepFailedError
+                )
             }
         }
     }

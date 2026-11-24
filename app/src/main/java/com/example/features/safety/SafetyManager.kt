@@ -29,6 +29,7 @@ import com.example.util.PermissionHelper
 import com.example.voice.BabyTtsManager
 import com.google.android.gms.location.LocationServices
 import com.google.android.gms.location.Priority
+import com.google.android.gms.tasks.CancellationTokenSource
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -256,18 +257,29 @@ class SafetyManager @Inject constructor(
         var sentCount = 0
         val hasSms = permissionHelper.hasPermission(Manifest.permission.SEND_SMS)
         if (hasSms) {
-            val smsManager = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                context.getSystemService(SmsManager::class.java)
-            } else {
-                @Suppress("DEPRECATION")
-                SmsManager.getDefault()
-            }
-            contacts.forEach { contact ->
-                runCatching {
-                    val parts = smsManager.divideMessage(sosMessage)
-                    smsManager.sendMultipartTextMessage(contact.phoneNumber, null, parts, null, null)
-                    sentCount++
+            val smsManager = runCatching {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    context.getSystemService(SmsManager::class.java)
+                } else {
+                    @Suppress("DEPRECATION")
+                    SmsManager.getDefault()
                 }
+            }.getOrNull()
+            if (smsManager != null) {
+                contacts.forEach { contact ->
+                    runCatching {
+                        val parts = smsManager.divideMessage(sosMessage)
+                        smsManager.sendMultipartTextMessage(contact.phoneNumber, null, parts, null, null)
+                        sentCount++
+                    }
+                }
+            } else {
+                val first = contacts.first()
+                val intent = Intent(Intent.ACTION_SENDTO, Uri.parse("smsto:${Uri.encode(first.phoneNumber)}")).apply {
+                    putExtra("sms_body", sosMessage)
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                runCatching { context.startActivity(intent) }
             }
         } else {
             val first = contacts.first()
@@ -301,7 +313,7 @@ class SafetyManager @Inject constructor(
     }
 
     private fun postCountdownNotification(secondsRemaining: Int) {
-        val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
         val channel = NotificationChannel(
             SOS_CHANNEL_ID,
             "Baby Emergency SOS",
@@ -340,8 +352,8 @@ class SafetyManager @Inject constructor(
     }
 
     private fun dismissCountdownNotification() {
-        val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        nm.cancel(SOS_NOTIFICATION_ID)
+        val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+        nm?.cancel(SOS_NOTIFICATION_ID)
     }
 
     @SuppressLint("MissingPermission")
@@ -352,17 +364,31 @@ class SafetyManager @Inject constructor(
             return null
         }
         val client = LocationServices.getFusedLocationProviderClient(context)
-        return withTimeoutOrNull(4000L) {
-            suspendCancellableCoroutine { cont ->
-                client.getCurrentLocation(Priority.PRIORITY_HIGH_ACCURACY, null)
+        val fresh = withTimeoutOrNull(4000L) {
+            suspendCancellableCoroutine<String?> { cont ->
+                val cts = CancellationTokenSource()
+                client.getCurrentLocation(Priority.PRIORITY_HIGH_ACCURACY, cts.token)
                     .addOnSuccessListener { loc ->
-                        if (loc != null) {
-                            cont.resume("https://maps.google.com/?q=${loc.latitude},${loc.longitude}")
-                        } else {
-                            cont.resume(null)
+                        if (cont.isActive) {
+                            cont.resume(loc?.let { "https://maps.google.com/?q=${it.latitude},${it.longitude}" })
                         }
                     }
-                    .addOnFailureListener { cont.resume(null) }
+                    .addOnFailureListener {
+                        if (cont.isActive) cont.resume(null)
+                    }
+                cont.invokeOnCancellation { cts.cancel() }
+            }
+        }
+        if (fresh != null) return fresh
+        return withTimeoutOrNull(1500L) {
+            suspendCancellableCoroutine<String?> { cont ->
+                client.lastLocation
+                    .addOnSuccessListener { loc ->
+                        if (cont.isActive) {
+                            cont.resume(loc?.let { "https://maps.google.com/?q=${it.latitude},${it.longitude}" })
+                        }
+                    }
+                    .addOnFailureListener { if (cont.isActive) cont.resume(null) }
             }
         }
     }
@@ -402,6 +428,18 @@ class SafetyManager @Inject constructor(
             "com.kunzisoft.keepass"
         )
 
+        private val SYSTEM_SECURITY_PACKAGES = listOf(
+            "com.android.settings",
+            "com.google.android.gms",
+            "com.android.systemui",
+            "com.miui.securitycenter",
+            "com.coloros.safecenter",
+            "com.oplus.safecenter",
+            "com.samsung.android.lool",
+            "com.iqoo.secure",
+            "com.vivo.permissionmanager"
+        )
+
         private val SYSTEM_SECURITY_MARKERS = listOf(
             "choose screen lock", "confirm your pin", "confirm your pattern",
             "confirm your password", "device admin", "biometrics", "fingerprint",
@@ -412,7 +450,8 @@ class SafetyManager @Inject constructor(
 
         private val PAYMENT_TEXT_MARKERS = listOf(
             "enter upi pin", "upi pin", "enter mpin", "netbanking",
-            "cvv", "card number", "authorize payment", "confirm payment"
+            "cvv", "card number", "authorize payment", "confirm payment",
+            "imobile", "yono", "bhim upi"
         )
 
         fun isBlockedScreen(packageName: String?, screenText: String? = null): String? {
@@ -433,7 +472,7 @@ class SafetyManager @Inject constructor(
                 return "Banking / UPI Payment screen"
             }
 
-            if (pkg == "com.android.settings" || pkg == "com.google.android.gms" || pkg == "com.android.systemui") {
+            if (SYSTEM_SECURITY_PACKAGES.any { pkg == it }) {
                 if (SYSTEM_SECURITY_MARKERS.any { text.contains(it) }) {
                     return "System Security settings screen"
                 }

@@ -133,3 +133,14 @@ val MIGRATION_3_4 = object : Migration(3, 4) {
         db.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS `index_saved_places_placeKey` ON `saved_places` (`placeKey`)")
     }
 }
+
+val MIGRATION_4_5 = object : Migration(4, 5) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("CREATE INDEX IF NOT EXISTS `index_chat_messages_timestamp` ON `chat_messages` (`timestamp`)")
+        db.execSQL("CREATE INDEX IF NOT EXISTS `index_task_runs_startedAt` ON `task_runs` (`startedAt`)")
+        db.execSQL("CREATE INDEX IF NOT EXISTS `index_action_logs_timestamp` ON `action_logs` (`timestamp`)")
+        db.execSQL("CREATE INDEX IF NOT EXISTS `index_action_logs_status` ON `action_logs` (`status`)")
+        db.execSQL("CREATE INDEX IF NOT EXISTS `index_action_logs_source` ON `action_logs` (`source`)")
+        db.execSQL("CREATE INDEX IF NOT EXISTS `index_reminders_isCompleted_triggerAtMs` ON `reminders` (`isCompleted`, `triggerAtMs`)")
+    }
+}

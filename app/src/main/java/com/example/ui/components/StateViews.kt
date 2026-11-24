@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.Alarm
 import androidx.compose.material.icons.filled.Apps
 import androidx.compose.material.icons.filled.AutoAwesome
@@ -33,7 +34,6 @@ import androidx.compose.material.icons.filled.Psychology
 import androidx.compose.material.icons.filled.Screenshot
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.TouchApp
-import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
@@ -203,7 +203,7 @@ fun presentToolAction(toolName: String?, argsJson: String?, resultText: String?)
             val on = args?.optBoolean("enable", true) ?: true
             ToolUiDisplay(Icons.Default.DoNotDisturbOn, "Do Not Disturb ${if (on) "ON" else "OFF"}")
         }
-        "set_volume" -> ToolUiDisplay(Icons.Default.VolumeUp, "Adjusted Volume")
+        "set_volume" -> ToolUiDisplay(Icons.AutoMirrored.Filled.VolumeUp, "Adjusted Volume")
         "toggle_wifi", "open_wifi_settings" -> ToolUiDisplay(Icons.Default.Wifi, "Wi-Fi Controls")
         "summarize_notifications" -> ToolUiDisplay(Icons.Default.Notifications, "Summarized Notifications")
         "save_memory", "recall_memory", "delete_memory" -> ToolUiDisplay(Icons.Default.Psychology, "Updated Memory")

@@ -31,12 +31,22 @@ import com.example.features.routines.RoutineManager
 import com.example.features.routines.RoutineStep
 import com.example.features.safety.EmergencyCountdownState
 import com.example.features.safety.SafetyManager
+import androidx.paging.Pager
+import androidx.paging.PagingConfig
+import androidx.paging.PagingData
+import androidx.paging.cachedIn
+import com.example.ui.state.ActionLogFilterState
+import com.example.ui.state.ActionLogPagingSource
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import javax.inject.Inject
@@ -70,6 +80,32 @@ class BabyExtrasViewModel @Inject constructor(
 
     val actionLogs: StateFlow<List<ActionLogEntity>> = actionLogRepository.logs
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val actionLogTotalCount: StateFlow<Int> = actionLogRepository.totalCount
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0)
+
+    val availableActionApps: StateFlow<List<String>> = actionLogRepository.availableApps
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    private val _actionLogFilter = MutableStateFlow(ActionLogFilterState())
+    val actionLogFilter: StateFlow<ActionLogFilterState> = _actionLogFilter.asStateFlow()
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    val pagedActionLogs: Flow<PagingData<ActionLogEntity>> = combine(
+        _actionLogFilter,
+        actionLogTotalCount
+    ) { filter, _ -> filter }
+        .flatMapLatest { filter ->
+            Pager(
+                config = PagingConfig(pageSize = 30, enablePlaceholders = false, initialLoadSize = 60),
+                pagingSourceFactory = { ActionLogPagingSource(actionLogRepository, filter) }
+            ).flow
+        }
+        .cachedIn(viewModelScope)
+
+    fun updateActionLogFilter(filter: ActionLogFilterState) {
+        _actionLogFilter.value = filter
+    }
 
     val reminders: StateFlow<List<ReminderEntity>> = reminderManager.reminders
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())

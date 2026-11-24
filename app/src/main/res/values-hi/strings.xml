@@ -1,6 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Baby</string>
+    <string name="accessibility_service_label">Baby फ़ोन कंट्रोल</string>
+    <string name="accessibility_service_description">आपके कहने पर Baby को स्क्रीन पढ़ने, टैप, टाइप, स्क्रॉल, स्क्रीनशॉट लेने और बैक/होम करने की अनुमति देता है।</string>
+    <string name="notification_listener_label">Baby नोटिफिकेशन रीडर</string>
+    <string name="quick_settings_tile_label">Baby</string>
+    <string name="auto_reply_tile_label">Baby ऑटो-रिप्लाई</string>
+    <string name="fg_channel_name">Baby असिस्टेंट सेवा</string>
+    <string name="fg_channel_desc">Baby को Hey Baby सुनने और कार्य चलाने के लिए सक्रिय रखता है</string>
     <string name="fg_notification_title">Baby सुन रही है</string>
     <string name="fg_notification_sleeping">Baby बैकग्राउंड में तैयार है</string>
     <string name="fg_action_speak">बोलो</string>

@@ -109,7 +109,7 @@ class CameraCaptureActivity : ComponentActivity() {
     }
 
     private fun maybeStartCamera() {
-        if (cameraStarted) return
+        if (cameraStarted || isFinishing || isDestroyed) return
         val pv = previewView ?: return
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
             return
@@ -118,6 +118,7 @@ class CameraCaptureActivity : ComponentActivity() {
 
         val future = ProcessCameraProvider.getInstance(this)
         future.addListener({
+            if (isFinishing || isDestroyed) return@addListener
             val provider = runCatching { future.get() }.getOrNull() ?: run {
                 finishWithResult(null)
                 return@addListener
@@ -175,24 +176,44 @@ class CameraCaptureActivity : ComponentActivity() {
     }
 
     private fun encodeScaledBase64(file: File): String? {
-        val bmp = BitmapFactory.decodeFile(file.absolutePath) ?: return null
-        val maxDim = 768
-        val scale = minOf(1f, maxDim.toFloat() / maxOf(bmp.width, bmp.height).coerceAtLeast(1))
-        val scaled = if (scale < 1f) {
-            Bitmap.createScaledBitmap(bmp, (bmp.width * scale).toInt().coerceAtLeast(1), (bmp.height * scale).toInt().coerceAtLeast(1), true)
-                .also { bmp.recycle() }
-        } else bmp
-        val out = ByteArrayOutputStream()
-        scaled.compress(Bitmap.CompressFormat.JPEG, 70, out)
-        scaled.recycle()
-        return Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP)
+        var bmp: Bitmap? = null
+        var scaled: Bitmap? = null
+        return try {
+            bmp = BitmapFactory.decodeFile(file.absolutePath) ?: return null
+            val maxDim = 768
+            val scale = minOf(1f, maxDim.toFloat() / maxOf(bmp.width, bmp.height).coerceAtLeast(1))
+            scaled = if (scale < 1f) {
+                Bitmap.createScaledBitmap(
+                    bmp,
+                    (bmp.width * scale).toInt().coerceAtLeast(1),
+                    (bmp.height * scale).toInt().coerceAtLeast(1),
+                    true
+                )
+            } else {
+                bmp
+            }
+            val out = ByteArrayOutputStream()
+            scaled.compress(Bitmap.CompressFormat.JPEG, 70, out)
+            Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP)
+        } catch (_: OutOfMemoryError) {
+            null
+        } catch (_: Exception) {
+            null
+        } finally {
+            if (scaled != null && scaled !== bmp && !scaled.isRecycled) {
+                scaled.recycle()
+            }
+            if (bmp != null && !bmp.isRecycled) {
+                bmp.recycle()
+            }
+        }
     }
 
     private fun finishWithResult(base64: String?) {
         mainHandler.removeCallbacksAndMessages(null)
         pendingDeferred?.complete(base64)
         pendingDeferred = null
-        finish()
+        if (!isFinishing) finish()
     }
 
     override fun onDestroy() {
@@ -214,7 +235,12 @@ class CameraCaptureActivity : ComponentActivity() {
             val intent = Intent(context, CameraCaptureActivity::class.java).apply {
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
-            context.startActivity(intent)
+            val launched = runCatching { context.startActivity(intent) }.isSuccess
+            if (!launched) {
+                if (pendingDeferred === deferred) pendingDeferred = null
+                deferred.complete(null)
+                return null
+            }
             return deferred.await()
         }
 

@@ -1,12 +1,14 @@
 package com.example.features.actionlog
 
 import com.example.core.security.SecureKeyStore
+import com.example.core.security.SensitiveDataSanitizer
 import com.example.data.local.ActionLogDao
 import com.example.data.local.ActionLogEntity
 import kotlinx.coroutines.flow.Flow
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicInteger
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -15,7 +17,11 @@ class ActionLogRepository @Inject constructor(
     private val dao: ActionLogDao,
     private val keyStore: SecureKeyStore
 ) {
+    private val insertCounter = AtomicInteger(0)
+
     val logs: Flow<List<ActionLogEntity>> = dao.observeRecent()
+    val totalCount: Flow<Int> = dao.observeTotalCount()
+    val availableApps: Flow<List<String>> = dao.observeDistinctTargetApps()
 
     suspend fun record(
         commandText: String,
@@ -28,19 +34,43 @@ class ActionLogRepository @Inject constructor(
     ) {
         val settings = keyStore.settings.value
         if (!settings.actionLogEnabled) return
+        val safeCmd = SensitiveDataSanitizer.sanitizeForLogs(commandText).take(220)
+        val safeArgs = SensitiveDataSanitizer.sanitizeForLogs(argsSummary).take(280)
+        val safeResult = SensitiveDataSanitizer.sanitizeForLogs(resultText).take(400)
+        val safeTargetApp = SensitiveDataSanitizer.sanitizeForLogs(targetApp).take(80)
         dao.insert(
             ActionLogEntity(
-                commandText = commandText.take(220),
+                commandText = safeCmd,
                 toolName = toolName,
-                argsSummary = argsSummary.take(280),
-                resultText = resultText.take(400),
-                targetApp = targetApp,
+                argsSummary = safeArgs,
+                resultText = safeResult,
+                targetApp = safeTargetApp,
                 status = status,
                 source = source
             )
         )
-        pruneExpired()
+        if (insertCounter.incrementAndGet() % PRUNE_EVERY_N_INSERTS == 0) {
+            pruneExpired()
+        }
     }
+
+    suspend fun getPagedFiltered(
+        query: String,
+        status: String,
+        source: String,
+        targetApp: String,
+        minTimestamp: Long,
+        limit: Int,
+        offset: Int
+    ): List<ActionLogEntity> = dao.getPagedFiltered(
+        query = query.trim(),
+        status = status,
+        source = source,
+        targetApp = targetApp,
+        minTimestamp = minTimestamp,
+        limit = limit,
+        offset = offset
+    )
 
     suspend fun pruneExpired() {
         val days = keyStore.settings.value.actionLogRetentionDays
@@ -60,11 +90,15 @@ class ActionLogRepository @Inject constructor(
             appendLine("=== Baby Assistant Action Log (${all.size} entries) ===")
             all.forEach { e ->
                 appendLine("[${fmt.format(Date(e.timestamp))}] [${e.status}] [${e.source}] Tool: ${e.toolName}")
-                if (e.commandText.isNotBlank()) appendLine("  Command: ${e.commandText}")
+                if (e.commandText.isNotBlank()) appendLine("  Command: ${SensitiveDataSanitizer.sanitizeForLogs(e.commandText)}")
                 if (e.targetApp.isNotBlank()) appendLine("  App: ${e.targetApp}")
-                if (e.argsSummary.isNotBlank()) appendLine("  Args: ${e.argsSummary}")
-                appendLine("  Result: ${e.resultText}")
+                if (e.argsSummary.isNotBlank()) appendLine("  Args: ${SensitiveDataSanitizer.sanitizeForLogs(e.argsSummary)}")
+                appendLine("  Result: ${SensitiveDataSanitizer.sanitizeForLogs(e.resultText)}")
             }
         }
+    }
+
+    companion object {
+        private const val PRUNE_EVERY_N_INSERTS = 50
     }
 }

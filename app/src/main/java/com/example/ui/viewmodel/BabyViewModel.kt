@@ -306,6 +306,10 @@ class BabyViewModel @Inject constructor(
         orchestrator.approveConfirmation(approved, enteredPin)
     }
 
+    fun clearAgentError() {
+        orchestrator.clearLastError()
+    }
+
     fun saveApiKeys(geminiKey: String, groqKey: String) {
         keyStore.updateApiKeys(geminiKey, groqKey)
         if (geminiKey.isNotBlank() || groqKey.isNotBlank()) {

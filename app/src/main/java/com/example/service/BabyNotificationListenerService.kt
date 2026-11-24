@@ -4,6 +4,7 @@ import android.app.Notification
 import android.app.PendingIntent
 import android.app.RemoteInput
 import android.content.Intent
+import android.os.Build
 import android.os.Bundle
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
@@ -39,10 +40,12 @@ class BabyNotificationListenerService : NotificationListenerService() {
         fun autoReplyManager(): AutoReplyManager
     }
 
-    private val listenerScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private var listenerScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     override fun onListenerConnected() {
         super.onListenerConnected()
+        listenerScope.cancel()
+        listenerScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         instance = this
         refreshFromActive()
     }
@@ -97,8 +100,11 @@ class BabyNotificationListenerService : NotificationListenerService() {
             ?: extras.getCharSequence(Notification.EXTRA_TEXT))?.toString().orEmpty()
         if (title.isBlank() && text.isBlank()) return null
 
-        val isGroup = extras.getBoolean(Notification.EXTRA_IS_GROUP_CONVERSATION, false) ||
-            !extras.getCharSequence(Notification.EXTRA_CONVERSATION_TITLE).isNullOrBlank()
+        val isGroup = (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            extras.getBoolean(Notification.EXTRA_IS_GROUP_CONVERSATION, false)
+        } else {
+            false
+        }) || !extras.getCharSequence(Notification.EXTRA_CONVERSATION_TITLE).isNullOrBlank()
 
         val appLabel = runCatching {
             val ai = packageManager.getApplicationInfo(sbn.packageName, 0)

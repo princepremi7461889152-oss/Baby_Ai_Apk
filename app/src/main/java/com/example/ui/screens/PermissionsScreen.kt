@@ -1,6 +1,7 @@
 package com.example.ui.screens
 
 import android.Manifest
+import android.app.Activity
 import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -50,11 +51,15 @@ import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.tooling.preview.Preview
@@ -77,6 +82,7 @@ private data class PermissionChecklistItem(
     val reason: String,
     val icon: ImageVector,
     val granted: Boolean,
+    val permanentlyDenied: Boolean = false,
     val onFix: () -> Unit
 )
 
@@ -92,6 +98,9 @@ fun PermissionsScreen(
 ) {
     val spacing = BabyThemeTokens.spacing
     val ext = BabyThemeTokens.colors
+    val context = LocalContext.current
+    val activity = context as? Activity
+    var deniedFeedback by remember { mutableStateOf<String?>(null) }
 
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
@@ -104,34 +113,77 @@ fun PermissionsScreen(
 
     val permLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
-    ) { onRefresh() }
+    ) { results ->
+        val deniedPerms = results.filterValues { !it }.keys
+        deniedFeedback = if (deniedPerms.isNotEmpty()) {
+            val anyPermanent = deniedPerms.any { perm ->
+                permissionHelper?.isPermanentlyDenied(activity, perm) == true
+            }
+            if (anyPermanent) {
+                "Permission 'Don't ask again' se block hai — neeche 'App Settings' dabakar allow karein."
+            } else {
+                "Permission deny hui hai — koi crash nahi, zaroorat par dobara allow kar sakte ho."
+            }
+        } else null
+        onRefresh()
+    }
 
-    val items = remember(permissions) {
+    fun requestRuntimePermissions(perms: Array<String>) {
+        perms.forEach { permissionHelper?.markPermissionRequested(it) }
+        val permanent = perms.any { permissionHelper?.isPermanentlyDenied(activity, it) == true }
+        if (permanent) {
+            permissionHelper?.openAppDetailsSettings()
+        } else {
+            permLauncher.launch(perms)
+        }
+    }
+
+    val micPermBlocked = !permissions.recordAudio &&
+        (permissionHelper?.isPermanentlyDenied(activity, Manifest.permission.RECORD_AUDIO) == true)
+    val notifPermBlocked = !permissions.postNotifications && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+        (permissionHelper?.isPermanentlyDenied(activity, Manifest.permission.POST_NOTIFICATIONS) == true)
+    val phonePerms = arrayOf(
+        Manifest.permission.CALL_PHONE,
+        Manifest.permission.READ_CONTACTS,
+        Manifest.permission.SEND_SMS
+    )
+    val phonePermBlocked = !(permissions.callPhone && permissions.readContacts && permissions.sendSms) &&
+        phonePerms.any { permissionHelper?.isPermanentlyDenied(activity, it) == true }
+    val camPermBlocked = !permissions.camera &&
+        (permissionHelper?.isPermanentlyDenied(activity, Manifest.permission.CAMERA) == true)
+    val locPermBlocked = !permissions.fineLocation &&
+        (permissionHelper?.isPermanentlyDenied(activity, Manifest.permission.ACCESS_FINE_LOCATION) == true)
+
+    val items = remember(
+        permissions, micPermBlocked, notifPermBlocked, phonePermBlocked, camPermBlocked, locPermBlocked
+    ) {
         listOf(
             PermissionChecklistItem(
                 id = "mic",
                 title = "Microphone",
-                reason = "\"Hey Baby\" wake word aur voice commands sunne ke liye zaroori.",
+                reason = "\"Hey Baby\" wake word aur voice commands sunne ke liye zaroori (Android 14 foreground mic).",
                 icon = Icons.Default.Mic,
                 granted = permissions.recordAudio,
-                onFix = { permLauncher.launch(arrayOf(Manifest.permission.RECORD_AUDIO)) }
+                permanentlyDenied = micPermBlocked,
+                onFix = { requestRuntimePermissions(arrayOf(Manifest.permission.RECORD_AUDIO)) }
             ),
             PermissionChecklistItem(
                 id = "notifs",
                 title = "Notifications",
-                reason = "Persistent \"Baby is listening\" bar aur Stop button dikhane ke liye.",
+                reason = "Persistent \"Baby is listening\" bar aur Stop button dikhane ke liye (Android 13+ required).",
                 icon = Icons.Default.NotificationsActive,
                 granted = permissions.postNotifications,
+                permanentlyDenied = notifPermBlocked,
                 onFix = {
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                        permLauncher.launch(arrayOf(Manifest.permission.POST_NOTIFICATIONS))
+                        requestRuntimePermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS))
                     } else onRefresh()
                 }
             ),
             PermissionChecklistItem(
                 id = "accessibility",
                 title = "Accessibility (Phone Control)",
-                reason = "Apps open, tap, scroll, macros record aur screen help ke liye.",
+                reason = "Apps open, tap, scroll, macros record aur screen help ke liye. OS kill kare to dobara ON karein.",
                 icon = Icons.Default.AccessibilityNew,
                 granted = permissions.accessibility,
                 onFix = { permissionHelper?.openAccessibilitySettings() }
@@ -139,7 +191,7 @@ fun PermissionsScreen(
             PermissionChecklistItem(
                 id = "notif_listener",
                 title = "Notification Reader & Reply",
-                reason = "WhatsApp/SMS notifications padhne aur Auto-Reply bhejne ke liye.",
+                reason = "WhatsApp/SMS notifications padhne aur Auto-Reply bhejne ke liye. System toggle off kare to re-enable karein.",
                 icon = Icons.Default.NotificationsActive,
                 granted = permissions.notificationListener,
                 onFix = { permissionHelper?.openNotificationListenerSettings() }
@@ -166,15 +218,8 @@ fun PermissionsScreen(
                 reason = "\"Mummy ko call karo\" ya emergency SOS SMS bhejne ke liye.",
                 icon = Icons.Default.Phone,
                 granted = permissions.callPhone && permissions.readContacts && permissions.sendSms,
-                onFix = {
-                    permLauncher.launch(
-                        arrayOf(
-                            Manifest.permission.CALL_PHONE,
-                            Manifest.permission.READ_CONTACTS,
-                            Manifest.permission.SEND_SMS
-                        )
-                    )
-                }
+                permanentlyDenied = phonePermBlocked,
+                onFix = { requestRuntimePermissions(phonePerms) }
             ),
             PermissionChecklistItem(
                 id = "write_settings",
@@ -195,7 +240,7 @@ fun PermissionsScreen(
             PermissionChecklistItem(
                 id = "exact_alarm",
                 title = "Exact Alarms",
-                reason = "Time reminders bilkul exact minute par bajane ke liye.",
+                reason = "Time reminders bilkul exact minute par bajane ke liye (Android 12+ fallback safe).",
                 icon = Icons.Default.Alarm,
                 granted = permissions.exactAlarm,
                 onFix = { permissionHelper?.openExactAlarmSettings() }
@@ -206,7 +251,8 @@ fun PermissionsScreen(
                 reason = "\"Camera se dekho ye kya hai?\" jaise visual questions ke liye.",
                 icon = Icons.Default.CameraAlt,
                 granted = permissions.camera,
-                onFix = { permLauncher.launch(arrayOf(Manifest.permission.CAMERA)) }
+                permanentlyDenied = camPermBlocked,
+                onFix = { requestRuntimePermissions(arrayOf(Manifest.permission.CAMERA)) }
             ),
             PermissionChecklistItem(
                 id = "location",
@@ -214,7 +260,8 @@ fun PermissionsScreen(
                 reason = "\"Ghar pahunchu to yaad dilana\" jaise location reminders ke liye.",
                 icon = Icons.Default.LocationOn,
                 granted = permissions.fineLocation,
-                onFix = { permLauncher.launch(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)) }
+                permanentlyDenied = locPermBlocked,
+                onFix = { requestRuntimePermissions(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)) }
             )
         )
     }
@@ -283,6 +330,25 @@ fun PermissionsScreen(
                     contentPadding = PaddingValues(spacing.md),
                     verticalArrangement = Arrangement.spacedBy(spacing.sm)
                 ) {
+                    if (!deniedFeedback.isNullOrBlank()) {
+                        item {
+                            Surface(
+                                color = ext.warningContainer,
+                                contentColor = ext.onWarningContainer,
+                                shape = RoundedCornerShape(spacing.chipRadius),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .testTag("permissions_denied_banner")
+                            ) {
+                                Text(
+                                    text = deniedFeedback.orEmpty().withDevanagariFallback(),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    modifier = Modifier.padding(spacing.sm)
+                                )
+                            }
+                        }
+                    }
+
                     items(items, key = { it.id }) { item ->
                         Card(
                             shape = RoundedCornerShape(spacing.cardRadius),
@@ -321,14 +387,25 @@ fun PermissionsScreen(
                                         Icon(
                                             imageVector = if (item.granted) Icons.Default.CheckCircle else Icons.Default.WarningAmber,
                                             contentDescription = null,
-                                            tint = if (item.granted) ext.success else ext.warning,
+                                            tint = when {
+                                                item.granted -> ext.success
+                                                item.permanentlyDenied -> MaterialTheme.colorScheme.error
+                                                else -> ext.warning
+                                            },
                                             modifier = Modifier.size(15.dp)
                                         )
                                         Text(
-                                            text = if (item.granted) stringResource(R.string.permission_granted)
-                                            else stringResource(R.string.permission_missing),
+                                            text = when {
+                                                item.granted -> stringResource(R.string.permission_granted)
+                                                item.permanentlyDenied -> "Blocked — Allow in App Settings"
+                                                else -> stringResource(R.string.permission_missing)
+                                            },
                                             style = MaterialTheme.typography.labelSmall,
-                                            color = if (item.granted) ext.success else ext.warning
+                                            color = when {
+                                                item.granted -> ext.success
+                                                item.permanentlyDenied -> MaterialTheme.colorScheme.error
+                                                else -> ext.warning
+                                            }
                                         )
                                     }
                                 }
@@ -340,7 +417,10 @@ fun PermissionsScreen(
                                             .minimumInteractiveComponentSize()
                                             .testTag("fix_perm_${item.id}")
                                     ) {
-                                        Text(stringResource(R.string.permission_fix))
+                                        Text(
+                                            if (item.permanentlyDenied) "App Settings"
+                                            else stringResource(R.string.permission_fix)
+                                        )
                                     }
                                 }
                             }

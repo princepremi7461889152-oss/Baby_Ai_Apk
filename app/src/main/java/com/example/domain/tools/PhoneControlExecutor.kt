@@ -20,6 +20,7 @@ import android.view.KeyEvent
 import com.example.core.security.SecureKeyStore
 import com.example.data.local.AllowedAppDao
 import com.example.data.local.MemoryDao
+import com.example.features.notifications.NotificationSummaryManager
 import com.example.features.safety.SafetyManager
 import com.example.service.BabyAccessibilityService
 import com.example.service.BabyNotificationListenerService
@@ -128,8 +129,12 @@ class PhoneControlExecutor @Inject constructor(
         val directIntent = pm.getLaunchIntentForPackage(query)
         if (directIntent != null) {
             directIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            context.startActivity(directIntent)
-            return ToolExecutionResult(true, "Opened $query")
+            return runCatching {
+                context.startActivity(directIntent)
+                ToolExecutionResult(true, "Opened $query")
+            }.getOrElse { e ->
+                ToolExecutionResult(false, "Cannot launch $query: ${e.message}")
+            }
         }
 
         val launcherIntent = Intent(Intent.ACTION_MAIN).apply {
@@ -167,8 +172,12 @@ class PhoneControlExecutor @Inject constructor(
             val launch = pm.getLaunchIntentForPackage(resolvedPkg)
             if (launch != null) {
                 launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                context.startActivity(launch)
-                ToolExecutionResult(true, "Opened $resolvedLabel")
+                runCatching {
+                    context.startActivity(launch)
+                    ToolExecutionResult(true, "Opened $resolvedLabel")
+                }.getOrElse { e ->
+                    ToolExecutionResult(false, "Cannot launch $resolvedLabel: ${e.message}")
+                }
             } else {
                 ToolExecutionResult(false, "Cannot launch $resolvedLabel")
             }
@@ -190,12 +199,16 @@ class PhoneControlExecutor @Inject constructor(
         val intent = Intent(action, Uri.parse("tel:${Uri.encode(phoneNumber)}")).apply {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         }
-        context.startActivity(intent)
-        return ToolExecutionResult(
-            true,
-            if (action == Intent.ACTION_CALL) "Calling $target ($phoneNumber)"
-            else "Opened dialer for $target ($phoneNumber) — grant CALL_PHONE for instant call."
-        )
+        return runCatching {
+            context.startActivity(intent)
+            ToolExecutionResult(
+                true,
+                if (action == Intent.ACTION_CALL) "Calling $target ($phoneNumber)"
+                else "Opened dialer for $target ($phoneNumber) — grant CALL_PHONE for instant call."
+            )
+        }.getOrElse { e ->
+            ToolExecutionResult(false, "No phone/dialer app available: ${e.message}")
+        }
     }
 
     private suspend fun sendSms(recipient: String, message: String): ToolExecutionResult {
@@ -204,26 +217,34 @@ class PhoneControlExecutor @Inject constructor(
         }
         val number = resolvePhoneNumber(recipient) ?: recipient
         if (permissionHelper.hasPermission(Manifest.permission.SEND_SMS)) {
-            return try {
-                val smsManager = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val smsManager = runCatching {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                     context.getSystemService(SmsManager::class.java)
                 } else {
                     @Suppress("DEPRECATION")
                     SmsManager.getDefault()
                 }
-                val parts = smsManager.divideMessage(message)
-                smsManager.sendMultipartTextMessage(number, null, parts, null, null)
-                ToolExecutionResult(true, "SMS sent to $recipient ($number)")
-            } catch (e: Exception) {
-                ToolExecutionResult(false, "SMS failed: ${e.message}")
+            }.getOrNull()
+            if (smsManager != null) {
+                return try {
+                    val parts = smsManager.divideMessage(message)
+                    smsManager.sendMultipartTextMessage(number, null, parts, null, null)
+                    ToolExecutionResult(true, "SMS sent to $recipient ($number)")
+                } catch (e: Exception) {
+                    ToolExecutionResult(false, "SMS failed: ${e.message}")
+                }
             }
         }
         val intent = Intent(Intent.ACTION_SENDTO, Uri.parse("smsto:${Uri.encode(number)}")).apply {
             putExtra("sms_body", message)
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         }
-        context.startActivity(intent)
-        return ToolExecutionResult(true, "Opened SMS composer for $recipient ($number)")
+        return runCatching {
+            context.startActivity(intent)
+            ToolExecutionResult(true, "Opened SMS composer for $recipient ($number)")
+        }.getOrElse { e ->
+            ToolExecutionResult(false, "No SMS app available on device: ${e.message}")
+        }
     }
 
     private suspend fun sendWhatsApp(recipient: String, message: String): ToolExecutionResult {
@@ -310,18 +331,23 @@ class PhoneControlExecutor @Inject constructor(
                 permissionHelper.hasPermission(Manifest.permission.BLUETOOTH_CONNECT)
             if (canToggle) {
                 @Suppress("DEPRECATION")
-                val ok = if (enable) adapter.enable() else adapter.disable()
+                val ok = runCatching { if (enable) adapter.enable() else adapter.disable() }.getOrDefault(false)
                 if (ok) return ToolExecutionResult(true, "Bluetooth turned ${if (enable) "ON" else "OFF"}")
             }
         }
         val intent = Intent(Settings.ACTION_BLUETOOTH_SETTINGS).apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) }
-        context.startActivity(intent)
-        return ToolExecutionResult(true, "Opened Bluetooth settings (requested ${if (enable) "ON" else "OFF"}). Use tap if needed.")
+        return runCatching {
+            context.startActivity(intent)
+            ToolExecutionResult(true, "Opened Bluetooth settings (requested ${if (enable) "ON" else "OFF"}). Use tap if needed.")
+        }.getOrElse { e ->
+            ToolExecutionResult(false, "Cannot open Bluetooth settings: ${e.message}")
+        }
     }
 
     private fun toggleFlashlight(enable: Boolean): ToolExecutionResult {
         return try {
-            val camManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+            val camManager = context.getSystemService(Context.CAMERA_SERVICE) as? CameraManager
+                ?: return ToolExecutionResult(false, "Camera service unavailable.")
             val cameraId = camManager.cameraIdList.firstOrNull { id ->
                 camManager.getCameraCharacteristics(id)
                     .get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
@@ -334,22 +360,28 @@ class PhoneControlExecutor @Inject constructor(
     }
 
     private fun toggleDnd(enable: Boolean): ToolExecutionResult {
-        val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+            ?: return ToolExecutionResult(false, "Notification service unavailable.")
         if (!nm.isNotificationPolicyAccessGranted) {
             permissionHelper.openDndAccessSettings()
             return ToolExecutionResult(false, "DND access not granted yet. Opened Do Not Disturb access settings.")
         }
-        val filter = if (enable) {
-            NotificationManager.INTERRUPTION_FILTER_PRIORITY
-        } else {
-            NotificationManager.INTERRUPTION_FILTER_ALL
+        return runCatching {
+            val filter = if (enable) {
+                NotificationManager.INTERRUPTION_FILTER_PRIORITY
+            } else {
+                NotificationManager.INTERRUPTION_FILTER_ALL
+            }
+            nm.setInterruptionFilter(filter)
+            ToolExecutionResult(true, "Do Not Disturb turned ${if (enable) "ON" else "OFF"}")
+        }.getOrElse { e ->
+            ToolExecutionResult(false, "Failed to update DND: ${e.message}")
         }
-        nm.setInterruptionFilter(filter)
-        return ToolExecutionResult(true, "Do Not Disturb turned ${if (enable) "ON" else "OFF"}")
     }
 
     private fun setVolume(stream: String, levelPercent: Int): ToolExecutionResult {
-        val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+            ?: return ToolExecutionResult(false, "Audio service unavailable.")
         val streamType = when (stream.lowercase()) {
             "ring", "ringer" -> AudioManager.STREAM_RING
             "alarm" -> AudioManager.STREAM_ALARM
@@ -357,10 +389,14 @@ class PhoneControlExecutor @Inject constructor(
             "notification" -> AudioManager.STREAM_NOTIFICATION
             else -> AudioManager.STREAM_MUSIC
         }
-        val max = am.getStreamMaxVolume(streamType)
-        val target = ((levelPercent.coerceIn(0, 100) / 100f) * max).toInt().coerceIn(0, max)
-        am.setStreamVolume(streamType, target, AudioManager.FLAG_SHOW_UI)
-        return ToolExecutionResult(true, "Set $stream volume to ${levelPercent.coerceIn(0, 100)}% ($target/$max)")
+        return runCatching {
+            val max = am.getStreamMaxVolume(streamType)
+            val target = ((levelPercent.coerceIn(0, 100) / 100f) * max).toInt().coerceIn(0, max)
+            am.setStreamVolume(streamType, target, AudioManager.FLAG_SHOW_UI)
+            ToolExecutionResult(true, "Set $stream volume to ${levelPercent.coerceIn(0, 100)}% ($target/$max)")
+        }.getOrElse { e ->
+            ToolExecutionResult(false, "Failed to change volume: ${e.message}")
+        }
     }
 
     private fun setBrightness(levelPercent: Int): ToolExecutionResult {
@@ -368,18 +404,24 @@ class PhoneControlExecutor @Inject constructor(
             permissionHelper.openWriteSettings()
             return ToolExecutionResult(false, "Write Settings permission missing. Opened Modify System Settings screen.")
         }
-        val value = ((levelPercent.coerceIn(5, 100) / 100f) * 255f).toInt().coerceIn(12, 255)
-        Settings.System.putInt(
-            context.contentResolver,
-            Settings.System.SCREEN_BRIGHTNESS_MODE,
-            Settings.System.SCREEN_BRIGHTNESS_MODE_MANUAL
-        )
-        Settings.System.putInt(context.contentResolver, Settings.System.SCREEN_BRIGHTNESS, value)
-        return ToolExecutionResult(true, "Screen brightness set to ${levelPercent.coerceIn(5, 100)}%")
+        return runCatching {
+            val clamped = levelPercent.coerceIn(5, 100)
+            val value = ((clamped / 100f) * 255f).toInt().coerceIn(12, 255)
+            Settings.System.putInt(
+                context.contentResolver,
+                Settings.System.SCREEN_BRIGHTNESS_MODE,
+                Settings.System.SCREEN_BRIGHTNESS_MODE_MANUAL
+            )
+            Settings.System.putInt(context.contentResolver, Settings.System.SCREEN_BRIGHTNESS, value)
+            ToolExecutionResult(true, "Screen brightness set to $clamped%")
+        }.getOrElse { e ->
+            ToolExecutionResult(false, "Failed to set brightness: ${e.message}")
+        }
     }
 
     private fun controlMedia(action: String): ToolExecutionResult {
-        val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+            ?: return ToolExecutionResult(false, "Audio service unavailable.")
         val keyCode = when (action.lowercase()) {
             "play" -> KeyEvent.KEYCODE_MEDIA_PLAY
             "pause" -> KeyEvent.KEYCODE_MEDIA_PAUSE
@@ -399,8 +441,12 @@ class PhoneControlExecutor @Inject constructor(
         val intent = Intent(Intent.ACTION_VIEW, Uri.parse("https://www.google.com/search?q=$encoded")).apply {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         }
-        context.startActivity(intent)
-        return ToolExecutionResult(true, "Searching web for \"$query\"")
+        return runCatching {
+            context.startActivity(intent)
+            ToolExecutionResult(true, "Searching web for \"$query\"")
+        }.getOrElse { e ->
+            ToolExecutionResult(false, "No browser available: ${e.message}")
+        }
     }
 
     private suspend fun checkUiSafetyGuard(acc: BabyAccessibilityService): ToolExecutionResult? {
@@ -529,9 +575,17 @@ class PhoneControlExecutor @Inject constructor(
         if (list.isEmpty()) {
             return ToolExecutionResult(true, "No active notifications${if (!filterApp.isNullOrBlank()) " matching $filterApp" else ""}.")
         }
+        val allowSensitive = keyStore.settings.value.readSensitiveNotificationsEnabled
         val text = list.joinToString("\n") { n ->
             val replyHint = if (n.replyAction != null) " [can_reply key=${n.key}]" else ""
-            "- [${n.appLabel}] ${n.title}: ${n.text}$replyHint"
+            val safeBody = if (!allowSensitive && NotificationSummaryManager.isSensitiveFinancialOrOtp(n.title, n.text)) {
+                "[OTP/Bank alert masked]"
+            } else if (!allowSensitive) {
+                NotificationSummaryManager.maskSensitiveText(n.text)
+            } else {
+                n.text
+            }
+            "- [${n.appLabel}] ${n.title}: $safeBody$replyHint"
         }
         return ToolExecutionResult(true, text)
     }

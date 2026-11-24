@@ -29,7 +29,7 @@ import kotlin.math.abs
 class FloatingBubbleController @Inject constructor(
     @ApplicationContext private val context: Context
 ) {
-    private val windowManager = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+    private val windowManager = context.getSystemService(Context.WINDOW_SERVICE) as? WindowManager
     private val mainHandler = Handler(Looper.getMainLooper())
 
     private var rootView: LinearLayout? = null
@@ -61,6 +61,7 @@ class FloatingBubbleController @Inject constructor(
         onClipClick: (() -> Unit)? = null,
         showClipButton: Boolean = true
     ) {
+        val wm = windowManager ?: return
         if (!Settings.canDrawOverlays(context)) return
         onTapBubble = onBubbleClick
         onTapStop = onStopClick
@@ -201,6 +202,7 @@ class FloatingBubbleController @Inject constructor(
         wrapper.addView(quickMenu)
 
         val (screenW, screenH, topInset) = getScreenBounds(dp)
+        // Spawn on top-right below status bar, safely above hero card & quick-command chips.
         val params = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
@@ -209,8 +211,8 @@ class FloatingBubbleController @Inject constructor(
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = dp(12)
-            y = (topInset + dp(140)).coerceAtMost((screenH * 0.65f).toInt())
+            x = (screenW - dp(132)).coerceAtLeast(dp(12))
+            y = (topInset + dp(72)).coerceAtMost((screenH * 0.45f).toInt())
         }
 
         var initialX = 0
@@ -246,9 +248,13 @@ class FloatingBubbleController @Inject constructor(
                     val bubbleW = wrapper.width.takeIf { it > 0 } ?: dp(104)
                     val bubbleH = wrapper.height.takeIf { it > 0 } ?: dp(48)
                     val margin = dp(8)
+                    val maxBottomClearance = dp(124)
                     params.x = (initialX + dx.toInt()).coerceIn(margin, (w - bubbleW - margin).coerceAtLeast(margin))
-                    params.y = (initialY + dy.toInt()).coerceIn(insetTop + margin, (h - bubbleH - dp(24)).coerceAtLeast(insetTop + margin))
-                    runCatching { windowManager.updateViewLayout(wrapper, params) }
+                    params.y = (initialY + dy.toInt()).coerceIn(
+                        insetTop + margin,
+                        (h - bubbleH - maxBottomClearance).coerceAtLeast(insetTop + margin)
+                    )
+                    runCatching { wm.updateViewLayout(wrapper, params) }
                     true
                 }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
@@ -272,7 +278,7 @@ class FloatingBubbleController @Inject constructor(
         }
 
         runCatching {
-            windowManager.addView(wrapper, params)
+            wm.addView(wrapper, params)
             rootView = wrapper
             mainPill = container
             menuRow = quickMenu
@@ -290,7 +296,7 @@ class FloatingBubbleController @Inject constructor(
         if (expand) wakeAlpha() else scheduleIdleDim()
         rootView?.let { v ->
             layoutParams?.let { p ->
-                runCatching { windowManager.updateViewLayout(v, p) }
+                runCatching { windowManager?.updateViewLayout(v, p) }
             }
         }
     }
@@ -312,12 +318,15 @@ class FloatingBubbleController @Inject constructor(
         params: WindowManager.LayoutParams,
         dp: (Int) -> Int
     ) {
-        val (screenW, _, _) = getScreenBounds(dp)
+        val (screenW, screenH, insetTop) = getScreenBounds(dp)
         val viewWidth = view.width.takeIf { it > 0 } ?: dp(104)
+        val viewHeight = view.height.takeIf { it > 0 } ?: dp(48)
         val margin = dp(10)
         val maxLeft = (screenW - viewWidth - margin).coerceAtLeast(margin)
         val center = params.x + viewWidth / 2
         val targetX = if (center < screenW / 2) margin else maxLeft
+        val maxY = (screenH - viewHeight - dp(124)).coerceAtLeast(insetTop + dp(8))
+        params.y = params.y.coerceIn(insetTop + dp(8), maxY)
 
         snapAnimator?.cancel()
         snapAnimator = ValueAnimator.ofInt(params.x, targetX).apply {
@@ -325,15 +334,16 @@ class FloatingBubbleController @Inject constructor(
             interpolator = DecelerateInterpolator()
             addUpdateListener { anim ->
                 params.x = anim.animatedValue as Int
-                runCatching { windowManager.updateViewLayout(view, params) }
+                runCatching { windowManager?.updateViewLayout(view, params) }
             }
             start()
         }
     }
 
     private fun getScreenBounds(dp: (Int) -> Int): Triple<Int, Int, Int> {
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            val metrics = windowManager.currentWindowMetrics
+        val wm = windowManager
+        return if (wm != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val metrics = wm.currentWindowMetrics
             val bounds = metrics.bounds
             val insets = metrics.windowInsets.getInsetsIgnoringVisibility(
                 android.view.WindowInsets.Type.statusBars() or android.view.WindowInsets.Type.displayCutout()
@@ -362,7 +372,7 @@ class FloatingBubbleController @Inject constructor(
         mainHandler.removeCallbacksAndMessages(null)
         snapAnimator?.cancel()
         rootView?.let { view ->
-            runCatching { windowManager.removeView(view) }
+            runCatching { windowManager?.removeView(view) }
         }
         rootView = null
         mainPill = null

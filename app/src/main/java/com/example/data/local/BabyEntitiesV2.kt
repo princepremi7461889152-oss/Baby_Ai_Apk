@@ -36,7 +36,14 @@ data class MemoryEntity(
     val createdAt: Long = System.currentTimeMillis()
 )
 
-@Entity(tableName = "action_logs")
+@Entity(
+    tableName = "action_logs",
+    indices = [
+        Index(value = ["timestamp"]),
+        Index(value = ["status"]),
+        Index(value = ["source"])
+    ]
+)
 data class ActionLogEntity(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
     val timestamp: Long = System.currentTimeMillis(),
@@ -49,7 +56,10 @@ data class ActionLogEntity(
     val source: String = "text" // "voice", "text", "routine", "auto-reply", "macro"
 )
 
-@Entity(tableName = "reminders")
+@Entity(
+    tableName = "reminders",
+    indices = [Index(value = ["isCompleted", "triggerAtMs"])]
+)
 data class ReminderEntity(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
     val title: String,

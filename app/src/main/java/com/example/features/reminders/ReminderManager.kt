@@ -10,6 +10,7 @@ import android.content.Intent
 import android.location.Geocoder
 import android.os.Build
 import com.example.core.security.SecureKeyStore
+import com.example.core.security.SensitiveDataSanitizer
 import com.example.data.local.ReminderDao
 import com.example.data.local.ReminderEntity
 import com.example.data.local.SavedPlaceDao
@@ -24,6 +25,7 @@ import com.google.android.gms.location.LocationServices
 import com.google.android.gms.location.Priority
 import com.google.android.gms.tasks.CancellationTokenSource
 import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -233,11 +235,12 @@ class ReminderManager @Inject constructor(
 
     suspend fun snoozeReminder(id: Long, minutes: Int = 10): String {
         val existing = reminderDao.getById(id) ?: return "Reminder #$id nahi mila."
-        val newTriggerMs = System.currentTimeMillis() + minutes.coerceIn(1, 1440) * 60_000L
+        val baseMs = maxOf(System.currentTimeMillis(), existing.triggerAtMs)
+        val newTriggerMs = baseMs + minutes.coerceIn(1, 1440) * 60_000L
         reminderDao.reschedule(id, newTriggerMs)
         scheduleAlarm(id, existing.title, newTriggerMs)
-        val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        nm.cancel(2000 + id.toInt())
+        val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+        nm?.cancel(2000 + id.toInt())
         val fmt = SimpleDateFormat("hh:mm a", Locale.getDefault())
         return "Reminder snoozed for $minutes min (${fmt.format(Date(newTriggerMs))}): \"${existing.title}\""
     }
@@ -381,7 +384,7 @@ class ReminderManager @Inject constructor(
         val timeReminders = reminderDao.getActiveTimeReminders()
         timeReminders.forEach { rem ->
             val targetMs = if (rem.triggerAtMs > now) rem.triggerAtMs else now + 15_000L
-            scheduleAlarm(rem.id, rem.title, targetMs)
+            runCatching { scheduleAlarm(rem.id, rem.title, targetMs) }
         }
         if (keyStore.settings.value.locationRemindersEnabled &&
             permissionHelper.hasPermission(Manifest.permission.ACCESS_FINE_LOCATION)
@@ -402,13 +405,15 @@ class ReminderManager @Inject constructor(
         if (key.isBlank()) return null
 
         val nowStr = SimpleDateFormat("yyyy-MM-dd HH:mm (EEEE)", Locale.ENGLISH).format(Date())
+        val safeRaw = SensitiveDataSanitizer.sanitizeForRemoteAi(rawText)
+        val safeHint = timeHint?.let { SensitiveDataSanitizer.sanitizeForRemoteAi(it) }
         val userPayload = buildString {
             appendLine("Current local datetime: $nowStr")
-            appendLine("User reminder input: $rawText")
-            if (!timeHint.isNullOrBlank()) appendLine("Time hint: $timeHint")
+            appendLine("User reminder input: $safeRaw")
+            if (!safeHint.isNullOrBlank()) appendLine("Time hint: $safeHint")
         }
 
-        return runCatching {
+        return try {
             val resp = groqApi.chatCompletions(
                 bearerAuth = "Bearer $key",
                 request = GroqChatRequest(
@@ -425,6 +430,7 @@ class ReminderManager @Inject constructor(
                     toolChoice = null
                 )
             )
+            if (!resp.isSuccessful) return null
             val content = resp.body()?.choices?.firstOrNull()?.message?.content?.trim() ?: return null
             val jsonStr = content.substringAfter('{', "").let { if (it.isNotEmpty()) "{$it" else content }
                 .substringBeforeLast('}', "")
@@ -448,7 +454,11 @@ class ReminderManager @Inject constructor(
                 delayMinutes = delay,
                 placeLabel = place
             )
-        }.getOrNull()
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (_: Exception) {
+            null
+        }
     }
 
     @SuppressLint("MissingPermission")
@@ -482,7 +492,7 @@ class ReminderManager @Inject constructor(
     }
 
     private fun scheduleAlarm(reminderId: Long, title: String, triggerAtMs: Long) {
-        val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+        val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as? AlarmManager ?: return
         val intent = Intent(context, ReminderAlarmReceiver::class.java).apply {
             action = ReminderAlarmReceiver.ACTION_FIRE_REMINDER
             putExtra("reminder_id", reminderId)
@@ -499,14 +509,20 @@ class ReminderManager @Inject constructor(
         } else true
 
         if (canExact) {
-            alarmManager.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAtMs, pi)
-        } else {
+            try {
+                alarmManager.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAtMs, pi)
+                return
+            } catch (_: SecurityException) {
+                // Exact alarm revoked while scheduling — degrade gracefully to inexact idle-safe alarm
+            }
+        }
+        runCatching {
             alarmManager.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAtMs, pi)
         }
     }
 
     private fun cancelAlarm(id: Long) {
-        val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+        val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as? AlarmManager ?: return
         val pi = PendingIntent.getBroadcast(
             context,
             id.toInt(),
@@ -515,7 +531,7 @@ class ReminderManager @Inject constructor(
             },
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
-        alarmManager.cancel(pi)
+        runCatching { alarmManager.cancel(pi) }
     }
 
     companion object {

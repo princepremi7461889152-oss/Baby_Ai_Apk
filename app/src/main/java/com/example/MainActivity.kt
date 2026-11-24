@@ -46,6 +46,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.fragment.app.FragmentActivity
@@ -93,7 +94,7 @@ import javax.inject.Inject
 
 private data class TopNavItem<T : Any>(
     val route: T,
-    val label: String,
+    val labelRes: Int,
     val selectedIcon: ImageVector,
     val unselectedIcon: ImageVector,
     val testTag: String
@@ -160,7 +161,7 @@ class MainActivity : FragmentActivity() {
         val startVoiceBool = intent?.getBooleanExtra(BabyQuickSettingsTileService.EXTRA_START_VOICE, false) == true
         val startVoiceStr = intent?.getStringExtra(BabyQuickSettingsTileService.EXTRA_START_VOICE) == "true"
         if (startVoiceBool || startVoiceStr) {
-            intent?.removeExtra(BabyQuickSettingsTileService.EXTRA_START_VOICE)
+            intent.removeExtra(BabyQuickSettingsTileService.EXTRA_START_VOICE)
             viewModel.toggleVoiceRecording()
         }
         val widgetCmd = intent?.getStringExtra(BabyWidgetProvider.EXTRA_WIDGET_COMMAND)
@@ -200,7 +201,9 @@ fun BabyAppRoot(
 
     val routines by extrasViewModel.routines.collectAsStateWithLifecycle()
     val memories by extrasViewModel.memories.collectAsStateWithLifecycle()
-    val actionLogs by extrasViewModel.actionLogs.collectAsStateWithLifecycle()
+    val actionLogTotalCount by extrasViewModel.actionLogTotalCount.collectAsStateWithLifecycle()
+    val availableActionApps by extrasViewModel.availableActionApps.collectAsStateWithLifecycle()
+    val actionLogFilter by extrasViewModel.actionLogFilter.collectAsStateWithLifecycle()
     val reminders by extrasViewModel.reminders.collectAsStateWithLifecycle()
     val savedPlaces by extrasViewModel.savedPlaces.collectAsStateWithLifecycle()
     val macros by extrasViewModel.macros.collectAsStateWithLifecycle()
@@ -257,10 +260,10 @@ fun BabyAppRoot(
     val reducedMotion = rememberReducedMotionEnabled()
 
     val navItems = listOf(
-        TopNavItem(ChatRoute, "Chat", Icons.Filled.ChatBubble, Icons.Outlined.ChatBubbleOutline, "nav_chat_tab"),
-        TopNavItem(ActionsRoute, "Actions", Icons.Filled.Bolt, Icons.Outlined.Bolt, "nav_actions_tab"),
-        TopNavItem(HistoryRoute, "History", Icons.Filled.History, Icons.Outlined.History, "nav_history_tab"),
-        TopNavItem(MoreRoute, "More", Icons.Filled.GridView, Icons.Outlined.GridView, "nav_more_tab")
+        TopNavItem(ChatRoute, R.string.nav_chat, Icons.Filled.ChatBubble, Icons.Outlined.ChatBubbleOutline, "nav_chat_tab"),
+        TopNavItem(ActionsRoute, R.string.nav_actions, Icons.Filled.Bolt, Icons.Outlined.Bolt, "nav_actions_tab"),
+        TopNavItem(HistoryRoute, R.string.nav_history, Icons.Filled.History, Icons.Outlined.History, "nav_history_tab"),
+        TopNavItem(MoreRoute, R.string.nav_more, Icons.Filled.GridView, Icons.Outlined.GridView, "nav_more_tab")
     )
 
     val isTopLevelDestination = currentDest == null ||
@@ -288,16 +291,23 @@ fun BabyAppRoot(
                     NavigationBar {
                         navItems.forEach { item ->
                             val selected = currentDest?.hasRoute(item.route::class) == true
+                            val label = stringResource(item.labelRes)
                             NavigationBarItem(
                                 selected = selected,
                                 onClick = { navigateTop(item.route) },
                                 icon = {
                                     Icon(
                                         imageVector = if (selected) item.selectedIcon else item.unselectedIcon,
-                                        contentDescription = item.label
+                                        contentDescription = label
                                     )
                                 },
-                                label = { Text(item.label, maxLines = 1) },
+                                label = {
+                                    Text(
+                                        text = label,
+                                        style = MaterialTheme.typography.labelMedium,
+                                        maxLines = 1
+                                    )
+                                },
                                 modifier = Modifier.testTag(item.testTag)
                             )
                         }
@@ -314,16 +324,23 @@ fun BabyAppRoot(
                     NavigationRail(modifier = Modifier.fillMaxHeight()) {
                         navItems.forEach { item ->
                             val selected = currentDest?.hasRoute(item.route::class) == true
+                            val label = stringResource(item.labelRes)
                             NavigationRailItem(
                                 selected = selected,
                                 onClick = { navigateTop(item.route) },
                                 icon = {
                                     Icon(
                                         imageVector = if (selected) item.selectedIcon else item.unselectedIcon,
-                                        contentDescription = item.label
+                                        contentDescription = label
                                     )
                                 },
-                                label = { Text(item.label, maxLines = 1) },
+                                label = {
+                                    Text(
+                                        text = label,
+                                        style = MaterialTheme.typography.labelMedium,
+                                        maxLines = 1
+                                    )
+                                },
                                 modifier = Modifier.testTag(item.testTag)
                             )
                         }
@@ -399,6 +416,7 @@ fun BabyAppRoot(
                             onSpeakMessage = viewModel::speakMessage,
                             onDismissApiKeyBanner = viewModel::dismissApiKeyBanner,
                             onDismissRateLimitBanner = viewModel::dismissRateLimitBanner,
+                            onDismissError = viewModel::clearAgentError,
                             onToggleQuickCommandPin = viewModel::toggleQuickCommandPin,
                             onEditQuickCommandPhrase = viewModel::updateQuickCommandPhrase,
                             onWakeWordToggle = viewModel::setWakeWordEnabled,
@@ -443,7 +461,11 @@ fun BabyAppRoot(
                     composable<HistoryRoute> {
                         HistoryScreen(
                             taskRuns = taskRuns,
-                            actionLogs = actionLogs,
+                            pagedActionLogsFlow = extrasViewModel.pagedActionLogs,
+                            totalActionLogCount = actionLogTotalCount,
+                            availableActionApps = availableActionApps,
+                            externalActionFilter = actionLogFilter,
+                            onActionFilterChange = extrasViewModel::updateActionLogFilter,
                             dismissedTaskIds = uiPrefs.dismissedTaskRunIds,
                             dismissedLogIds = uiPrefs.dismissedActionLogIds,
                             isRefreshing = isRefreshing,
@@ -467,7 +489,7 @@ fun BabyAppRoot(
                             settings = settings,
                             permissions = permissions,
                             emergencyContactsCount = emergencyContacts.size,
-                            actionLogsCount = actionLogs.size,
+                            actionLogsCount = actionLogTotalCount,
                             memoriesCount = memories.size,
                             onOpenSettings = { sec -> navController.navigate(SettingsRoute(initialSection = sec)) },
                             onOpenPermissions = { navController.navigate(PermissionsRoute) },

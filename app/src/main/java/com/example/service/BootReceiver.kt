@@ -30,7 +30,7 @@ class BootReceiver : BroadcastReceiver() {
             action == Intent.ACTION_MY_PACKAGE_REPLACED
         ) {
             runCatching {
-                BabyForegroundService.start(ctx)
+                BabyForegroundService.start(ctx, fromBoot = true)
             }
             val pending = goAsync()
             CoroutineScope(Dispatchers.IO).launch {

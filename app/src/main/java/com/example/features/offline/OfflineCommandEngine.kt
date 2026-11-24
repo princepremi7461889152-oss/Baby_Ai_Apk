@@ -74,18 +74,19 @@ class OfflineCommandEngine @Inject constructor(
 
         // 4. Brightness
         if (lower.contains("brightness") || lower.contains("roshni")) {
-            val percent = Regex("""(\d{1,3})\s*%?""").find(lower)?.groupValues?.get(1)?.toIntOrNull()
+            val rawPercent = Regex("""(\d{1,3})\s*%?""").find(lower)?.groupValues?.get(1)?.toIntOrNull()
                 ?: when {
                     lower.contains("low") || lower.contains("kam") || lower.contains("dim") -> 20
                     lower.contains("full") || lower.contains("high") || lower.contains("max") -> 95
                     else -> 50
                 }
-            val res = executor.execute("set_brightness", mapOf("level_percent" to percent.coerceIn(5, 100)))
+            val clamped = rawPercent.coerceIn(5, 100)
+            val res = executor.execute("set_brightness", mapOf("level_percent" to clamped))
             return OfflineMatchResult(
                 "set_brightness",
-                mapOf("level_percent" to percent),
+                mapOf("level_percent" to clamped),
                 res,
-                if (res.ok) "Brightness $percent% set kar di hai." else res.output
+                if (res.ok) "Brightness $clamped% set kar di hai." else res.output
             )
         }
 
@@ -145,7 +146,7 @@ class OfflineCommandEngine @Inject constructor(
     }
 
     private fun currentVolumePercent(): Int {
-        val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return 50
         val cur = am.getStreamVolume(AudioManager.STREAM_MUSIC)
         val max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
         return ((cur.toFloat() / max) * 100f).toInt()

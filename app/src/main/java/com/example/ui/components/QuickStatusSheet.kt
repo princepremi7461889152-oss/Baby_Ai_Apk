@@ -13,12 +13,12 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.DataSaverOn
 import androidx.compose.material.icons.filled.MarkChatRead
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MusicNote
-import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
@@ -145,7 +145,7 @@ fun QuickStatusSheet(
             )
 
             QuickToggleRow(
-                icon = Icons.Default.VolumeUp,
+                icon = Icons.AutoMirrored.Filled.VolumeUp,
                 title = "Speak Replies Aloud (TTS)",
                 subtitle = "Voice answers in ${settings.preferredLanguage.displayName}",
                 checked = settings.ttsRepliesEnabled,

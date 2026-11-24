@@ -18,7 +18,7 @@ import androidx.room.RoomDatabase
         EmergencyContactEntity::class,
         SavedPlaceEntity::class
     ],
-    version = 4,
+    version = 5,
     exportSchema = false
 )
 abstract class BabyDatabase : RoomDatabase() {
