@@ -10,13 +10,15 @@ data class GroqChatRequest(
     val tools: List<GroqTool>? = null,
     @Json(name = "tool_choice") val toolChoice: String? = "auto",
     val temperature: Double = 0.35,
-    @Json(name = "max_tokens") val maxTokens: Int = 1024
+    @Json(name = "max_tokens") val maxTokens: Int = 2048
 )
 
 @JsonClass(generateAdapter = true)
 data class GroqMessage(
     val role: String,
     val content: String? = null,
+    val reasoning: String? = null,
+    @Json(name = "reasoning_content") val reasoningContent: String? = null,
     @Json(name = "tool_calls") val toolCalls: List<GroqToolCall>? = null,
     @Json(name = "tool_call_id") val toolCallId: String? = null,
     val name: String? = null
@@ -37,15 +39,15 @@ data class GroqFunctionSpec(
 
 @JsonClass(generateAdapter = true)
 data class GroqToolCall(
-    val id: String,
-    val type: String = "function",
-    val function: GroqFunctionCallPayload
+    val id: String? = null,
+    val type: String? = "function",
+    val function: GroqFunctionCallPayload? = null
 )
 
 @JsonClass(generateAdapter = true)
 data class GroqFunctionCallPayload(
-    val name: String,
-    val arguments: String
+    val name: String? = null,
+    val arguments: String? = null
 )
 
 @JsonClass(generateAdapter = true)
@@ -74,4 +76,16 @@ data class GroqTranscriptionResponse(
     val text: String = "",
     val language: String? = null,
     val duration: Double? = null
+)
+
+@JsonClass(generateAdapter = true)
+data class GroqModelsListResponse(
+    val data: List<GroqModelInfo>? = null
+)
+
+@JsonClass(generateAdapter = true)
+data class GroqModelInfo(
+    val id: String? = null,
+    @Json(name = "owned_by") val ownedBy: String? = null,
+    val active: Boolean? = null
 )

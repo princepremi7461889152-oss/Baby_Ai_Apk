@@ -11,16 +11,18 @@ import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
 import com.example.MainActivity
 import com.example.R
+import com.example.core.security.GroqModelRole
 import com.example.core.security.SecureKeyStore
 import com.example.core.security.SensitiveDataSanitizer
 import com.example.data.remote.GroqApiService
 import com.example.data.remote.GroqChatRequest
 import com.example.data.remote.GroqMessage
+import com.example.domain.ai.AiResilienceHelper
+import com.example.domain.ai.AiResponseParser
 import com.example.service.BabyNotificationListenerService
 import com.example.service.CachedNotification
 import com.example.voice.BabyTtsManager
 import dagger.hilt.android.qualifiers.ApplicationContext
-import kotlinx.coroutines.CancellationException
 import java.util.Calendar
 import java.util.concurrent.TimeUnit
 import javax.inject.Inject
@@ -112,11 +114,15 @@ class NotificationSummaryManager @Inject constructor(
 
         val safeRemotePayload = SensitiveDataSanitizer.sanitizeForRemoteAi(structuredInput)
         val summary = if (!settings.dataSaverEnabled && settings.groqApiKey.isNotBlank()) {
-            try {
-                val resp = groqApi.chatCompletions(
-                    bearerAuth = "Bearer ${settings.groqApiKey.trim()}",
-                    request = GroqChatRequest(
-                        model = settings.groqModel,
+            AiResilienceHelper.executeGroqChatWithRecovery(
+                groqApi = groqApi,
+                keyStore = keyStore,
+                key = settings.groqApiKey.trim(),
+                initialModel = settings.modelConfig.fastModel,
+                role = GroqModelRole.FAST,
+                requestBuilder = { modelId ->
+                    GroqChatRequest(
+                        model = modelId,
                         messages = listOf(
                             GroqMessage(
                                 role = "system",
@@ -127,15 +133,10 @@ class NotificationSummaryManager @Inject constructor(
                         tools = null,
                         toolChoice = null
                     )
-                )
-                if (resp.isSuccessful) {
-                    resp.body()?.choices?.firstOrNull()?.message?.content?.trim()?.takeIf { it.isNotBlank() }
-                } else null
-            } catch (ce: CancellationException) {
-                throw ce
-            } catch (_: Exception) {
-                null
-            } ?: formatLocalSummary(orderedByBucketAndApp, allowSensitive)
+                }
+            ).getOrNull()?.value?.choices?.firstOrNull()?.message?.content
+                ?.let { AiResponseParser.stripReasoning(it) }
+                ?: formatLocalSummary(orderedByBucketAndApp, allowSensitive)
         } else {
             formatLocalSummary(orderedByBucketAndApp, allowSensitive)
         }

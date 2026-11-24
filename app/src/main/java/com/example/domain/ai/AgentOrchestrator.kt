@@ -56,7 +56,9 @@ data class AgentExecutionState(
     val statusText: String = "Ready",
     val pendingConfirmation: ConfirmationRequest? = null,
     val queuedCount: Int = 0,
-    val lastError: String? = null
+    val lastError: String? = null,
+    val lastErrorDetails: String? = null,
+    val oneTimeNotice: String? = null
 ) {
     companion object {
         const val MAX_STEPS = 15
@@ -100,7 +102,11 @@ class AgentOrchestrator @Inject constructor(
     }
 
     fun clearLastError() {
-        _state.value = _state.value.copy(lastError = null)
+        _state.value = _state.value.copy(lastError = null, lastErrorDetails = null)
+    }
+
+    fun clearOneTimeNotice() {
+        _state.value = _state.value.copy(oneTimeNotice = null)
     }
 
     fun submitUserCommand(
@@ -131,6 +137,7 @@ class AgentOrchestrator @Inject constructor(
             currentStep = 0,
             statusText = "Starting...",
             lastError = null,
+            lastErrorDetails = null,
             pendingConfirmation = null
         )
 
@@ -140,10 +147,17 @@ class AgentOrchestrator @Inject constructor(
     }
 
     suspend fun handleVoiceWav(wavBytes: ByteArray): String? {
-        _state.value = _state.value.copy(statusText = "Whisper se samajh rahi hoon...", lastError = null)
+        _state.value = _state.value.copy(
+            statusText = "Whisper se samajh rahi hoon...",
+            lastError = null,
+            lastErrorDetails = null
+        )
         val res = aiRouter.transcribeAudio(wavBytes)
         return res.fold(
             onSuccess = { transcript ->
+                if (!transcript.modelSwitchedNotice.isNullOrBlank()) {
+                    _state.value = _state.value.copy(oneTimeNotice = transcript.modelSwitchedNotice)
+                }
                 if (transcript.text.isBlank()) {
                     _state.value = _state.value.copy(statusText = "Kuch sunai nahi diya")
                     null
@@ -151,7 +165,10 @@ class AgentOrchestrator @Inject constructor(
                     SafetyManager.isEmergencyCancelCommand(transcript.text)
                 ) {
                     safetyManager.cancelEmergencyCountdown("Voice cancel: ${transcript.text}")
-                    _state.value = AgentExecutionState(statusText = "SOS Cancelled")
+                    _state.value = AgentExecutionState(
+                        statusText = "SOS Cancelled",
+                        oneTimeNotice = _state.value.oneTimeNotice
+                    )
                     transcript.text
                 } else if (WakeWordDetector.isStopCommand(transcript.text)) {
                     stopCurrentTask("Voice: Baby stop")
@@ -168,15 +185,27 @@ class AgentOrchestrator @Inject constructor(
             onFailure = { err ->
                 if (err is CancellationException) throw err
                 val settings = keyStore.settings.value
-                val safeErr = SensitiveDataSanitizer.sanitizeError(err.message, settings.groqApiKey, settings.geminiApiKey)
+                val failure = (err as? AiCallException)?.failure
+                val friendlyErr = failure?.userMessage ?: SensitiveDataSanitizer.sanitizeError(
+                    err.message ?: "Voice transcribe nahi ho paya",
+                    settings.groqApiKey,
+                    settings.geminiApiKey
+                )
+                val techDetails = failure?.technicalDetails ?: friendlyErr
                 historyRepository.addMessage(
                     ChatMessageEntity(
                         role = "assistant",
-                        content = "Voice transcribe nahi ho paya: $safeErr",
-                        brainUsed = "local"
+                        content = friendlyErr,
+                        brainUsed = "local",
+                        toolName = "ai_error",
+                        toolResult = techDetails
                     )
                 )
-                _state.value = _state.value.copy(statusText = "Ready", lastError = safeErr)
+                _state.value = _state.value.copy(
+                    statusText = "Error",
+                    lastError = friendlyErr,
+                    lastErrorDetails = techDetails
+                )
                 null
             }
         )
@@ -337,6 +366,7 @@ class AgentOrchestrator @Inject constructor(
 
         var finalReply = ""
         var stepFailedError: String? = null
+        var stepFailedErrorDetails: String? = null
         var lastStepCompleted = 0
 
         try {
@@ -356,12 +386,10 @@ class AgentOrchestrator @Inject constructor(
                     }
                 } else null
 
-                _state.value = AgentExecutionState(
+                _state.value = _state.value.copy(
                     isRunning = true,
                     currentStep = step + 1,
-                    activeBrain = _state.value.activeBrain,
-                    statusText = "Soch rahi hoon (${step + 1}/15)...",
-                    queuedCount = _state.value.queuedCount
+                    statusText = "Soch rahi hoon (${step + 1}/15)..."
                 )
 
                 val planRes = aiRouter.planNextStep(
@@ -377,32 +405,85 @@ class AgentOrchestrator @Inject constructor(
 
                 if (planRes.isFailure) {
                     val curKeys = keyStore.settings.value
-                    val errMsg = SensitiveDataSanitizer.sanitizeError(
-                        planRes.exceptionOrNull()?.message ?: "AI error",
+                    val err = planRes.exceptionOrNull()
+                    val failure = (err as? AiCallException)?.failure
+
+                    // Try offline fallback when cloud providers fail on supported device commands
+                    if (step == 0) {
+                        val offlineMatch = offlineCommandEngine.tryExecuteOffline(command, fallbackMode = true)
+                        if (offlineMatch != null) {
+                            actionLogRepository.record(
+                                commandText = command,
+                                toolName = offlineMatch.toolName,
+                                argsSummary = offlineMatch.args.toString(),
+                                resultText = offlineMatch.executionResult.output,
+                                targetApp = offlineMatch.args["app_name"]?.toString().orEmpty(),
+                                status = if (offlineMatch.executionResult.ok) "OK" else "ERR",
+                                source = "offline_fallback"
+                            )
+                            if (offlineMatch.toolName == "open_app" && offlineMatch.executionResult.ok) {
+                                memoryManager.recordAppUsageHabit(offlineMatch.args["app_name"]?.toString().orEmpty())
+                            }
+                            finalReply = "Cloud AI abhi available nahi hai, isliye offline mode mein handle kar diya: ${offlineMatch.friendlyReply}"
+                            historyRepository.addMessage(
+                                ChatMessageEntity(
+                                    role = "assistant",
+                                    content = finalReply,
+                                    brainUsed = "local"
+                                )
+                            )
+                            historyRepository.updateTaskRun(
+                                id = taskId,
+                                status = "COMPLETED",
+                                stepsCount = step + 1,
+                                brainSummary = "Offline Fallback",
+                                finalReply = finalReply,
+                                stepLogsJson = stepLogs.toString(),
+                                finishedAt = System.currentTimeMillis()
+                            )
+                            speakIfEnabled(finalReply, languageHint)
+                            updateWidgetLastTask(command, finalReply)
+                            return
+                        }
+                    }
+
+                    val friendlyMsg = failure?.userMessage ?: SensitiveDataSanitizer.sanitizeError(
+                        err?.message ?: "AI abhi jawab nahi de pa rahi hai. Retry karo ya Settings > AI Models check karo.",
                         curKeys.groqApiKey,
                         curKeys.geminiApiKey
                     )
-                    stepFailedError = errMsg
-                    finalReply = "Oops, issue aa gaya: $errMsg"
+                    val techDetails = failure?.technicalDetails ?: friendlyMsg
+                    stepFailedError = friendlyMsg
+                    stepFailedErrorDetails = techDetails
+                    finalReply = friendlyMsg
                     historyRepository.addMessage(
-                        ChatMessageEntity(role = "assistant", content = finalReply, brainUsed = "local")
+                        ChatMessageEntity(
+                            role = "assistant",
+                            content = friendlyMsg,
+                            brainUsed = "local",
+                            toolName = "ai_error",
+                            toolResult = techDetails
+                        )
                     )
                     historyRepository.updateTaskRun(
                         id = taskId,
                         status = "FAILED",
                         stepsCount = step + 1,
                         brainSummary = brainsUsed.joinToString(", "),
-                        finalReply = finalReply,
+                        finalReply = friendlyMsg,
                         stepLogsJson = stepLogs.toString(),
                         finishedAt = System.currentTimeMillis()
                     )
-                    speakIfEnabled(finalReply, languageHint)
+                    speakIfEnabled(friendlyMsg, languageHint)
                     return
                 }
 
                 val plan = planRes.getOrThrow()
                 brainsUsed.add(plan.brainUsed.label)
-                _state.value = _state.value.copy(activeBrain = plan.brainUsed)
+                _state.value = _state.value.copy(
+                    activeBrain = plan.brainUsed,
+                    oneTimeNotice = plan.modelSwitchedNotice ?: _state.value.oneTimeNotice
+                )
 
                 if (plan.toolCalls.isEmpty()) {
                     finalReply = plan.replyText ?: "Ho gaya!"
@@ -612,19 +693,32 @@ class AgentOrchestrator @Inject constructor(
             throw ce
         } catch (t: Throwable) {
             val curKeys = keyStore.settings.value
-            val safeErr = SensitiveDataSanitizer.sanitizeError(t.message, curKeys.groqApiKey, curKeys.geminiApiKey)
+            val failure = (t as? AiCallException)?.failure
+            val safeErr = failure?.userMessage ?: SensitiveDataSanitizer.sanitizeError(
+                t.message ?: "Task complete nahi ho paya. Retry karo.",
+                curKeys.groqApiKey,
+                curKeys.geminiApiKey
+            )
+            val details = failure?.technicalDetails ?: safeErr
             stepFailedError = safeErr
-            finalReply = "Task ruk gaya: $safeErr"
+            stepFailedErrorDetails = details
+            finalReply = safeErr
             withContext(NonCancellable) {
                 historyRepository.addMessage(
-                    ChatMessageEntity(role = "assistant", content = finalReply, brainUsed = "local")
+                    ChatMessageEntity(
+                        role = "assistant",
+                        content = safeErr,
+                        brainUsed = "local",
+                        toolName = "ai_error",
+                        toolResult = details
+                    )
                 )
                 historyRepository.updateTaskRun(
                     id = taskId,
                     status = "FAILED",
                     stepsCount = lastStepCompleted,
                     brainSummary = brainsUsed.joinToString(" -> "),
-                    finalReply = finalReply,
+                    finalReply = safeErr,
                     stepLogsJson = stepLogs.toString(),
                     finishedAt = System.currentTimeMillis()
                 )
@@ -635,7 +729,9 @@ class AgentOrchestrator @Inject constructor(
                 _state.value = AgentExecutionState(
                     statusText = if (stepFailedError != null) "Error" else "Ready",
                     queuedCount = _state.value.queuedCount,
-                    lastError = stepFailedError
+                    lastError = stepFailedError,
+                    lastErrorDetails = stepFailedErrorDetails,
+                    oneTimeNotice = _state.value.oneTimeNotice
                 )
             }
         }

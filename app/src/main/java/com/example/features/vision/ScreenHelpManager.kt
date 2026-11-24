@@ -1,5 +1,6 @@
 package com.example.features.vision
 
+import com.example.core.security.GroqModelRole
 import com.example.core.security.SecureKeyStore
 import com.example.core.security.SensitiveDataSanitizer
 import com.example.data.remote.GeminiApiService
@@ -10,11 +11,12 @@ import com.example.data.remote.GeminiPart
 import com.example.data.remote.GroqApiService
 import com.example.data.remote.GroqChatRequest
 import com.example.data.remote.GroqMessage
+import com.example.domain.ai.AiResilienceHelper
+import com.example.domain.ai.AiResponseParser
 import com.example.domain.tools.ToolExecutionResult
 import com.example.features.safety.SafetyManager
 import com.example.service.BabyAccessibilityService
 import com.example.util.PermissionHelper
-import kotlinx.coroutines.CancellationException
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -110,11 +112,15 @@ class ScreenHelpManager @Inject constructor(
         val userContent = SensitiveDataSanitizer.sanitizeForRemoteAi("$taskPrompt\n\nVisible Screen Content:\n$screenText")
 
         if (settings.groqApiKey.isNotBlank()) {
-            val groqAns = try {
-                val resp = groqApi.chatCompletions(
-                    bearerAuth = "Bearer ${settings.groqApiKey.trim()}",
-                    request = GroqChatRequest(
-                        model = settings.groqModel,
+            val groqAns = AiResilienceHelper.executeGroqChatWithRecovery(
+                groqApi = groqApi,
+                keyStore = keyStore,
+                key = settings.groqApiKey.trim(),
+                initialModel = settings.modelConfig.fastModel,
+                role = GroqModelRole.FAST,
+                requestBuilder = { modelId ->
+                    GroqChatRequest(
+                        model = modelId,
                         messages = listOf(
                             GroqMessage(
                                 role = "system",
@@ -125,40 +131,25 @@ class ScreenHelpManager @Inject constructor(
                         tools = null,
                         toolChoice = null
                     )
-                )
-                if (resp.isSuccessful) {
-                    resp.body()?.choices?.firstOrNull()?.message?.content?.trim()
-                } else null
-            } catch (ce: CancellationException) {
-                throw ce
-            } catch (_: Exception) {
-                null
-            }
+                }
+            ).getOrNull()?.value?.choices?.firstOrNull()?.message?.content
+                ?.let { AiResponseParser.stripReasoning(it) }
             if (!groqAns.isNullOrBlank()) return groqAns
         }
 
         if (settings.geminiApiKey.isNotBlank()) {
-            return try {
-                val resp = geminiApi.generateContent(
-                    model = settings.geminiModel,
-                    apiKey = settings.geminiApiKey.trim(),
-                    request = GeminiGenerateRequest(
-                        systemInstruction = GeminiContent(
-                            parts = listOf(GeminiPart(text = "You are Baby. Answer concisely in friendly Hinglish."))
-                        ),
-                        contents = listOf(GeminiContent(role = "user", parts = listOf(GeminiPart(text = userContent))))
-                    )
+            return AiResilienceHelper.executeGeminiWithRetry(
+                geminiApi = geminiApi,
+                key = settings.geminiApiKey.trim(),
+                model = settings.modelConfig.geminiModel,
+                request = GeminiGenerateRequest(
+                    systemInstruction = GeminiContent(
+                        parts = listOf(GeminiPart(text = "You are Baby. Answer concisely in friendly Hinglish."))
+                    ),
+                    contents = listOf(GeminiContent(role = "user", parts = listOf(GeminiPart(text = userContent))))
                 )
-                if (resp.isSuccessful) {
-                    resp.body()?.candidates?.firstOrNull()?.content?.parts
-                        ?.mapNotNull { it.text }?.joinToString("\n")?.trim()
-                        ?.takeIf { it.isNotBlank() }
-                } else null
-            } catch (ce: CancellationException) {
-                throw ce
-            } catch (_: Exception) {
-                null
-            }
+            ).getOrNull()?.candidates?.firstOrNull()?.content?.parts
+                ?.let { AiResilienceHelper.extractGeminiVisibleText(it) }
         }
         return null
     }
@@ -168,37 +159,28 @@ class ScreenHelpManager @Inject constructor(
         val key = settings.geminiApiKey.trim()
         if (key.isBlank()) return null
 
-        return try {
-            val resp = geminiApi.generateContent(
-                model = settings.geminiModel,
-                apiKey = key,
-                request = GeminiGenerateRequest(
-                    systemInstruction = GeminiContent(
+        return AiResilienceHelper.executeGeminiWithRetry(
+            geminiApi = geminiApi,
+            key = key,
+            model = settings.modelConfig.geminiModel,
+            request = GeminiGenerateRequest(
+                systemInstruction = GeminiContent(
+                    parts = listOf(
+                        GeminiPart(text = "You are Baby, a friendly Hinglish assistant. Explain, translate, or summarize what is shown on the user's phone screen concisely.")
+                    )
+                ),
+                contents = listOf(
+                    GeminiContent(
+                        role = "user",
                         parts = listOf(
-                            GeminiPart(text = "You are Baby, a friendly Hinglish assistant. Explain, translate, or summarize what is shown on the user's phone screen concisely.")
-                        )
-                    ),
-                    contents = listOf(
-                        GeminiContent(
-                            role = "user",
-                            parts = listOf(
-                                GeminiPart(text = SensitiveDataSanitizer.sanitizeForRemoteAi(prompt)),
-                                GeminiPart(inlineData = GeminiInlineData("image/jpeg", jpegBase64))
-                            )
+                            GeminiPart(text = SensitiveDataSanitizer.sanitizeForRemoteAi(prompt)),
+                            GeminiPart(inlineData = GeminiInlineData("image/jpeg", jpegBase64))
                         )
                     )
                 )
             )
-            if (resp.isSuccessful) {
-                resp.body()?.candidates?.firstOrNull()?.content?.parts
-                    ?.mapNotNull { it.text }?.joinToString("\n")?.trim()
-                    ?.takeIf { it.isNotBlank() }
-            } else null
-        } catch (ce: CancellationException) {
-            throw ce
-        } catch (_: Exception) {
-            null
-        }
+        ).getOrNull()?.candidates?.firstOrNull()?.content?.parts
+            ?.let { AiResilienceHelper.extractGeminiVisibleText(it) }
     }
 
     private fun buildTaskInstruction(mode: String, targetLang: String, extraQuestion: String?): String {

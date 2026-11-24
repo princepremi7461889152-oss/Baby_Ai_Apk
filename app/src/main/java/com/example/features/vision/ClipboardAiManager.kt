@@ -2,6 +2,7 @@ package com.example.features.vision
 
 import android.content.ClipboardManager
 import android.content.Context
+import com.example.core.security.GroqModelRole
 import com.example.core.security.SecureKeyStore
 import com.example.core.security.SensitiveDataSanitizer
 import com.example.data.remote.GeminiApiService
@@ -11,10 +12,11 @@ import com.example.data.remote.GeminiPart
 import com.example.data.remote.GroqApiService
 import com.example.data.remote.GroqChatRequest
 import com.example.data.remote.GroqMessage
+import com.example.domain.ai.AiResilienceHelper
+import com.example.domain.ai.AiResponseParser
 import com.example.domain.tools.ToolExecutionResult
 import com.example.voice.BabyTtsManager
 import dagger.hilt.android.qualifiers.ApplicationContext
-import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import javax.inject.Inject
@@ -97,11 +99,15 @@ class ClipboardAiManager @Inject constructor(
         val settings = keyStore.settings.value
         val key = settings.groqApiKey.trim()
         if (key.isBlank()) return null
-        return try {
-            val resp = groqApi.chatCompletions(
-                bearerAuth = "Bearer $key",
-                request = GroqChatRequest(
-                    model = settings.groqModel,
+        return AiResilienceHelper.executeGroqChatWithRecovery(
+            groqApi = groqApi,
+            keyStore = keyStore,
+            key = key,
+            initialModel = settings.modelConfig.fastModel,
+            role = GroqModelRole.FAST,
+            requestBuilder = { modelId ->
+                GroqChatRequest(
+                    model = modelId,
                     messages = listOf(
                         GroqMessage(
                             role = "system",
@@ -112,42 +118,27 @@ class ClipboardAiManager @Inject constructor(
                     tools = null,
                     toolChoice = null
                 )
-            )
-            if (resp.isSuccessful) {
-                resp.body()?.choices?.firstOrNull()?.message?.content?.trim()?.takeIf { it.isNotBlank() }
-            } else null
-        } catch (ce: CancellationException) {
-            throw ce
-        } catch (_: Exception) {
-            null
-        }
+            }
+        ).getOrNull()?.value?.choices?.firstOrNull()?.message?.content
+            ?.let { AiResponseParser.stripReasoning(it) }
     }
 
     private suspend fun callGeminiText(prompt: String): String? {
         val settings = keyStore.settings.value
         val key = settings.geminiApiKey.trim()
         if (key.isBlank()) return null
-        return try {
-            val resp = geminiApi.generateContent(
-                model = settings.geminiModel,
-                apiKey = key,
-                request = GeminiGenerateRequest(
-                    systemInstruction = GeminiContent(
-                        parts = listOf(GeminiPart(text = "You are Baby, a friendly Hinglish phone assistant."))
-                    ),
-                    contents = listOf(GeminiContent(role = "user", parts = listOf(GeminiPart(text = prompt))))
-                )
+        return AiResilienceHelper.executeGeminiWithRetry(
+            geminiApi = geminiApi,
+            key = key,
+            model = settings.modelConfig.geminiModel,
+            request = GeminiGenerateRequest(
+                systemInstruction = GeminiContent(
+                    parts = listOf(GeminiPart(text = "You are Baby, a friendly Hinglish phone assistant."))
+                ),
+                contents = listOf(GeminiContent(role = "user", parts = listOf(GeminiPart(text = prompt))))
             )
-            if (resp.isSuccessful) {
-                resp.body()?.candidates?.firstOrNull()?.content?.parts
-                    ?.mapNotNull { it.text }?.joinToString("\n")?.trim()
-                    ?.takeIf { it.isNotBlank() }
-            } else null
-        } catch (ce: CancellationException) {
-            throw ce
-        } catch (_: Exception) {
-            null
-        }
+        ).getOrNull()?.candidates?.firstOrNull()?.content?.parts
+            ?.let { AiResilienceHelper.extractGeminiVisibleText(it) }
     }
 
     companion object {

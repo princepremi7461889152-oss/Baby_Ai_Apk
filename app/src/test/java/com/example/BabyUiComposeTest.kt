@@ -17,6 +17,7 @@ import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performScrollToNode
 import androidx.compose.ui.test.performTextInput
 import androidx.compose.ui.unit.Density
+import com.example.core.security.AiModelConfig
 import com.example.core.security.BabySettings
 import com.example.data.local.ActionLogEntity
 import com.example.data.local.ChatMessageEntity
@@ -35,6 +36,8 @@ import com.example.ui.screens.PermissionsScreen
 import com.example.ui.screens.RemindersScreen
 import com.example.ui.screens.SettingsScreen
 import com.example.ui.state.BabyUiPreferences
+import com.example.ui.state.ModelTestItem
+import com.example.ui.state.ModelsTestUiState
 import com.example.ui.theme.BabyTheme
 import com.example.ui.theme.BabyThemeMode
 import com.example.ui.viewmodel.BabyHeaderStatus
@@ -435,6 +438,63 @@ class BabyUiComposeTest {
     }
 
     @Test
+    fun `settings AI Models section displays editable fields, live models refresh, and Test models results`() {
+        var refreshedKey: String? = null
+        var testedConfig: AiModelConfig? = null
+        composeRule.setContent {
+            BabyTheme(themeMode = BabyThemeMode.DARK) {
+                SettingsScreen(
+                    settings = BabySettings(groqApiKey = "gsk_test", geminiApiKey = "AIzaTest"),
+                    permissions = testPermissions(true),
+                    oemGuide = OemAutostartGuide("Pixel", listOf("None"), emptyList()),
+                    permissionHelper = null,
+                    initialSection = "ai",
+                    liveGroqModels = listOf("openai/gpt-oss-120b", "qwen/qwen3.6-27b"),
+                    modelsTestState = ModelsTestUiState(
+                        isTesting = false,
+                        items = listOf(
+                            ModelTestItem("Chat / Tools", "openai/gpt-oss-120b", true, "Pass (HTTP 200)"),
+                            ModelTestItem("Gemini Flash", "gemini-2.5-flash", false, "Fail (HTTP 503)")
+                        )
+                    ),
+                    onRefreshPermissions = {},
+                    onSaveKeys = { _, _ -> },
+                    onClearKeys = {},
+                    onGeminiModelChange = {},
+                    onGroqModelChange = {},
+                    onRefreshLiveGroqModels = { refreshedKey = it },
+                    onTestAllModels = { cfg, _, _ -> testedConfig = cfg },
+                    onPreferredBrainChange = {},
+                    onAutoFallbackChange = {},
+                    onWakeWordToggle = {},
+                    onSensitivityChange = {},
+                    onLanguageChange = {},
+                    onConfirmSensitiveToggle = {},
+                    onTtsRepliesToggle = {},
+                    onFloatingBubbleToggle = {},
+                    onReopenOnboarding = {}
+                )
+            }
+        }
+
+        composeRule.waitForIdle()
+        composeRule.onNodeWithTag("settings_chat_model_input").performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithTag("settings_fast_model_input").performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithTag("settings_stt_model_input").performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithTag("settings_gemini_model_input").performScrollTo().assertIsDisplayed()
+
+        composeRule.onNodeWithTag("load_live_groq_models_button").performScrollTo().performClick()
+        assertEquals("gsk_test", refreshedKey)
+
+        composeRule.onNodeWithTag("test_models_button").performScrollTo().performClick()
+        assertEquals(AiModelConfig.DEFAULT_CHAT_MODEL, testedConfig?.chatModel)
+
+        composeRule.onNodeWithTag("models_test_results").performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithText("Pass (HTTP 200)").performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithText("Fail (HTTP 503)").performScrollTo().assertIsDisplayed()
+    }
+
+    @Test
     fun `more screen provides direct entry points to routines, commands, macros, reminders, and memory`() {
         var openedRoutinesTab = -1
         var openedReminders = false
@@ -481,15 +541,27 @@ class BabyUiComposeTest {
     }
 
     @Test
-    fun `chat screen renders error banner retry and dismiss and 1000-message feed without lag`() {
+    fun `chat screen renders error banner retry, open ai settings, collapsible details, and chat error bubble details`() {
         var retriedCmd: String? = null
         var dismissed = false
+        var openedAiSettings = false
         val largeMessages = List(1000) { idx ->
-            ChatMessageEntity(
-                id = idx + 1L,
-                role = if (idx % 2 == 0) "user" else "assistant",
-                content = if (idx == 998) "Last command" else "Message #$idx"
-            )
+            when (idx) {
+                998 -> ChatMessageEntity(id = idx + 1L, role = "user", content = "Last command")
+                999 -> ChatMessageEntity(
+                    id = idx + 1L,
+                    role = "assistant",
+                    content = "Groq server abhi busy hai (503). Retry karo ya Settings > AI Models check karo.",
+                    brainUsed = "local",
+                    toolName = "ai_error",
+                    toolResult = "Provider: Groq | Model: openai/gpt-oss-120b | HTTP: 503"
+                )
+                else -> ChatMessageEntity(
+                    id = idx + 1L,
+                    role = if (idx % 2 == 0) "user" else "assistant",
+                    content = "Message #$idx"
+                )
+            }
         }
         composeRule.setContent {
             BabyTheme(themeMode = BabyThemeMode.LIGHT) {
@@ -497,7 +569,8 @@ class BabyUiComposeTest {
                     messages = largeMessages,
                     agentState = AgentExecutionState(
                         isRunning = false,
-                        lastError = "Groq request timed out."
+                        lastError = "Groq model abhi available nahi hai.",
+                        lastErrorDetails = "Provider: Groq | HTTP: 503 | Attempts: 4"
                     ),
                     settings = BabySettings(groqApiKey = "gsk_demo"),
                     permissions = testPermissions(true),
@@ -510,6 +583,7 @@ class BabyUiComposeTest {
                     onApproveConfirmation = { _, _ -> },
                     onClearChat = {},
                     onNavigateToSettings = {},
+                    onOpenAiSettings = { openedAiSettings = true },
                     onDismissError = { dismissed = true }
                 )
             }
@@ -517,6 +591,19 @@ class BabyUiComposeTest {
 
         composeRule.waitForIdle()
         composeRule.onNodeWithTag("agent_error_banner").assertIsDisplayed()
+        composeRule.onNodeWithTag("agent_error_details_toggle").performClick()
+        composeRule.waitForIdle()
+        composeRule.onNodeWithTag("agent_error_details_text").assertIsDisplayed()
+
+        composeRule.onNodeWithTag("agent_error_open_ai_settings_button").performClick()
+        assertTrue(openedAiSettings)
+
+        composeRule.onNodeWithTag("chat_error_details_toggle").performClick()
+        composeRule.waitForIdle()
+        composeRule.onNodeWithTag("chat_error_details_body", useUnmergedTree = true)
+            .performScrollTo()
+            .assertIsDisplayed()
+
         composeRule.onNodeWithTag("agent_error_retry_button").performClick()
         assertTrue(dismissed)
         assertEquals("Last command", retriedCmd)

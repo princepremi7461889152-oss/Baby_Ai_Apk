@@ -7,11 +7,12 @@ import com.example.data.remote.GeminiContent
 import com.example.data.remote.GeminiGenerateRequest
 import com.example.data.remote.GeminiInlineData
 import com.example.data.remote.GeminiPart
+import com.example.domain.ai.AiCallException
+import com.example.domain.ai.AiResilienceHelper
 import com.example.domain.tools.ToolExecutionResult
 import com.example.util.PermissionHelper
 import com.example.voice.BabyTtsManager
 import dagger.hilt.android.qualifiers.ApplicationContext
-import kotlinx.coroutines.CancellationException
 import android.content.Context
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -57,9 +58,10 @@ class CameraVisionManager @Inject constructor(
                 question.ifBlank { "Ye kya hai? Hinglish mein short aur helpful jawab do." }
             )
             val photoData = base64Photo ?: return ToolExecutionResult(false, "Camera image missing.")
-            val resp = geminiApi.generateContent(
-                model = settings.geminiModel,
-                apiKey = key,
+            val res = AiResilienceHelper.executeGeminiWithRetry(
+                geminiApi = geminiApi,
+                key = key,
+                model = settings.modelConfig.geminiModel,
                 request = GeminiGenerateRequest(
                     systemInstruction = GeminiContent(
                         parts = listOf(
@@ -81,30 +83,20 @@ class CameraVisionManager @Inject constructor(
             // Immediately release base64 payload reference after API call
             base64Photo = null
 
-            if (!resp.isSuccessful || resp.body() == null) {
-                val errBody = runCatching { resp.errorBody()?.string()?.take(180) }.getOrNull()
-                val safeErr = SensitiveDataSanitizer.sanitizeError(errBody ?: "HTTP ${resp.code()}", key)
-                return ToolExecutionResult(false, "Gemini Vision error: $safeErr")
+            val body = res.getOrElse { err ->
+                val friendly = (err as? AiCallException)?.failure?.userMessage
+                    ?: "Camera Vision fail ho gaya. Settings > AI Models ya network check karo."
+                return ToolExecutionResult(false, friendly)
             }
 
-            val answer = resp.body()?.candidates?.firstOrNull()?.content?.parts
-                ?.mapNotNull { it.text?.trim() }
-                ?.joinToString("\n")
-                ?.trim()
-                ?.takeIf { it.isNotEmpty() }
+            val parts = body.candidates?.firstOrNull()?.content?.parts.orEmpty()
+            val answer = AiResilienceHelper.extractGeminiVisibleText(parts)
                 ?: "Photo samajh nahi aayi, dobara try karo."
 
             if (settings.ttsRepliesEnabled) {
                 ttsManager.speak(answer, "hinglish")
             }
             ToolExecutionResult(true, answer)
-        } catch (ce: CancellationException) {
-            throw ce
-        } catch (e: Exception) {
-            ToolExecutionResult(
-                false,
-                "Camera Vision failed: ${SensitiveDataSanitizer.sanitizeError(e.message, key)}"
-            )
         } finally {
             base64Photo = null
             CameraCaptureActivity.purgeTempCacheFiles(context)

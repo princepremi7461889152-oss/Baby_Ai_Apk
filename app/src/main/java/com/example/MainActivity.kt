@@ -198,6 +198,10 @@ fun BabyAppRoot(
     val isRefreshing by viewModel.isRefreshing.collectAsStateWithLifecycle()
     val groqKeyTest by viewModel.groqKeyTest.collectAsStateWithLifecycle()
     val geminiKeyTest by viewModel.geminiKeyTest.collectAsStateWithLifecycle()
+    val liveGroqModels by viewModel.liveGroqModels.collectAsStateWithLifecycle()
+    val liveModelsLoading by viewModel.liveModelsLoading.collectAsStateWithLifecycle()
+    val liveModelsError by viewModel.liveModelsError.collectAsStateWithLifecycle()
+    val modelsTestState by viewModel.modelsTestState.collectAsStateWithLifecycle()
 
     val routines by extrasViewModel.routines.collectAsStateWithLifecycle()
     val memories by extrasViewModel.memories.collectAsStateWithLifecycle()
@@ -221,6 +225,12 @@ fun BabyAppRoot(
         statusToast?.let { msg ->
             snackbarHostState.showSnackbar(msg)
             extrasViewModel.clearStatusToast()
+        }
+    }
+    LaunchedEffect(agentState.oneTimeNotice) {
+        agentState.oneTimeNotice?.let { notice ->
+            snackbarHostState.showSnackbar(notice)
+            viewModel.clearOneTimeNotice()
         }
     }
 
@@ -411,6 +421,7 @@ fun BabyAppRoot(
                             onApproveConfirmation = viewModel::approveConfirmation,
                             onClearChat = viewModel::clearChat,
                             onNavigateToSettings = { navController.navigate(SettingsRoute("keys")) },
+                            onOpenAiSettings = { navController.navigate(SettingsRoute("ai")) },
                             onOpenPermissions = { navController.navigate(PermissionsRoute) },
                             onRegenerateMessage = viewModel::regenerateFromAssistantMessage,
                             onSpeakMessage = viewModel::speakMessage,
@@ -563,6 +574,10 @@ fun BabyAppRoot(
                             uiPrefs = uiPrefs,
                             groqKeyTest = groqKeyTest,
                             geminiKeyTest = geminiKeyTest,
+                            liveGroqModels = liveGroqModels,
+                            liveModelsLoading = liveModelsLoading,
+                            liveModelsError = liveModelsError,
+                            modelsTestState = modelsTestState,
                             onBack = { navController.popBackStack() },
                             onRefreshPermissions = viewModel::refreshPermissions,
                             onSaveKeys = viewModel::saveApiKeys,
@@ -574,6 +589,12 @@ fun BabyAppRoot(
                             onSoundCuesChange = viewModel::setListeningSoundCuesEnabled,
                             onGeminiModelChange = viewModel::updateGeminiModel,
                             onGroqModelChange = viewModel::updateGroqModel,
+                            onSaveModelConfig = viewModel::updateModelConfig,
+                            onResetModelConfig = viewModel::resetModelConfig,
+                            onRefreshLiveGroqModels = { key -> viewModel.refreshLiveGroqModels(key) },
+                            onTestAllModels = { cfg, gKey, gemKey ->
+                                viewModel.testAllAiModels(cfg, gKey, gemKey)
+                            },
                             onPreferredBrainChange = viewModel::updatePreferredBrain,
                             onAutoFallbackChange = viewModel::setAutoFallback,
                             onWakeWordToggle = viewModel::setWakeWordEnabled,

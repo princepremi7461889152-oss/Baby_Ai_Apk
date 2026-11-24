@@ -9,6 +9,7 @@ import android.content.Context
 import android.content.Intent
 import android.location.Geocoder
 import android.os.Build
+import com.example.core.security.GroqModelRole
 import com.example.core.security.SecureKeyStore
 import com.example.core.security.SensitiveDataSanitizer
 import com.example.data.local.ReminderDao
@@ -18,6 +19,8 @@ import com.example.data.local.SavedPlaceEntity
 import com.example.data.remote.GroqApiService
 import com.example.data.remote.GroqChatRequest
 import com.example.data.remote.GroqMessage
+import com.example.domain.ai.AiResilienceHelper
+import com.example.domain.ai.AiResponseParser
 import com.example.util.PermissionHelper
 import com.google.android.gms.location.Geofence
 import com.google.android.gms.location.GeofencingRequest
@@ -25,7 +28,6 @@ import com.google.android.gms.location.LocationServices
 import com.google.android.gms.location.Priority
 import com.google.android.gms.tasks.CancellationTokenSource
 import dagger.hilt.android.qualifiers.ApplicationContext
-import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -414,24 +416,30 @@ class ReminderManager @Inject constructor(
         }
 
         return try {
-            val resp = groqApi.chatCompletions(
-                bearerAuth = "Bearer $key",
-                request = GroqChatRequest(
-                    model = keyStore.settings.value.groqModel,
-                    messages = listOf(
-                        GroqMessage(
-                            role = "system",
-                            content = "Parse the Hinglish/Hindi/English reminder into strict JSON ONLY (no markdown): " +
-                                "{\"title\":\"short task\",\"trigger_type\":\"TIME\"|\"LOCATION\",\"iso_local\":\"yyyy-MM-dd HH:mm\" or null,\"delay_minutes\":int or null,\"place_label\":\"Home\"|\"Work\"|string or null}."
+            val groqRes = AiResilienceHelper.executeGroqChatWithRecovery(
+                groqApi = groqApi,
+                keyStore = keyStore,
+                key = key,
+                initialModel = keyStore.settings.value.modelConfig.fastModel,
+                role = GroqModelRole.FAST,
+                requestBuilder = { modelId ->
+                    GroqChatRequest(
+                        model = modelId,
+                        messages = listOf(
+                            GroqMessage(
+                                role = "system",
+                                content = "Parse the Hinglish/Hindi/English reminder into strict JSON ONLY (no markdown): " +
+                                    "{\"title\":\"short task\",\"trigger_type\":\"TIME\"|\"LOCATION\",\"iso_local\":\"yyyy-MM-dd HH:mm\" or null,\"delay_minutes\":int or null,\"place_label\":\"Home\"|\"Work\"|string or null}."
+                            ),
+                            GroqMessage(role = "user", content = userPayload)
                         ),
-                        GroqMessage(role = "user", content = userPayload)
-                    ),
-                    tools = null,
-                    toolChoice = null
-                )
+                        tools = null,
+                        toolChoice = null
+                    )
+                }
             )
-            if (!resp.isSuccessful) return null
-            val content = resp.body()?.choices?.firstOrNull()?.message?.content?.trim() ?: return null
+            val rawContent = groqRes.getOrNull()?.value?.choices?.firstOrNull()?.message?.content
+            val content = AiResponseParser.stripReasoning(rawContent) ?: return null
             val jsonStr = content.substringAfter('{', "").let { if (it.isNotEmpty()) "{$it" else content }
                 .substringBeforeLast('}', "")
                 .let { if (it.isNotEmpty()) "$it}" else content }
@@ -454,8 +462,6 @@ class ReminderManager @Inject constructor(
                 delayMinutes = delay,
                 placeLabel = place
             )
-        } catch (ce: CancellationException) {
-            throw ce
         } catch (_: Exception) {
             null
         }

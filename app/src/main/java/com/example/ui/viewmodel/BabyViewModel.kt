@@ -6,10 +6,12 @@ import android.net.Network
 import android.net.NetworkCapabilities
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.core.security.AiModelConfig
 import com.example.core.security.AppLanguage
 import com.example.core.security.BabySettings
 import com.example.core.security.PreferredBrain
 import com.example.core.security.SecureKeyStore
+import com.example.core.security.SensitiveDataSanitizer
 import com.example.data.local.ChatMessageEntity
 import com.example.data.local.HistoryRepository
 import com.example.data.local.TaskRunEntity
@@ -19,6 +21,7 @@ import com.example.service.BabyForegroundService
 import com.example.ui.state.ApiKeyHealthTester
 import com.example.ui.state.BabyUiPreferences
 import com.example.ui.state.KeyTestResult
+import com.example.ui.state.ModelsTestUiState
 import com.example.ui.state.UiPreferencesStore
 import com.example.ui.theme.BabySoundCues
 import com.example.ui.theme.BabyThemeMode
@@ -101,6 +104,18 @@ class BabyViewModel @Inject constructor(
     private val _geminiKeyTest = MutableStateFlow<KeyTestResult>(KeyTestResult.Idle)
     val geminiKeyTest: StateFlow<KeyTestResult> = _geminiKeyTest.asStateFlow()
 
+    private val _liveGroqModels = MutableStateFlow<List<String>>(emptyList())
+    val liveGroqModels: StateFlow<List<String>> = _liveGroqModels.asStateFlow()
+
+    private val _liveModelsLoading = MutableStateFlow(false)
+    val liveModelsLoading: StateFlow<Boolean> = _liveModelsLoading.asStateFlow()
+
+    private val _liveModelsError = MutableStateFlow<String?>(null)
+    val liveModelsError: StateFlow<String?> = _liveModelsError.asStateFlow()
+
+    private val _modelsTestState = MutableStateFlow(ModelsTestUiState())
+    val modelsTestState: StateFlow<ModelsTestUiState> = _modelsTestState.asStateFlow()
+
     val isOffline: StateFlow<Boolean> = callbackFlow {
         val cm = appContext.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
         fun currentOffline(): Boolean {
@@ -139,7 +154,7 @@ class BabyViewModel @Inject constructor(
         chatMessages,
         _rateLimitDismissed
     ) { exec, messages, dismissed ->
-        if (dismissed || exec.isRunning) {
+        if (dismissed || exec.isRunning || !exec.lastError.isNullOrBlank()) {
             false
         } else {
             val latestAssistant = messages.lastOrNull { it.role != "user" && it.role != "tool" }?.content.orEmpty()
@@ -310,6 +325,10 @@ class BabyViewModel @Inject constructor(
         orchestrator.clearLastError()
     }
 
+    fun clearOneTimeNotice() {
+        orchestrator.clearOneTimeNotice()
+    }
+
     fun saveApiKeys(geminiKey: String, groqKey: String) {
         keyStore.updateApiKeys(geminiKey, groqKey)
         if (geminiKey.isNotBlank() || groqKey.isNotBlank()) {
@@ -338,7 +357,53 @@ class BabyViewModel @Inject constructor(
 
     fun clearApiKeys() {
         keyStore.clearApiKeys()
+        _liveGroqModels.value = emptyList()
+        _liveModelsError.value = null
+        _modelsTestState.value = ModelsTestUiState()
         resetKeyTests()
+    }
+
+    fun updateModelConfig(config: AiModelConfig) {
+        keyStore.updateModelConfig(config)
+    }
+
+    fun resetModelConfig() {
+        keyStore.resetModelConfig()
+    }
+
+    fun refreshLiveGroqModels(keyOverride: String? = null) {
+        val keyToUse = (keyOverride ?: settings.value.groqApiKey).trim()
+        if (keyToUse.isBlank()) {
+            _liveModelsError.value = "Groq API key pehle daalo."
+            return
+        }
+        viewModelScope.launch {
+            _liveModelsLoading.value = true
+            _liveModelsError.value = null
+            apiKeyHealthTester.fetchGroqModels(keyToUse).fold(
+                onSuccess = { models ->
+                    _liveGroqModels.value = models
+                },
+                onFailure = { err ->
+                    _liveModelsError.value = SensitiveDataSanitizer.sanitizeError(err.message, keyToUse)
+                }
+            )
+            _liveModelsLoading.value = false
+        }
+    }
+
+    fun testAllAiModels(
+        config: AiModelConfig = settings.value.modelConfig,
+        groqKeyOverride: String? = null,
+        geminiKeyOverride: String? = null
+    ) {
+        val gKey = (groqKeyOverride ?: settings.value.groqApiKey).trim()
+        val gemKey = (geminiKeyOverride ?: settings.value.geminiApiKey).trim()
+        keyStore.updateModelConfig(config)
+        viewModelScope.launch {
+            _modelsTestState.value = ModelsTestUiState(isTesting = true)
+            _modelsTestState.value = apiKeyHealthTester.testAllModels(gKey, gemKey, config)
+        }
     }
 
     fun updateGeminiModel(model: String) {
@@ -346,7 +411,7 @@ class BabyViewModel @Inject constructor(
     }
 
     fun updateGroqModel(model: String) {
-        keyStore.updateGroqModel(model)
+        keyStore.updateChatModel(model)
     }
 
     fun updatePreferredBrain(brain: PreferredBrain) {

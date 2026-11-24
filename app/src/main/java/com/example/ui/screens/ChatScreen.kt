@@ -175,6 +175,7 @@ fun ChatScreen(
     onApproveConfirmation: (Boolean, String?) -> Unit,
     onClearChat: () -> Unit,
     onNavigateToSettings: () -> Unit,
+    onOpenAiSettings: () -> Unit = onNavigateToSettings,
     onOpenPermissions: () -> Unit = onNavigateToSettings,
     onRegenerateMessage: (Long) -> Unit = {},
     onSpeakMessage: (String) -> Unit = {},
@@ -487,6 +488,9 @@ fun ChatScreen(
                 val lastUserCommand = remember(messages) {
                     messages.lastOrNull { it.role == "user" }?.content
                 }
+                var bannerDetailsExpanded by remember(agentState.lastError, agentState.lastErrorDetails) {
+                    mutableStateOf(false)
+                }
                 Surface(
                     color = MaterialTheme.colorScheme.errorContainer,
                     contentColor = MaterialTheme.colorScheme.onErrorContainer,
@@ -496,47 +500,86 @@ fun ChatScreen(
                         .clip(RoundedCornerShape(spacing.chipRadius))
                         .testTag("agent_error_banner")
                 ) {
-                    Row(
+                    Column(
                         modifier = Modifier.padding(horizontal = spacing.sm, vertical = spacing.xs),
-                        verticalAlignment = Alignment.CenterVertically
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
                     ) {
-                        Icon(
-                            imageVector = Icons.Default.ErrorOutline,
-                            contentDescription = null,
-                            tint = MaterialTheme.colorScheme.onErrorContainer,
-                            modifier = Modifier.size(18.dp)
-                        )
-                        Spacer(Modifier.width(spacing.xs))
-                        Text(
-                            text = agentState.lastError.orEmpty().withDevanagariFallback(),
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onErrorContainer,
-                            maxLines = 2,
-                            overflow = TextOverflow.Ellipsis,
-                            modifier = Modifier.weight(1f)
-                        )
-                        if (!lastUserCommand.isNullOrBlank()) {
-                            TextButton(
-                                onClick = {
-                                    onDismissError()
-                                    onSendCommand(lastUserCommand)
-                                },
-                                modifier = Modifier.testTag("agent_error_retry_button")
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                imageVector = Icons.Default.ErrorOutline,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.onErrorContainer,
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Spacer(Modifier.width(spacing.xs))
+                            Text(
+                                text = agentState.lastError.orEmpty().withDevanagariFallback(),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onErrorContainer,
+                                maxLines = 3,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f)
+                            )
+                            IconButton(
+                                onClick = onDismissError,
+                                modifier = Modifier
+                                    .minimumInteractiveComponentSize()
+                                    .testTag("agent_error_dismiss_button")
                             ) {
-                                Text("Retry", color = MaterialTheme.colorScheme.onErrorContainer)
+                                Icon(
+                                    Icons.Default.Close,
+                                    contentDescription = "Dismiss error",
+                                    tint = MaterialTheme.colorScheme.onErrorContainer,
+                                    modifier = Modifier.size(16.dp)
+                                )
                             }
                         }
-                        IconButton(
-                            onClick = onDismissError,
-                            modifier = Modifier
-                                .minimumInteractiveComponentSize()
-                                .testTag("agent_error_dismiss_button")
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
                         ) {
-                            Icon(
-                                Icons.Default.Close,
-                                contentDescription = "Dismiss error",
-                                tint = MaterialTheme.colorScheme.onErrorContainer,
-                                modifier = Modifier.size(16.dp)
+                            if (!lastUserCommand.isNullOrBlank()) {
+                                TextButton(
+                                    onClick = {
+                                        onDismissError()
+                                        onSendCommand(lastUserCommand)
+                                    },
+                                    modifier = Modifier.testTag("agent_error_retry_button")
+                                ) {
+                                    Text("Retry", color = MaterialTheme.colorScheme.onErrorContainer)
+                                }
+                            }
+                            TextButton(
+                                onClick = onOpenAiSettings,
+                                modifier = Modifier.testTag("agent_error_open_ai_settings_button")
+                            ) {
+                                Text("Open AI settings", color = MaterialTheme.colorScheme.onErrorContainer)
+                            }
+                            if (!agentState.lastErrorDetails.isNullOrBlank()) {
+                                Spacer(Modifier.weight(1f))
+                                TextButton(
+                                    onClick = { bannerDetailsExpanded = !bannerDetailsExpanded },
+                                    modifier = Modifier.testTag("agent_error_details_toggle")
+                                ) {
+                                    Text(
+                                        text = if (bannerDetailsExpanded) "Hide details" else "Details",
+                                        color = MaterialTheme.colorScheme.onErrorContainer,
+                                        style = MaterialTheme.typography.labelMedium
+                                    )
+                                }
+                            }
+                        }
+
+                        AnimatedVisibility(visible = bannerDetailsExpanded && !agentState.lastErrorDetails.isNullOrBlank()) {
+                            Text(
+                                text = agentState.lastErrorDetails.orEmpty(),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onErrorContainer.copy(alpha = 0.85f),
+                                modifier = Modifier
+                                    .padding(horizontal = 4.dp, vertical = 2.dp)
+                                    .testTag("agent_error_details_text")
                             )
                         }
                     }
@@ -1156,14 +1199,19 @@ private fun ChatBubbleItem(
                 msg.content.substring(0, revealedChars)
             }
 
+            val isErrorMsg = msg.toolName == "ai_error"
+            var detailsExpanded by remember(msg.id) { mutableStateOf(false) }
+
             Column(
                 modifier = modifier.fillMaxWidth(),
                 horizontalAlignment = Alignment.Start
             ) {
                 Box {
                     Surface(
-                        color = MaterialTheme.colorScheme.surfaceVariant,
-                        contentColor = MaterialTheme.colorScheme.onSurface,
+                        color = if (isErrorMsg) MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.85f)
+                        else MaterialTheme.colorScheme.surfaceVariant,
+                        contentColor = if (isErrorMsg) MaterialTheme.colorScheme.onErrorContainer
+                        else MaterialTheme.colorScheme.onSurface,
                         shape = RoundedCornerShape(20.dp, 20.dp, 20.dp, 4.dp),
                         modifier = Modifier
                             .widthIn(max = 330.dp)
@@ -1179,9 +1227,44 @@ private fun ChatBubbleItem(
                         Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
                             BabyMarkdownText(
                                 markdown = displayText,
-                                color = MaterialTheme.colorScheme.onSurface,
+                                color = if (isErrorMsg) MaterialTheme.colorScheme.onErrorContainer
+                                else MaterialTheme.colorScheme.onSurface,
                                 style = MaterialTheme.typography.bodyLarge
                             )
+                            if (isErrorMsg && !msg.toolResult.isNullOrBlank()) {
+                                Spacer(Modifier.height(6.dp))
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(8.dp))
+                                        .clickable { detailsExpanded = !detailsExpanded }
+                                        .padding(vertical = 4.dp, horizontal = 2.dp)
+                                        .testTag("chat_error_details_toggle")
+                                ) {
+                                    Text(
+                                        text = "Details",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = MaterialTheme.colorScheme.onErrorContainer
+                                    )
+                                    Spacer(Modifier.width(4.dp))
+                                    Icon(
+                                        imageVector = if (detailsExpanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+                                        contentDescription = "Toggle error details",
+                                        tint = MaterialTheme.colorScheme.onErrorContainer,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                }
+                                AnimatedVisibility(visible = detailsExpanded) {
+                                    Text(
+                                        text = msg.toolResult.orEmpty(),
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onErrorContainer.copy(alpha = 0.85f),
+                                        modifier = Modifier
+                                            .padding(top = 4.dp)
+                                            .testTag("chat_error_details_body")
+                                    )
+                                }
+                            }
                             msg.brainUsed?.takeIf { it != "local" }?.let { brain ->
                                 Spacer(Modifier.height(4.dp))
                                 Text(

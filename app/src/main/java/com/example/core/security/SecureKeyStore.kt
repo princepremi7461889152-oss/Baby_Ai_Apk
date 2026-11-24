@@ -22,7 +22,7 @@ enum class AppLanguage(val displayName: String, val localeTag: String, val instr
 
 enum class PreferredBrain(val label: String) {
     AUTO("Smart Auto (Groq fast + Gemini heavy)"),
-    GROQ_FIRST("Groq First (llama-3.3-70b-versatile)"),
+    GROQ_FIRST("Groq First (gpt-oss-120b)"),
     GEMINI_FIRST("Gemini First (Vision & Reasoning)")
 }
 
@@ -43,9 +43,7 @@ enum class BabyPersonality(val label: String, val toneInstruction: String) {
 data class BabySettings(
     val geminiApiKey: String = "",
     val groqApiKey: String = "",
-    val geminiModel: String = DEFAULT_GEMINI_MODEL,
-    val groqModel: String = DEFAULT_GROQ_MODEL,
-    val groqWhisperModel: String = DEFAULT_WHISPER_MODEL,
+    val modelConfig: AiModelConfig = AiModelConfig(),
     val preferredBrain: PreferredBrain = PreferredBrain.AUTO,
     val autoFallbackEnabled: Boolean = true,
     val wakeWordEnabled: Boolean = true,
@@ -108,9 +106,6 @@ data class BabySettings(
     }
 
     companion object {
-        const val DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"
-        const val DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile"
-        const val DEFAULT_WHISPER_MODEL = "whisper-large-v3-turbo"
         const val DEFAULT_EMERGENCY_MSG = "EMERGENCY HELP NEEDED! Baby Assistant SOS alert."
     }
 }
@@ -161,15 +156,42 @@ class SecureKeyStore @Inject constructor(
         val brainName = prefs.getString(KEY_BRAIN, PreferredBrain.AUTO.name) ?: PreferredBrain.AUTO.name
         val replyModeName = prefs.getString(KEY_AUTO_REPLY_MODE, AutoReplyMode.OFF.name) ?: AutoReplyMode.OFF.name
         val personalityName = prefs.getString(KEY_PERSONALITY, BabyPersonality.FRIENDLY.name) ?: BabyPersonality.FRIENDLY.name
+        val rawGemini = prefs.getString(KEY_GEMINI_MODEL, AiModelConfig.DEFAULT_GEMINI_MODEL)
+            ?.trim().orEmpty()
+        val resolvedGemini = if (rawGemini.isBlank() || AiModelConfig.isDeprecatedGeminiDefault(rawGemini)) {
+            AiModelConfig.DEFAULT_GEMINI_MODEL
+        } else {
+            rawGemini
+        }
+
+        val rawChat = prefs.getString(KEY_GROQ_MODEL, AiModelConfig.DEFAULT_CHAT_MODEL)
+            ?.trim().orEmpty()
+        val resolvedChat = if (rawChat.isBlank() || AiModelConfig.isDeprecatedGroqDefault(rawChat)) {
+            AiModelConfig.DEFAULT_CHAT_MODEL
+        } else {
+            rawChat
+        }
+
+        val rawFast = prefs.getString(KEY_GROQ_FAST_MODEL, AiModelConfig.DEFAULT_FAST_MODEL)
+            ?.trim().orEmpty()
+        val resolvedFast = if (rawFast.isBlank() || AiModelConfig.isDeprecatedGroqDefault(rawFast)) {
+            AiModelConfig.DEFAULT_FAST_MODEL
+        } else {
+            rawFast
+        }
+
+        val resolvedStt = prefs.getString(KEY_WHISPER_MODEL, AiModelConfig.DEFAULT_STT_MODEL)
+            ?.trim()?.ifBlank { AiModelConfig.DEFAULT_STT_MODEL } ?: AiModelConfig.DEFAULT_STT_MODEL
+
         return BabySettings(
             geminiApiKey = prefs.getString(KEY_GEMINI_API_KEY, "") ?: "",
             groqApiKey = prefs.getString(KEY_GROQ_API_KEY, "") ?: "",
-            geminiModel = prefs.getString(KEY_GEMINI_MODEL, BabySettings.DEFAULT_GEMINI_MODEL)
-                ?: BabySettings.DEFAULT_GEMINI_MODEL,
-            groqModel = prefs.getString(KEY_GROQ_MODEL, BabySettings.DEFAULT_GROQ_MODEL)
-                ?: BabySettings.DEFAULT_GROQ_MODEL,
-            groqWhisperModel = prefs.getString(KEY_WHISPER_MODEL, BabySettings.DEFAULT_WHISPER_MODEL)
-                ?: BabySettings.DEFAULT_WHISPER_MODEL,
+            modelConfig = AiModelConfig(
+                chatModel = resolvedChat,
+                fastModel = resolvedFast,
+                sttModel = resolvedStt,
+                geminiModel = resolvedGemini
+            ),
             preferredBrain = runCatching { PreferredBrain.valueOf(brainName) }.getOrDefault(PreferredBrain.AUTO),
             autoFallbackEnabled = prefs.getBoolean(KEY_AUTO_FALLBACK, true),
             wakeWordEnabled = prefs.getBoolean(KEY_WAKE_WORD_ENABLED, true),
@@ -232,14 +254,43 @@ class SecureKeyStore @Inject constructor(
         refresh()
     }
 
+    fun updateModelConfig(config: AiModelConfig) {
+        val norm = config.normalized()
+        prefs.edit()
+            .putString(KEY_GROQ_MODEL, norm.chatModel)
+            .putString(KEY_GROQ_FAST_MODEL, norm.fastModel)
+            .putString(KEY_WHISPER_MODEL, norm.sttModel)
+            .putString(KEY_GEMINI_MODEL, norm.geminiModel)
+            .apply()
+        refresh()
+    }
+
     fun updateGeminiModel(model: String) {
-        prefs.edit().putString(KEY_GEMINI_MODEL, model.trim().ifBlank { BabySettings.DEFAULT_GEMINI_MODEL }).apply()
+        prefs.edit().putString(KEY_GEMINI_MODEL, model.trim().ifBlank { AiModelConfig.DEFAULT_GEMINI_MODEL }).apply()
         refresh()
     }
 
     fun updateGroqModel(model: String) {
-        prefs.edit().putString(KEY_GROQ_MODEL, model.trim().ifBlank { BabySettings.DEFAULT_GROQ_MODEL }).apply()
+        updateChatModel(model)
+    }
+
+    fun updateChatModel(model: String) {
+        prefs.edit().putString(KEY_GROQ_MODEL, model.trim().ifBlank { AiModelConfig.DEFAULT_CHAT_MODEL }).apply()
         refresh()
+    }
+
+    fun updateFastModel(model: String) {
+        prefs.edit().putString(KEY_GROQ_FAST_MODEL, model.trim().ifBlank { AiModelConfig.DEFAULT_FAST_MODEL }).apply()
+        refresh()
+    }
+
+    fun updateSttModel(model: String) {
+        prefs.edit().putString(KEY_WHISPER_MODEL, model.trim().ifBlank { AiModelConfig.DEFAULT_STT_MODEL }).apply()
+        refresh()
+    }
+
+    fun resetModelConfig() {
+        updateModelConfig(AiModelConfig())
     }
 
     fun updatePreferredBrain(brain: PreferredBrain) {
@@ -429,6 +480,7 @@ class SecureKeyStore @Inject constructor(
         private const val KEY_GROQ_API_KEY = "groq_api_key"
         private const val KEY_GEMINI_MODEL = "gemini_model"
         private const val KEY_GROQ_MODEL = "groq_model"
+        private const val KEY_GROQ_FAST_MODEL = "groq_fast_model"
         private const val KEY_WHISPER_MODEL = "groq_whisper_model"
         private const val KEY_BRAIN = "preferred_brain"
         private const val KEY_AUTO_FALLBACK = "auto_fallback"

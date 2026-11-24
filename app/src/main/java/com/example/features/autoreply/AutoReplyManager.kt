@@ -10,6 +10,7 @@ import android.os.Bundle
 import android.provider.ContactsContract
 import android.telephony.SmsManager
 import com.example.core.security.AutoReplyMode
+import com.example.core.security.GroqModelRole
 import com.example.core.security.SecureKeyStore
 import com.example.core.security.SensitiveDataSanitizer
 import com.example.data.local.AutoReplyContactRuleEntity
@@ -21,10 +22,11 @@ import com.example.data.remote.GeminiPart
 import com.example.data.remote.GroqApiService
 import com.example.data.remote.GroqChatRequest
 import com.example.data.remote.GroqMessage
+import com.example.domain.ai.AiResilienceHelper
+import com.example.domain.ai.AiResponseParser
 import com.example.features.actionlog.ActionLogRepository
 import com.example.util.PermissionHelper
 import dagger.hilt.android.qualifiers.ApplicationContext
-import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.Flow
 import java.util.Calendar
 import javax.inject.Inject
@@ -211,11 +213,15 @@ class AutoReplyManager @Inject constructor(
         val prompt = "Mode: ${settings.autoReplyMode.label}. Base message: \"$template\". Sender: $sender wrote: \"$safeIncoming\". Write a short, polite 1-sentence Hinglish auto-reply."
 
         if (settings.groqApiKey.isNotBlank()) {
-            try {
-                val resp = groqApi.chatCompletions(
-                    bearerAuth = "Bearer ${settings.groqApiKey.trim()}",
-                    request = GroqChatRequest(
-                        model = settings.groqModel,
+            val groqText = AiResilienceHelper.executeGroqChatWithRecovery(
+                groqApi = groqApi,
+                keyStore = keyStore,
+                key = settings.groqApiKey.trim(),
+                initialModel = settings.modelConfig.fastModel,
+                role = GroqModelRole.FAST,
+                requestBuilder = { modelId ->
+                    GroqChatRequest(
+                        model = modelId,
                         messages = listOf(
                             GroqMessage(role = "system", content = "You are Baby. Generate only the short 1-sentence Hinglish auto-reply text."),
                             GroqMessage(role = "user", content = prompt)
@@ -223,40 +229,26 @@ class AutoReplyManager @Inject constructor(
                         tools = null,
                         toolChoice = null
                     )
-                )
-                if (resp.isSuccessful) {
-                    val text = resp.body()?.choices?.firstOrNull()?.message?.content?.trim()
-                    if (!text.isNullOrBlank()) return text
                 }
-            } catch (ce: CancellationException) {
-                throw ce
-            } catch (_: Exception) {
-                // Fall through to Gemini/template
-            }
+            ).getOrNull()?.value?.choices?.firstOrNull()?.message?.content
+                ?.let { AiResponseParser.stripReasoning(it) }
+            if (!groqText.isNullOrBlank()) return groqText
         }
 
         if (settings.autoFallbackEnabled && settings.geminiApiKey.isNotBlank()) {
-            try {
-                val resp = geminiApi.generateContent(
-                    model = settings.geminiModel,
-                    apiKey = settings.geminiApiKey.trim(),
-                    request = GeminiGenerateRequest(
-                        systemInstruction = GeminiContent(
-                            parts = listOf(GeminiPart(text = "You are Baby. Generate only the short 1-sentence Hinglish auto-reply text."))
-                        ),
-                        contents = listOf(GeminiContent(role = "user", parts = listOf(GeminiPart(text = prompt))))
-                    )
+            val gemText = AiResilienceHelper.executeGeminiWithRetry(
+                geminiApi = geminiApi,
+                key = settings.geminiApiKey.trim(),
+                model = settings.modelConfig.geminiModel,
+                request = GeminiGenerateRequest(
+                    systemInstruction = GeminiContent(
+                        parts = listOf(GeminiPart(text = "You are Baby. Generate only the short 1-sentence Hinglish auto-reply text."))
+                    ),
+                    contents = listOf(GeminiContent(role = "user", parts = listOf(GeminiPart(text = prompt))))
                 )
-                if (resp.isSuccessful) {
-                    val text = resp.body()?.candidates?.firstOrNull()?.content?.parts
-                        ?.mapNotNull { it.text?.trim() }?.joinToString(" ")?.trim()
-                    if (!text.isNullOrBlank()) return text
-                }
-            } catch (ce: CancellationException) {
-                throw ce
-            } catch (_: Exception) {
-                // Fall back to template
-            }
+            ).getOrNull()?.candidates?.firstOrNull()?.content?.parts
+                ?.let { AiResilienceHelper.extractGeminiVisibleText(it) }
+            if (!gemText.isNullOrBlank()) return gemText
         }
         return template
     }

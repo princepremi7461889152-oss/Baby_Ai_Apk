@@ -26,6 +26,7 @@ data class GeminiContent(
 @JsonClass(generateAdapter = true)
 data class GeminiPart(
     val text: String? = null,
+    val thought: Boolean? = null,
     val inlineData: GeminiInlineData? = null,
     val functionCall: GeminiFunctionCall? = null,
     val functionResponse: GeminiFunctionResponse? = null

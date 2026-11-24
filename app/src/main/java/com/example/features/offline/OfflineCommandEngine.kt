@@ -22,12 +22,14 @@ class OfflineCommandEngine @Inject constructor(
     private val keyStore: SecureKeyStore,
     private val executor: PhoneControlExecutor
 ) {
-    suspend fun tryExecuteOffline(command: String): OfflineMatchResult? {
+    suspend fun tryExecuteOffline(command: String, fallbackMode: Boolean = false): OfflineMatchResult? {
         if (!keyStore.settings.value.offlineCommandsEnabled) return null
         val lower = command.lowercase().trim()
 
         // 1. Flashlight
-        if (lower.contains("flashlight") || lower.contains("torch")) {
+        if (lower.contains("flashlight") || lower.contains("torch") ||
+            (fallbackMode && (lower.contains("flash on") || lower.contains("flash off")))
+        ) {
             val enable = !lower.contains("off") && !lower.contains("band") && !lower.contains("disable")
             val res = executor.execute("toggle_flashlight", mapOf("enable" to enable))
             return OfflineMatchResult(
@@ -57,7 +59,7 @@ class OfflineCommandEngine @Inject constructor(
                     lower.contains("mute") || lower.contains("silent") -> 0
                     lower.contains("full") || lower.contains("max") -> 100
                     lower.contains("kam") || lower.contains("low") || lower.contains("down") -> currentVolumePercent() - 20
-                    lower.contains("zyada") || lower.contains("high") || lower.contains("up") || lower.contains("badha") -> currentVolumePercent() + 20
+                    lower.contains("zyada") || lower.contains("high") || lower.contains("up") || lower.contains("badha") || lower.contains("increase") -> currentVolumePercent() + 20
                     else -> null
                 }
             if (percent != null) {
@@ -91,29 +93,28 @@ class OfflineCommandEngine @Inject constructor(
         }
 
         // 5. Simple direct alarm "7:30 alarm" / "7 baje ka alarm"
-        if (lower.contains("alarm") && !lower.contains("cancel") && !lower.contains("band")) {
+        if ((lower.contains("alarm") || (fallbackMode && lower.contains("wake me"))) &&
+            !lower.contains("cancel") && !lower.contains("band")
+        ) {
             val colon = Regex("""(\d{1,2}):(\d{2})""").find(lower)
             val baje = Regex("""(\d{1,2})\s*(baje|am|pm)""").find(lower)
             if (colon != null || baje != null) {
                 var h = (colon?.groupValues?.get(1) ?: baje?.groupValues?.get(1))?.toIntOrNull() ?: 7
                 val m = colon?.groupValues?.get(2)?.toIntOrNull() ?: 0
                 if ((lower.contains("pm") || lower.contains("shaam") || lower.contains("raat")) && h in 1..11) h += 12
+                if (baje?.groupValues?.get(2) == "am" && h == 12) h = 0
                 val args = mapOf("hour" to h.coerceIn(0, 23), "minute" to m.coerceIn(0, 59), "label" to "Baby Alarm")
                 val res = executor.execute("set_alarm", args)
                 return OfflineMatchResult("set_alarm", args, res, res.output)
             }
         }
 
-        // 6. Simple "open <app>" / "<app> kholo"
-        val openMatch = Regex("""^open\s+([a-z0-9 .]+)$""").find(lower)
-            ?: Regex("""^([a-z0-9 .]+)\s+kholo$""").find(lower)
-        if (openMatch != null) {
-            val appName = openMatch.groupValues[1].trim()
-            if (appName.isNotBlank() && !appName.contains("wifi") && !appName.contains("settings")) {
-                val res = executor.execute("open_app", mapOf("app_name" to appName))
-                if (res.ok) {
-                    return OfflineMatchResult("open_app", mapOf("app_name" to appName), res, "$appName khol diya hai!")
-                }
+        // 6. Simple "open <app>" / "<app> kholo" (and broader extraction in fallbackMode)
+        val openAppName = extractOpenAppName(lower, fallbackMode)
+        if (!openAppName.isNullOrBlank()) {
+            val res = executor.execute("open_app", mapOf("app_name" to openAppName))
+            if (res.ok) {
+                return OfflineMatchResult("open_app", mapOf("app_name" to openAppName), res, "$openAppName khol diya hai!")
             }
         }
 
@@ -125,6 +126,25 @@ class OfflineCommandEngine @Inject constructor(
         }
 
         return null
+    }
+
+    private fun extractOpenAppName(lower: String, fallbackMode: Boolean): String? {
+        val raw = if (!fallbackMode) {
+            (Regex("""^open\s+([a-z0-9 .]+)$""").find(lower)
+                ?: Regex("""^([a-z0-9 .]+)\s+kholo$""").find(lower))
+                ?.groupValues?.get(1)
+        } else {
+            (Regex("""\b(?:open|launch)\s+([a-z0-9 .]{2,40})""").find(lower)
+                ?: Regex("""([a-z0-9 .]{2,30})\s+(?:kholo|open\s+karo|open\s+kardo|chalao)\b""").find(lower))
+                ?.groupValues?.get(1)
+        } ?: return null
+
+        val cleaned = raw
+            .replace(Regex("""\b(please|for me|app|karo|kar do|kardo|bhai|baby)\b"""), "")
+            .replace(Regex("""\s+"""), " ")
+            .trim()
+        if (cleaned.isBlank() || cleaned.contains("wifi") || cleaned.contains("settings")) return null
+        return cleaned
     }
 
     private fun extractOfflineCallTarget(lower: String): String? {

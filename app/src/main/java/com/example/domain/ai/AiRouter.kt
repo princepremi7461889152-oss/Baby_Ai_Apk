@@ -1,31 +1,33 @@
 package com.example.domain.ai
 
+import com.example.core.security.AiModelConfig
 import com.example.core.security.BabySettings
+import com.example.core.security.GroqModelRole
 import com.example.core.security.PreferredBrain
 import com.example.core.security.SecureKeyStore
 import com.example.core.security.SensitiveDataSanitizer
 import com.example.data.remote.GeminiApiService
 import com.example.data.remote.GeminiContent
+import com.example.data.remote.GeminiFunctionCall
 import com.example.data.remote.GeminiFunctionResponse
 import com.example.data.remote.GeminiGenerateRequest
 import com.example.data.remote.GeminiInlineData
 import com.example.data.remote.GeminiPart
 import com.example.data.remote.GroqApiService
 import com.example.data.remote.GroqChatRequest
+import com.example.data.remote.GroqFunctionCallPayload
 import com.example.data.remote.GroqMessage
+import com.example.data.remote.GroqToolCall
 import com.example.domain.tools.ToolDefinitions
 import com.squareup.moshi.Moshi
 import com.squareup.moshi.Types
-import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.delay
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MultipartBody
 import okhttp3.RequestBody.Companion.toRequestBody
-import java.io.IOException
-import java.net.ConnectException
-import java.net.SocketTimeoutException
-import java.net.UnknownHostException
 import javax.inject.Inject
 import javax.inject.Singleton
+import kotlin.random.Random
 
 enum class BrainType(val label: String) {
     GROQ("Groq"),
@@ -52,12 +54,14 @@ data class AiPlanResult(
     val brainUsed: BrainType,
     val replyText: String?,
     val toolCalls: List<PlannedToolCall>,
-    val fallbackNote: String? = null
+    val fallbackNote: String? = null,
+    val modelSwitchedNotice: String? = null
 )
 
 data class WhisperTranscriptResult(
     val text: String,
-    val detectedLanguage: String?
+    val detectedLanguage: String?,
+    val modelSwitchedNotice: String? = null
 )
 
 @Singleton
@@ -74,38 +78,108 @@ class AiRouter @Inject constructor(
     )
     private val mapAdapter = moshi.adapter<Map<String, Any?>>(mapType)
 
+    // Test hooks for deterministic backoff tests without slow sleeps
+    internal var sleeper: suspend (Long) -> Unit = { delay(it) }
+    internal var jitterRatioProvider: () -> Double = { Random.nextDouble(0.0, 0.25) }
+
     suspend fun transcribeAudio(wavBytes: ByteArray): Result<WhisperTranscriptResult> {
         val settings = keyStore.settings.value
         val groqKey = settings.groqApiKey.trim()
         if (groqKey.isBlank()) {
-            return Result.failure(IllegalStateException("Groq API key missing for Whisper speech-to-text."))
+            return Result.failure(
+                AiCallException(
+                    AiFailure(
+                        provider = "Groq Whisper",
+                        model = settings.modelConfig.sttModel,
+                        userMessage = "Voice transcribe karne ke liye Settings > API Keys mein Groq API key daalo.",
+                        technicalDetails = "Groq API key is missing"
+                    )
+                )
+            )
         }
-        return try {
-            val filePart = MultipartBody.Part.createFormData(
-                "file",
-                "voice.wav",
-                wavBytes.toRequestBody("audio/wav".toMediaType())
+
+        val initialModel = settings.modelConfig.sttModel
+        val firstRes = callWhisperOnce(groqKey, wavBytes, initialModel)
+        if (firstRes.isSuccess) {
+            val body = firstRes.getOrThrow()
+            return Result.success(WhisperTranscriptResult(body.text.trim(), body.language))
+        }
+
+        val firstEx = firstRes.exceptionOrNull() as? AiCallException
+        if (firstEx == null || !firstEx.failure.isModelNotFound) {
+            return Result.failure(firstRes.exceptionOrNull() ?: IllegalStateException("Whisper error"))
+        }
+
+        val liveIds = AiResilienceHelper.fetchLiveGroqModels(groqApi, groqKey).getOrElse { fetchErr ->
+            val clean = SensitiveDataSanitizer.sanitizeError(fetchErr.message, groqKey)
+            return Result.failure(
+                AiResilienceHelper.modelRecoveryExhaustedException(
+                    failedModel = initialModel,
+                    reason = clean,
+                    origDetails = firstEx.failure.technicalDetails
+                )
             )
-            val modelBody = settings.groqWhisperModel.toRequestBody("text/plain".toMediaType())
-            val formatBody = "verbose_json".toRequestBody("text/plain".toMediaType())
-            val resp = groqApi.transcribeAudio(
-                bearerAuth = "Bearer $groqKey",
-                file = filePart,
-                model = modelBody,
-                responseFormat = formatBody
+        }
+
+        val replacement = AiModelConfig.pickBestReplacement(liveIds, initialModel, GroqModelRole.STT)
+            ?: return Result.failure(
+                AiResilienceHelper.modelRecoveryExhaustedException(
+                    failedModel = initialModel,
+                    reason = "Live list mein koi compatible Whisper model nahi mila",
+                    origDetails = firstEx.failure.technicalDetails
+                )
             )
-            if (resp.isSuccessful && resp.body() != null) {
-                val body = resp.body()!!
-                Result.success(WhisperTranscriptResult(body.text.trim(), body.language))
-            } else {
-                val errBody = runCatching { resp.errorBody()?.string()?.take(200) }.getOrNull()
-                Result.failure(classifyHttpFailure("Whisper", resp.code(), errBody, groqKey))
+
+        AiResilienceHelper.saveReplacementModel(keyStore, GroqModelRole.STT, replacement)
+
+        val retryRes = callWhisperOnce(groqKey, wavBytes, replacement)
+        return retryRes.fold(
+            onSuccess = { body ->
+                Result.success(
+                    WhisperTranscriptResult(
+                        text = body.text.trim(),
+                        detectedLanguage = body.language,
+                        modelSwitchedNotice = "Model badal diya: $replacement"
+                    )
+                )
+            },
+            onFailure = { retryErr ->
+                val clean = SensitiveDataSanitizer.sanitizeError(retryErr.message, groqKey)
+                Result.failure(
+                    AiResilienceHelper.modelRecoveryExhaustedException(
+                        failedModel = "$initialModel -> $replacement",
+                        reason = clean,
+                        origDetails = (retryErr as? AiCallException)?.failure?.technicalDetails
+                    )
+                )
             }
-        } catch (ce: CancellationException) {
-            throw ce
-        } catch (e: Exception) {
-            Result.failure(classifyNetworkFailure("Whisper", e, groqKey))
-        }
+        )
+    }
+
+    private suspend fun callWhisperOnce(
+        groqKey: String,
+        wavBytes: ByteArray,
+        modelId: String
+    ) = AiResilienceHelper.executeWithRetry(
+        provider = "Groq Whisper",
+        model = modelId,
+        secretKey = groqKey,
+        sleeper = sleeper,
+        jitterRatioProvider = jitterRatioProvider
+    ) {
+        val filePart = MultipartBody.Part.createFormData(
+            "file",
+            "voice.wav",
+            wavBytes.toRequestBody("audio/wav".toMediaType())
+        )
+        val modelBody = modelId.toRequestBody("text/plain".toMediaType())
+        val formatBody = "verbose_json".toRequestBody("text/plain".toMediaType())
+        groqApi.transcribeAudio(
+            bearerAuth = "Bearer $groqKey",
+            file = filePart,
+            model = modelBody,
+            responseFormat = formatBody
+        )
     }
 
     suspend fun planNextStep(
@@ -120,7 +194,14 @@ class AiRouter @Inject constructor(
         val settings = keyStore.settings.value
         if (!settings.hasAnyApiKey) {
             return Result.failure(
-                IllegalStateException("No API keys saved. Please add your Groq or Gemini API key in Settings.")
+                AiCallException(
+                    AiFailure(
+                        provider = "AI",
+                        model = "",
+                        userMessage = "Koi AI API key save nahi hai. Settings > API Keys mein Groq ya Gemini key daalo.",
+                        technicalDetails = "No Groq or Gemini API key saved in SecureKeyStore"
+                    )
+                )
             )
         }
 
@@ -150,28 +231,73 @@ class AiRouter @Inject constructor(
         val firstAttempt = invokeBrain(primary, settings, systemPrompt, safeTurns, effectiveScreenshot)
         if (firstAttempt.isSuccess) return firstAttempt
 
-        val firstErr = SensitiveDataSanitizer.sanitizeError(
-            firstAttempt.exceptionOrNull()?.message ?: "Primary brain error",
+        val firstException = firstAttempt.exceptionOrNull()
+        val firstFailure = (firstException as? AiCallException)?.failure
+        val firstFriendly = SensitiveDataSanitizer.sanitizeError(
+            firstFailure?.userMessage ?: firstException?.message ?: "Primary AI fail ho gaya",
             settings.groqApiKey,
             settings.geminiApiKey
         )
+
         if (settings.autoFallbackEnabled && hasKeyFor(secondary, settings)) {
             val fallbackAttempt = invokeBrain(secondary, settings, systemPrompt, safeTurns, effectiveScreenshot)
             if (fallbackAttempt.isSuccess) {
                 val plan = fallbackAttempt.getOrThrow()
                 return Result.success(
-                    plan.copy(fallbackNote = "Auto-switched from ${primary.label} ($firstErr) to ${secondary.label}")
+                    plan.copy(
+                        fallbackNote = "Auto-switched from ${primary.label} (${firstFailure?.httpCode ?: "error"}) to ${secondary.label}"
+                    )
                 )
             }
-            val secondErr = SensitiveDataSanitizer.sanitizeError(
-                fallbackAttempt.exceptionOrNull()?.message ?: "Fallback error",
+            val secondException = fallbackAttempt.exceptionOrNull()
+            val secondFailure = (secondException as? AiCallException)?.failure
+            val secondFriendly = SensitiveDataSanitizer.sanitizeError(
+                secondFailure?.userMessage ?: secondException?.message ?: "Fallback AI fail ho gaya",
                 settings.groqApiKey,
                 settings.geminiApiKey
             )
-            return Result.failure(IllegalStateException("${primary.label} failed ($firstErr); ${secondary.label} failed ($secondErr)"))
+            val combinedUserMsg = buildString {
+                if (firstFailure?.isOffline == true && secondFailure?.isOffline == true) {
+                    append("Internet connection nahi mil raha. Offline commands (flashlight, volume, alarm, open app) bina internet chalenge.")
+                } else {
+                    append("${primary.label}: $firstFriendly")
+                    append("\n${secondary.label}: $secondFriendly")
+                }
+            }
+            val combinedDetails = listOfNotNull(
+                firstFailure?.technicalDetails ?: firstFriendly,
+                secondFailure?.technicalDetails ?: secondFriendly
+            ).joinToString(" || ")
+
+            return Result.failure(
+                AiCallException(
+                    AiFailure(
+                        provider = "Groq + Gemini",
+                        model = "${settings.modelConfig.chatModel} / ${settings.modelConfig.geminiModel}",
+                        httpCode = secondFailure?.httpCode ?: firstFailure?.httpCode,
+                        isRetryable = false,
+                        isOffline = firstFailure?.isOffline == true && secondFailure?.isOffline == true,
+                        userMessage = combinedUserMsg,
+                        technicalDetails = combinedDetails
+                    )
+                )
+            )
         }
 
-        return Result.failure(IllegalStateException(firstErr))
+        if (firstException is AiCallException) {
+            return Result.failure(firstException)
+        }
+        return Result.failure(
+            AiCallException(
+                AiFailure(
+                    provider = primary.label,
+                    model = if (primary == BrainType.GROQ) settings.modelConfig.chatModel else settings.modelConfig.geminiModel,
+                    userMessage = firstFriendly,
+                    technicalDetails = firstFriendly
+                ),
+                cause = firstException
+            )
+        )
     }
 
     private fun sanitizeTurnsForRemoteAi(turns: List<AgentStepTurn>): List<AgentStepTurn> {
@@ -237,7 +363,19 @@ class AiRouter @Inject constructor(
         turns: List<AgentStepTurn>
     ): Result<AiPlanResult> {
         val key = settings.groqApiKey.trim()
-        if (key.isBlank()) return Result.failure(IllegalStateException("Groq API key missing"))
+        val initialModel = settings.modelConfig.chatModel
+        if (key.isBlank()) {
+            return Result.failure(
+                AiCallException(
+                    AiFailure(
+                        provider = "Groq",
+                        model = initialModel,
+                        userMessage = "Groq API key missing hai. Settings > API Keys check karo.",
+                        technicalDetails = "Groq API key missing"
+                    )
+                )
+            )
+        }
 
         val messages = mutableListOf<GroqMessage>()
         messages.add(GroqMessage(role = "system", content = systemPrompt))
@@ -255,10 +393,10 @@ class AiRouter @Inject constructor(
                                 role = "assistant",
                                 content = turn.text,
                                 toolCalls = listOf(
-                                    com.example.data.remote.GroqToolCall(
+                                    GroqToolCall(
                                         id = callId,
                                         type = "function",
-                                        function = com.example.data.remote.GroqFunctionCallPayload(
+                                        function = GroqFunctionCallPayload(
                                             name = turn.toolName,
                                             arguments = argsJson
                                         )
@@ -283,48 +421,85 @@ class AiRouter @Inject constructor(
             }
         }
 
-        return try {
-            val resp = groqApi.chatCompletions(
-                bearerAuth = "Bearer $key",
-                request = GroqChatRequest(
-                    model = settings.groqModel,
+        val tools = ToolDefinitions.toGroqTools()
+        val res = AiResilienceHelper.executeGroqChatWithRecovery(
+            groqApi = groqApi,
+            keyStore = keyStore,
+            key = key,
+            initialModel = initialModel,
+            role = GroqModelRole.CHAT,
+            requestBuilder = { modelId ->
+                GroqChatRequest(
+                    model = modelId,
                     messages = messages,
-                    tools = ToolDefinitions.toGroqTools(),
+                    tools = tools,
                     toolChoice = "auto"
                 )
-            )
-            if (!resp.isSuccessful || resp.body() == null) {
-                val errBody = runCatching { resp.errorBody()?.string()?.take(220) }.getOrNull()
-                return Result.failure(classifyHttpFailure("Groq", resp.code(), errBody, key))
-            }
-            val msg = resp.body()?.choices?.firstOrNull()?.message
-                ?: return Result.failure(IllegalStateException("Empty Groq response"))
+            },
+            sleeper = sleeper,
+            jitterRatioProvider = jitterRatioProvider
+        )
 
-            val toolCalls = msg.toolCalls.orEmpty()
-                .filter { it.function.name.isNotBlank() }
-                .mapIndexed { idx, tc ->
-                    PlannedToolCall(
-                        id = tc.id.ifBlank { "groq_call_$idx" },
-                        name = tc.function.name.trim(),
-                        args = parseToolArgsSafely(tc.function.arguments)
+        if (res.isFailure) {
+            return Result.failure(res.exceptionOrNull() ?: IllegalStateException("Groq request fail"))
+        }
+
+        val attempt = res.getOrThrow()
+        val body = attempt.value
+        val msg = body.choices?.firstOrNull()?.message
+            ?: return Result.failure(
+                AiCallException(
+                    AiFailure(
+                        provider = "Groq",
+                        model = attempt.modelUsed,
+                        userMessage = "Groq ne khali jawab bheja. Dobara try karo.",
+                        technicalDetails = "Empty choices in GroqChatResponse (${attempt.modelUsed})"
                     )
-                }
-            val replyText = msg.content?.trim()?.takeIf { it.isNotEmpty() }
-            if (replyText == null && toolCalls.isEmpty()) {
-                return Result.failure(IllegalStateException("Groq returned empty output"))
-            }
-            Result.success(
-                AiPlanResult(
-                    brainUsed = BrainType.GROQ,
-                    replyText = replyText,
-                    toolCalls = toolCalls
                 )
             )
-        } catch (ce: CancellationException) {
-            throw ce
-        } catch (e: Exception) {
-            Result.failure(classifyNetworkFailure("Groq", e, key))
+
+        val structuredToolCalls = msg.toolCalls.orEmpty()
+            .mapNotNull { tc ->
+                val fnName = tc.function?.name?.trim()?.takeIf { it.isNotEmpty() } ?: return@mapNotNull null
+                val rawArgs = tc.function.arguments
+                fnName to (tc.id?.trim()?.takeIf { it.isNotEmpty() } to rawArgs)
+            }
+            .mapIndexed { idx, (fnName, idAndArgs) ->
+                PlannedToolCall(
+                    id = idAndArgs.first ?: "groq_call_$idx",
+                    name = fnName,
+                    args = parseToolArgsSafely(idAndArgs.second)
+                )
+            }
+
+        val toolCalls = if (structuredToolCalls.isNotEmpty()) {
+            structuredToolCalls
+        } else {
+            AiResponseParser.extractInlineToolCalls(msg.content, mapAdapter)
         }
+
+        val replyText = AiResponseParser.stripReasoning(msg.content)
+        if (replyText == null && toolCalls.isEmpty()) {
+            return Result.failure(
+                AiCallException(
+                    AiFailure(
+                        provider = "Groq",
+                        model = attempt.modelUsed,
+                        userMessage = "Groq model (${attempt.modelUsed}) ne koi useful jawab nahi diya. Retry karo ya model badlo.",
+                        technicalDetails = "Groq returned empty content & zero tool calls (${attempt.modelUsed})"
+                    )
+                )
+            )
+        }
+
+        return Result.success(
+            AiPlanResult(
+                brainUsed = BrainType.GROQ,
+                replyText = replyText,
+                toolCalls = toolCalls,
+                modelSwitchedNotice = attempt.modelSwitchedNotice
+            )
+        )
     }
 
     private suspend fun callGemini(
@@ -334,7 +509,19 @@ class AiRouter @Inject constructor(
         latestScreenshotBase64: String?
     ): Result<AiPlanResult> {
         val key = settings.geminiApiKey.trim()
-        if (key.isBlank()) return Result.failure(IllegalStateException("Gemini API key missing"))
+        val modelId = settings.modelConfig.geminiModel
+        if (key.isBlank()) {
+            return Result.failure(
+                AiCallException(
+                    AiFailure(
+                        provider = "Gemini",
+                        model = modelId,
+                        userMessage = "Gemini API key missing hai. Settings > API Keys check karo.",
+                        technicalDetails = "Gemini API key missing"
+                    )
+                )
+            )
+        }
 
         val contents = mutableListOf<GeminiContent>()
         turns.forEachIndexed { idx, turn ->
@@ -360,7 +547,7 @@ class AiRouter @Inject constructor(
                     if (!turn.toolName.isNullOrBlank()) {
                         parts.add(
                             GeminiPart(
-                                functionCall = com.example.data.remote.GeminiFunctionCall(
+                                functionCall = GeminiFunctionCall(
                                     name = turn.toolName,
                                     args = turn.toolArgs ?: emptyMap()
                                 )
@@ -397,105 +584,90 @@ class AiRouter @Inject constructor(
             }
         }
 
-        return try {
-            val resp = geminiApi.generateContent(
-                model = settings.geminiModel,
-                apiKey = key,
-                request = GeminiGenerateRequest(
-                    systemInstruction = GeminiContent(parts = listOf(GeminiPart(text = systemPrompt))),
-                    contents = contents,
-                    tools = ToolDefinitions.toGeminiTools()
-                )
-            )
-            if (!resp.isSuccessful || resp.body() == null) {
-                val errBody = runCatching { resp.errorBody()?.string()?.take(220) }.getOrNull()
-                return Result.failure(classifyHttpFailure("Gemini", resp.code(), errBody, key))
-            }
-            val body = resp.body()!!
-            body.error?.message?.takeIf { it.isNotBlank() }?.let { apiErr ->
-                return Result.failure(
-                    IllegalStateException("Gemini API error: ${SensitiveDataSanitizer.sanitizeError(apiErr, key)}")
-                )
-            }
-            val firstCandidate = body.candidates?.firstOrNull()
-                ?: return Result.failure(IllegalStateException("Empty Gemini response"))
-            val parts = firstCandidate.content?.parts.orEmpty()
-            val textParts = parts.mapNotNull { it.text?.trim() }.filter { it.isNotEmpty() }
-            val calls = parts.mapNotNull { it.functionCall }
-                .filter { it.name.isNotBlank() }
-                .mapIndexed { index, fc ->
-                    PlannedToolCall(
-                        id = "gem_call_$index",
-                        name = fc.name.trim(),
-                        args = fc.args ?: emptyMap()
-                    )
-                }
-            if (textParts.isEmpty() && calls.isEmpty()) {
-                val reason = firstCandidate.finishReason ?: "EMPTY"
-                return Result.failure(IllegalStateException("Gemini returned no content ($reason)"))
-            }
-            Result.success(
-                AiPlanResult(
-                    brainUsed = BrainType.GEMINI,
-                    replyText = textParts.joinToString("\n").takeIf { it.isNotBlank() },
-                    toolCalls = calls
-                )
-            )
-        } catch (ce: CancellationException) {
-            throw ce
-        } catch (e: Exception) {
-            Result.failure(classifyNetworkFailure("Gemini", e, key))
+        val res = AiResilienceHelper.executeGeminiWithRetry(
+            geminiApi = geminiApi,
+            key = key,
+            model = modelId,
+            request = GeminiGenerateRequest(
+                systemInstruction = GeminiContent(parts = listOf(GeminiPart(text = systemPrompt))),
+                contents = contents,
+                tools = ToolDefinitions.toGeminiTools()
+            ),
+            sleeper = sleeper,
+            jitterRatioProvider = jitterRatioProvider
+        )
+
+        if (res.isFailure) {
+            return Result.failure(res.exceptionOrNull() ?: IllegalStateException("Gemini request fail"))
         }
+
+        val body = res.getOrThrow()
+        body.error?.let { errBody ->
+            if (!errBody.message.isNullOrBlank()) {
+                val clean = SensitiveDataSanitizer.sanitizeError(errBody.message, key)
+                return Result.failure(
+                    AiCallException(
+                        AiFailure(
+                            provider = "Gemini",
+                            model = modelId,
+                            httpCode = errBody.code,
+                            errorCode = errBody.status,
+                            userMessage = "Gemini error (${errBody.code ?: "API"}): Settings > AI Models ya API Key check karo.",
+                            technicalDetails = "Provider: Gemini | Model: $modelId | Reason: $clean"
+                        )
+                    )
+                )
+            }
+        }
+
+        val firstCandidate = body.candidates?.firstOrNull()
+            ?: return Result.failure(
+                AiCallException(
+                    AiFailure(
+                        provider = "Gemini",
+                        model = modelId,
+                        userMessage = "Gemini ne khali jawab bheja. Dobara try karo.",
+                        technicalDetails = "Empty candidates in GeminiGenerateResponse ($modelId)"
+                    )
+                )
+            )
+        val parts = firstCandidate.content?.parts.orEmpty()
+        val visibleReply = AiResilienceHelper.extractGeminiVisibleText(parts)
+        val calls = parts.mapNotNull { it.functionCall }
+            .filter { it.name.isNotBlank() }
+            .mapIndexed { index, fc ->
+                PlannedToolCall(
+                    id = "gem_call_$index",
+                    name = fc.name.trim(),
+                    args = fc.args ?: emptyMap()
+                )
+            }
+
+        if (visibleReply == null && calls.isEmpty()) {
+            val reason = firstCandidate.finishReason ?: "EMPTY"
+            return Result.failure(
+                AiCallException(
+                    AiFailure(
+                        provider = "Gemini",
+                        model = modelId,
+                        userMessage = "Gemini model ($modelId) ne jawab nahi diya ($reason).",
+                        technicalDetails = "Provider: Gemini | Model: $modelId | Finish: $reason"
+                    )
+                )
+            )
+        }
+
+        return Result.success(
+            AiPlanResult(
+                brainUsed = BrainType.GEMINI,
+                replyText = visibleReply,
+                toolCalls = calls
+            )
+        )
     }
 
     internal fun parseToolArgsSafely(rawJson: String?): Map<String, Any?> {
-        if (rawJson.isNullOrBlank()) return emptyMap()
-        val cleaned = rawJson.trim()
-            .removePrefix("```json")
-            .removePrefix("```")
-            .removeSuffix("```")
-            .trim()
-        val jsonCandidate = if (cleaned.startsWith("{")) {
-            cleaned
-        } else {
-            val start = cleaned.indexOf('{')
-            val end = cleaned.lastIndexOf('}')
-            if (start >= 0 && end > start) cleaned.substring(start, end + 1) else return emptyMap()
-        }
-        return runCatching {
-            mapAdapter.fromJson(jsonCandidate).orEmpty()
-        }.getOrDefault(emptyMap())
-    }
-
-    private fun classifyHttpFailure(
-        provider: String,
-        code: Int,
-        rawError: String?,
-        secretKey: String
-    ): IllegalStateException {
-        val cleanErr = SensitiveDataSanitizer.sanitizeError(rawError, secretKey).take(160)
-        val msg = when (code) {
-            400 -> "$provider rejected request (HTTP 400): $cleanErr"
-            401, 403 -> "$provider API key invalid or unauthorized (HTTP $code)."
-            429 -> "$provider rate limit exceeded (HTTP 429). Switching or retry shortly."
-            in 500..599 -> "$provider service temporarily unavailable (HTTP $code)."
-            else -> "$provider HTTP $code: $cleanErr"
-        }
-        return IllegalStateException(msg)
-    }
-
-    private fun classifyNetworkFailure(
-        provider: String,
-        err: Exception,
-        secretKey: String
-    ): IllegalStateException {
-        val msg = when (err) {
-            is SocketTimeoutException -> "$provider request timed out."
-            is UnknownHostException, is ConnectException -> "No internet connection while contacting $provider."
-            is IOException -> "$provider network error: ${SensitiveDataSanitizer.sanitizeError(err.message, secretKey)}"
-            else -> SensitiveDataSanitizer.sanitizeError(err.message, secretKey)
-        }
-        return IllegalStateException(msg, err)
+        return AiResponseParser.parseToolArgsSafely(rawJson, mapAdapter)
     }
 
     private fun buildSystemPrompt(
@@ -517,7 +689,7 @@ class AiRouter @Inject constructor(
         return buildString {
             appendLine("Your name is Baby. You are a friendly Hinglish-speaking phone assistant. Reply in short, natural language. Use tools to act on the phone. Ask confirmation before sensitive actions.")
             appendLine("IDENTITY & PERSONALITY:")
-            appendLine("- Always introduce yourself as Baby. NEVER mention Gemini, Llama, Groq, Google, Meta, or any underlying model or API name.")
+            appendLine("- Always introduce yourself as Baby. NEVER mention Gemini, Llama, Groq, GPT-OSS, Qwen, Google, OpenAI, or any underlying model or API name.")
             appendLine("- Personality style: ${settings.personality.toneInstruction}")
             appendLine("- $langGuide")
             appendLine(

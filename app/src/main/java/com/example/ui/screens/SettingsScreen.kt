@@ -26,16 +26,19 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.OpenInNew
+import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.ContentPaste
 import androidx.compose.material.icons.filled.DeleteForever
+import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Palette
 import androidx.compose.material.icons.filled.RadioButtonUnchecked
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Visibility
@@ -47,6 +50,8 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -83,6 +88,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import com.example.core.security.AiModelConfig
 import com.example.core.security.AppLanguage
 import com.example.core.security.AutoReplyMode
 import com.example.core.security.BabyPersonality
@@ -93,6 +99,7 @@ import com.example.data.local.AutoReplyContactRuleEntity
 import com.example.data.local.EmergencyContactEntity
 import com.example.ui.state.BabyUiPreferences
 import com.example.ui.state.KeyTestResult
+import com.example.ui.state.ModelsTestUiState
 import com.example.ui.theme.BabyTheme
 import com.example.ui.theme.BabyThemeMode
 import com.example.ui.theme.BabyThemeTokens
@@ -119,6 +126,10 @@ fun SettingsScreen(
     uiPrefs: BabyUiPreferences = BabyUiPreferences(),
     groqKeyTest: KeyTestResult = KeyTestResult.Idle,
     geminiKeyTest: KeyTestResult = KeyTestResult.Idle,
+    liveGroqModels: List<String> = emptyList(),
+    liveModelsLoading: Boolean = false,
+    liveModelsError: String? = null,
+    modelsTestState: ModelsTestUiState = ModelsTestUiState(),
     onBack: (() -> Unit)? = null,
     onRefreshPermissions: () -> Unit,
     onSaveKeys: (String, String) -> Unit,
@@ -130,6 +141,10 @@ fun SettingsScreen(
     onSoundCuesChange: (Boolean) -> Unit = {},
     onGeminiModelChange: (String) -> Unit,
     onGroqModelChange: (String) -> Unit,
+    onSaveModelConfig: (AiModelConfig) -> Unit = {},
+    onResetModelConfig: () -> Unit = {},
+    onRefreshLiveGroqModels: (String) -> Unit = {},
+    onTestAllModels: (AiModelConfig, String, String) -> Unit = { _, _, _ -> },
     onPreferredBrainChange: (PreferredBrain) -> Unit,
     onAutoFallbackChange: (Boolean) -> Unit,
     onWakeWordToggle: (Boolean) -> Unit,
@@ -198,7 +213,7 @@ fun SettingsScreen(
 
     val showAppearance = matches("appearance", "theme", "dark", "light", "amoled", "material you", "dynamic color", "sound", "cue", "beep")
     val showKeysSection = matches("api", "key", "groq", "gemini", "keystore", "paste", "test")
-    val showAiSection = matches("ai", "brain", "routing", "model", "whisper", "fallback", "gemini", "groq", "llama")
+    val showAiSection = matches("ai", "brain", "routing", "model", "whisper", "fallback", "gemini", "groq", "gpt-oss", "qwen", "stt")
     val showVoiceSection = matches("wake", "voice", "hey baby", "sensitivity", "language", "hinglish", "hindi", "english", "tts", "bubble", "overlay", "confirm")
     val showPermissionsSection = matches("permission", "mic", "accessibility", "notification", "battery", "autostart", "oem", "dnd", "brightness")
     val showFeaturesSection = matches("module", "personality", "memory", "data saver", "offline", "routine", "command", "macro", "reminder", "location", "clipboard", "camera", "screen help", "retention", "audit")
@@ -476,13 +491,33 @@ fun SettingsScreen(
                     }
                 }
 
-                // 2. AI Routing & Model Choice
+                // 2. AI Routing & Model Config
                 if (showAiSection) {
                     item(key = "sec_ai") {
+                        val cfg = settings.modelConfig
+                        var chatModelInput by remember(cfg.chatModel) { mutableStateOf(cfg.chatModel) }
+                        var fastModelInput by remember(cfg.fastModel) { mutableStateOf(cfg.fastModel) }
+                        var sttModelInput by remember(cfg.sttModel) { mutableStateOf(cfg.sttModel) }
+                        var geminiModelInput by remember(cfg.geminiModel) { mutableStateOf(cfg.geminiModel) }
+                        var modelsSavedNotice by remember { mutableStateOf(false) }
+
+                        val chatOptions = remember(liveGroqModels) {
+                            (liveGroqModels.filter { AiModelConfig.isChatCapableModel(it) } + AiModelConfig.GROQ_CHAT_PRESETS)
+                                .distinct()
+                        }
+                        val fastOptions = remember(liveGroqModels) {
+                            (liveGroqModels.filter { AiModelConfig.isChatCapableModel(it) } + AiModelConfig.FAST_PRIORITY_LIST)
+                                .distinct()
+                        }
+                        val sttOptions = remember(liveGroqModels) {
+                            (liveGroqModels.filter { it.lowercase().contains("whisper") } + AiModelConfig.GROQ_STT_PRESETS)
+                                .distinct()
+                        }
+
                         SectionCard(
                             icon = Icons.Default.Memory,
-                            title = "AI Brain Routing & Models",
-                            summary = "${settings.preferredBrain.label} • ${settings.groqModel}"
+                            title = "AI Models & Brain Routing",
+                            summary = "${settings.preferredBrain.label} • ${cfg.chatModel}"
                         ) {
                             Text("Preferred Routing", style = MaterialTheme.typography.titleSmall)
                             FlowRow(
@@ -500,32 +535,217 @@ fun SettingsScreen(
 
                             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
 
-                            Text("Gemini Vision/Reasoning Model", style = MaterialTheme.typography.titleSmall)
-                            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                listOf("gemini-3.8-flash", "gemini-2.5-flash", "gemini-2.5-pro").forEach { model ->
-                                    FilterChip(
-                                        selected = settings.geminiModel == model,
-                                        onClick = { onGeminiModelChange(model) },
-                                        label = { Text(model) }
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text("Groq Live Model List", style = MaterialTheme.typography.titleSmall)
+                                OutlinedButton(
+                                    onClick = { onRefreshLiveGroqModels(groqInput) },
+                                    enabled = !liveModelsLoading,
+                                    modifier = Modifier
+                                        .minimumInteractiveComponentSize()
+                                        .testTag("load_live_groq_models_button")
+                                ) {
+                                    if (liveModelsLoading) {
+                                        CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp)
+                                        Spacer(Modifier.width(6.dp))
+                                    } else {
+                                        Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
+                                        Spacer(Modifier.width(6.dp))
+                                    }
+                                    Text(if (liveGroqModels.isEmpty()) "Load Live Models" else "Refresh (${liveGroqModels.size})")
+                                }
+                            }
+                            if (!liveModelsError.isNullOrBlank()) {
+                                Text(
+                                    text = liveModelsError,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.error
+                                )
+                            }
+
+                            ModelSelectorField(
+                                label = "Groq Chat & Tools Model",
+                                value = chatModelInput,
+                                options = chatOptions,
+                                onValueChange = {
+                                    chatModelInput = it
+                                    modelsSavedNotice = false
+                                },
+                                onSelectOption = {
+                                    chatModelInput = it
+                                    onGroqModelChange(it)
+                                    onSaveModelConfig(
+                                        AiModelConfig(chatModelInput, fastModelInput, sttModelInput, geminiModelInput)
                                     )
+                                    modelsSavedNotice = true
+                                },
+                                testTag = "settings_chat_model_input",
+                                dropdownTag = "settings_chat_model_dropdown"
+                            )
+
+                            ModelSelectorField(
+                                label = "Groq Fast / Simple Model",
+                                value = fastModelInput,
+                                options = fastOptions,
+                                onValueChange = {
+                                    fastModelInput = it
+                                    modelsSavedNotice = false
+                                },
+                                onSelectOption = {
+                                    fastModelInput = it
+                                    onSaveModelConfig(
+                                        AiModelConfig(chatModelInput, fastModelInput, sttModelInput, geminiModelInput)
+                                    )
+                                    modelsSavedNotice = true
+                                },
+                                testTag = "settings_fast_model_input",
+                                dropdownTag = "settings_fast_model_dropdown"
+                            )
+
+                            ModelSelectorField(
+                                label = "Groq Speech-to-Text (STT) Model",
+                                value = sttModelInput,
+                                options = sttOptions,
+                                onValueChange = {
+                                    sttModelInput = it
+                                    modelsSavedNotice = false
+                                },
+                                onSelectOption = {
+                                    sttModelInput = it
+                                    onSaveModelConfig(
+                                        AiModelConfig(chatModelInput, fastModelInput, sttModelInput, geminiModelInput)
+                                    )
+                                    modelsSavedNotice = true
+                                },
+                                testTag = "settings_stt_model_input",
+                                dropdownTag = "settings_stt_model_dropdown"
+                            )
+
+                            ModelSelectorField(
+                                label = "Gemini Flash / Vision Model",
+                                value = geminiModelInput,
+                                options = AiModelConfig.GEMINI_PRESETS,
+                                onValueChange = {
+                                    geminiModelInput = it
+                                    modelsSavedNotice = false
+                                },
+                                onSelectOption = {
+                                    geminiModelInput = it
+                                    onGeminiModelChange(it)
+                                    onSaveModelConfig(
+                                        AiModelConfig(chatModelInput, fastModelInput, sttModelInput, geminiModelInput)
+                                    )
+                                    modelsSavedNotice = true
+                                },
+                                testTag = "settings_gemini_model_input",
+                                dropdownTag = "settings_gemini_model_dropdown"
+                            )
+
+                            FlowRow(
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalArrangement = Arrangement.spacedBy(8.dp),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Button(
+                                    onClick = {
+                                        val updated = AiModelConfig(
+                                            chatModel = chatModelInput,
+                                            fastModel = fastModelInput,
+                                            sttModel = sttModelInput,
+                                            geminiModel = geminiModelInput
+                                        ).normalized()
+                                        onGroqModelChange(updated.chatModel)
+                                        onGeminiModelChange(updated.geminiModel)
+                                        onSaveModelConfig(updated)
+                                        modelsSavedNotice = true
+                                    },
+                                    modifier = Modifier
+                                        .minimumInteractiveComponentSize()
+                                        .testTag("save_models_button")
+                                ) {
+                                    Text("Save Models")
+                                }
+
+                                OutlinedButton(
+                                    onClick = {
+                                        val current = AiModelConfig(
+                                            chatModel = chatModelInput,
+                                            fastModel = fastModelInput,
+                                            sttModel = sttModelInput,
+                                            geminiModel = geminiModelInput
+                                        ).normalized()
+                                        onTestAllModels(current, groqInput, geminiInput)
+                                    },
+                                    enabled = !modelsTestState.isTesting,
+                                    modifier = Modifier
+                                        .minimumInteractiveComponentSize()
+                                        .testTag("test_models_button")
+                                ) {
+                                    if (modelsTestState.isTesting) {
+                                        CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp)
+                                        Spacer(Modifier.width(6.dp))
+                                    }
+                                    Text("Test models")
+                                }
+
+                                TextButton(
+                                    onClick = {
+                                        onResetModelConfig()
+                                        modelsSavedNotice = true
+                                    },
+                                    modifier = Modifier
+                                        .minimumInteractiveComponentSize()
+                                        .testTag("reset_models_button")
+                                ) {
+                                    Text("Reset Defaults")
                                 }
                             }
 
-                            Text("Groq Fast Brain & Whisper", style = MaterialTheme.typography.titleSmall)
-                            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                listOf("llama-3.3-70b-versatile", "llama-3.1-8b-instant").forEach { model ->
-                                    FilterChip(
-                                        selected = settings.groqModel == model,
-                                        onClick = { onGroqModelChange(model) },
-                                        label = { Text(model) }
-                                    )
+                            if (modelsSavedNotice) {
+                                Text(
+                                    text = "Model config saved!",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = ext.success
+                                )
+                            }
+
+                            if (modelsTestState.items.isNotEmpty()) {
+                                Column(
+                                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .testTag("models_test_results")
+                                ) {
+                                    modelsTestState.items.forEach { item ->
+                                        Row(
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                            modifier = Modifier.fillMaxWidth()
+                                        ) {
+                                            Icon(
+                                                imageVector = if (item.passed == true) Icons.Default.CheckCircle else Icons.Default.ErrorOutline,
+                                                contentDescription = if (item.passed == true) "Pass" else "Fail",
+                                                tint = if (item.passed == true) ext.success else MaterialTheme.colorScheme.error,
+                                                modifier = Modifier.size(18.dp)
+                                            )
+                                            Column(modifier = Modifier.weight(1f)) {
+                                                Text(
+                                                    text = "${item.label}: ${item.modelId}",
+                                                    style = MaterialTheme.typography.labelMedium
+                                                )
+                                                Text(
+                                                    text = item.detail,
+                                                    style = MaterialTheme.typography.bodySmall,
+                                                    color = if (item.passed == true) ext.success else MaterialTheme.colorScheme.error
+                                                )
+                                            }
+                                        }
+                                    }
                                 }
                             }
-                            Text(
-                                text = "Voice STT: ${settings.groqWhisperModel}",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.secondary
-                            )
 
                             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
 
@@ -937,6 +1157,55 @@ fun SettingsScreen(
                 TextButton(onClick = { pendingDangerAction = null }) { Text("Cancel") }
             }
         )
+    }
+}
+
+@Composable
+private fun ModelSelectorField(
+    label: String,
+    value: String,
+    options: List<String>,
+    onValueChange: (String) -> Unit,
+    onSelectOption: (String) -> Unit,
+    testTag: String,
+    dropdownTag: String
+) {
+    var expanded by remember { mutableStateOf(false) }
+    Box(modifier = Modifier.fillMaxWidth()) {
+        OutlinedTextField(
+            value = value,
+            onValueChange = onValueChange,
+            label = { Text(label) },
+            singleLine = true,
+            trailingIcon = {
+                IconButton(
+                    onClick = { expanded = true },
+                    modifier = Modifier.testTag(dropdownTag)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.ArrowDropDown,
+                        contentDescription = "Choose $label"
+                    )
+                }
+            },
+            modifier = Modifier
+                .fillMaxWidth()
+                .testTag(testTag)
+        )
+        DropdownMenu(
+            expanded = expanded,
+            onDismissRequest = { expanded = false }
+        ) {
+            options.forEach { option ->
+                DropdownMenuItem(
+                    text = { Text(option) },
+                    onClick = {
+                        expanded = false
+                        onSelectOption(option)
+                    }
+                )
+            }
+        }
     }
 }
 
