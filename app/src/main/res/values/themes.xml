@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.Baby" parent="android:Theme.Material.NoActionBar" />
+
+    <style name="Theme.Baby.Splash" parent="Theme.SplashScreen">
+        <item name="windowSplashScreenBackground">#0B0E17</item>
+        <item name="windowSplashScreenAnimatedIcon">@mipmap/ic_launcher_round</item>
+        <item name="postSplashScreenTheme">@style/Theme.Baby</item>
+    </style>
+</resources>

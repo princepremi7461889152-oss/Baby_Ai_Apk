@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+    <shortcut
+        android:enabled="true"
+        android:icon="@drawable/ic_baby_tile"
+        android:shortcutId="baby_speak_shortcut"
+        android:shortcutLongLabel="@string/fg_action_speak"
+        android:shortcutShortLabel="@string/fg_action_speak">
+        <intent
+            android:action="android.intent.action.VIEW"
+            android:targetClass="com.example.MainActivity"
+            android:targetPackage="com.aistudio.babyassistant.kqzmpw">
+            <extra
+                android:name="extra_start_voice"
+                android:value="true" />
+        </intent>
+    </shortcut>
+</shortcuts>

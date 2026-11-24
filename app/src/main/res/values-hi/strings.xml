@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Baby</string>
+    <string name="fg_notification_title">Baby सुन रही है</string>
+    <string name="fg_notification_sleeping">Baby बैकग्राउंड में तैयार है</string>
+    <string name="fg_action_speak">बोलो</string>
+    <string name="fg_action_stop">रोको</string>
+    <string name="emergency_stop">रोको</string>
+
+    <string name="nav_chat">चैट</string>
+    <string name="nav_actions">एक्शन</string>
+    <string name="nav_history">हिस्ट्री</string>
+    <string name="nav_more">और</string>
+
+    <string name="status_listening">सुन रही है</string>
+    <string name="status_paused">रुकी हुई</string>
+    <string name="status_offline">ऑफ़लाइन</string>
+    <string name="status_no_api_key">API Key नहीं है</string>
+    <string name="status_locked_queue">अनलॉक का इंतज़ार</string>
+    <string name="status_thinking">सोच रही है</string>
+    <string name="status_speaking">बोल रही है</string>
+    <string name="status_rate_limited">रेट लिमिट</string>
+    <string name="quick_status_title">Baby स्टेटस और क्विक कंट्रोल</string>
+
+    <string name="banner_no_key_title">Groq या Gemini API key जोड़ें — तभी Baby पूरी तरह जवाब देगी</string>
+    <string name="banner_no_key_cta">Key जोड़ें</string>
+    <string name="banner_offline_msg">इंटरनेट बंद है — ऑफ़लाइन टूल्स (फ़्लैशलाइट, अलार्म, वॉल्यूम, कॉल) चलेंगे!</string>
+    <string name="banner_rate_limit_msg">API रेट लिमिट पूरी हुई — थोड़ा रुकें या फ़ॉलबैक उपयोग करें।</string>
+    <string name="chat_greeting_title">नमस्ते! मैं Baby हूँ</string>
+    <string name="chat_greeting_subtitle">बोलें \"Hey Baby\" या नीचे लिखें — ऐप्स, कॉल, रिमाइंडर और स्क्रीन कंट्रोल सब संभाल लूँगी।</string>
+    <string name="chat_input_hint">Baby को बोलें या लिखें…</string>
+    <string name="chat_jump_latest">नए संदेश पर जाएं</string>
+    <string name="chat_action_copy">कॉपी</string>
+    <string name="chat_action_share">शेयर</string>
+    <string name="chat_action_regenerate">दोबारा बनाएं</string>
+    <string name="chat_action_speak">सुनें</string>
+
+    <string name="voice_tap_interrupt">रोकने के लिए ऑर्ब टैप करें • बंद करने के लिए नीचे स्वाइप करें</string>
+    <string name="voice_hold_or_tap">टैप से बोलें • दबाए रखकर बात करें</string>
+
+    <string name="actions_title">एक्शन हब</string>
+    <string name="actions_subtitle">रूटीन, कमांड, मैक्रो, रिमाइंडर और मेमोरी</string>
+    <string name="more_title">और विकल्प</string>
+    <string name="more_subtitle">सेटिंग्स, परमिशन, सुरक्षा और बैकअप</string>
+    <string name="search_all_hint">फ़ीचर, टूल और सेटिंग्स खोजें…</string>
+
+    <string name="permissions_title">परमिशन चेकलिस्ट</string>
+    <string name="permissions_subtitle">कोई परमिशन न होने पर भी Baby उपलब्ध फीचर्स चलाएगी</string>
+    <string name="permission_granted">चालू</string>
+    <string name="permission_missing">सेटअप बाकी</string>
+    <string name="permission_fix">ठीक करें</string>
+
+    <string name="widget_tap_mic">बात करने के लिए माइक दबाएं</string>
+    <string name="widget_flash">फ़्लैश</string>
+    <string name="widget_sos">SOS</string>
+    <string name="widget_mic">माइक</string>
+</resources>

@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#FF121726"
+    android:gravity="center_vertical"
+    android:orientation="horizontal"
+    android:padding="12dp">
+
+    <LinearLayout
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_marginEnd="8dp"
+        android:layout_weight="1"
+        android:orientation="vertical">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/app_name"
+            android:textColor="#FFFF8A5B"
+            android:textSize="15sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:ellipsize="end"
+            android:maxLines="2"
+            android:text="@string/widget_tap_mic"
+            android:textColor="#FFB3BDD4"
+            android:textSize="11sp" />
+    </LinearLayout>
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="40dp"
+        android:layout_marginEnd="6dp"
+        android:background="#FF1A2237"
+        android:gravity="center"
+        android:paddingHorizontal="10dp"
+        android:text="@string/widget_flash"
+        android:textColor="#FFF5F7FC"
+        android:textSize="12sp" />
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="40dp"
+        android:layout_marginEnd="6dp"
+        android:background="#FF2DD4BF"
+        android:gravity="center"
+        android:paddingHorizontal="10dp"
+        android:text="@string/widget_sos"
+        android:textColor="#FF032622"
+        android:textSize="12sp"
+        android:textStyle="bold" />
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="40dp"
+        android:background="#FFFF8A5B"
+        android:gravity="center"
+        android:paddingHorizontal="14dp"
+        android:text="@string/widget_mic"
+        android:textColor="#FF2B0D02"
+        android:textSize="13sp"
+        android:textStyle="bold" />
+</LinearLayout>

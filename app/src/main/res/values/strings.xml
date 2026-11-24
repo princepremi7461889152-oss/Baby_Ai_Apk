@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Baby</string>
+    <string name="accessibility_service_label">Baby Phone Control</string>
+    <string name="accessibility_service_description">Lets Baby read screen elements, tap, type, scroll, take screenshots, and press back or home when you ask.</string>
+    <string name="notification_listener_label">Baby Notification Reader</string>
+    <string name="quick_settings_tile_label">Baby</string>
+    <string name="auto_reply_tile_label">Baby Auto-Reply</string>
+    <string name="fg_channel_name">Baby Assistant Service</string>
+    <string name="fg_channel_desc">Keeps Baby listening for Hey Baby wake word and running tasks</string>
+    <string name="fg_notification_title">Baby is listening</string>
+    <string name="fg_notification_sleeping">Baby is ready in background</string>
+    <string name="fg_action_speak">Speak</string>
+    <string name="fg_action_stop">Stop</string>
+    <string name="emergency_stop">STOP</string>
+
+    <!-- Bottom Navigation -->
+    <string name="nav_chat">Chat</string>
+    <string name="nav_actions">Actions</string>
+    <string name="nav_history">History</string>
+    <string name="nav_more">More</string>
+
+    <!-- Header & Status -->
+    <string name="status_listening">Listening</string>
+    <string name="status_paused">Paused</string>
+    <string name="status_offline">Offline</string>
+    <string name="status_no_api_key">No API key</string>
+    <string name="status_locked_queue">Locked-queue pending</string>
+    <string name="status_thinking">Thinking</string>
+    <string name="status_speaking">Speaking</string>
+    <string name="status_rate_limited">Rate limited</string>
+    <string name="quick_status_title">Baby Status &amp; Quick Controls</string>
+
+    <!-- Chat Banners & Empty State -->
+    <string name="banner_no_key_title">API key add karo — Groq ya Gemini paste karne par Baby full power se kaam karegi</string>
+    <string name="banner_no_key_cta">Add Key</string>
+    <string name="banner_offline_msg">Internet band hai — offline tools (flashlight, alarm, volume, call) chalenge!</string>
+    <string name="banner_rate_limit_msg">API rate limit hit hui — thoda ruko ya fallback brain use karo.</string>
+    <string name="chat_greeting_title">Hey! Main Baby hoon</string>
+    <string name="chat_greeting_subtitle">Bolo \"Hey Baby\" ya neeche likho — main apps, calls, reminders aur screen control sambhal loongi.</string>
+    <string name="chat_input_hint">Baby ko bolo ya likho…</string>
+    <string name="chat_jump_latest">Jump to latest</string>
+    <string name="chat_action_copy">Copy</string>
+    <string name="chat_action_share">Share</string>
+    <string name="chat_action_regenerate">Regenerate</string>
+    <string name="chat_action_speak">Speak</string>
+
+    <!-- Voice Overlay -->
+    <string name="voice_tap_interrupt">Tap orb to interrupt • Swipe down to close</string>
+    <string name="voice_hold_or_tap">Tap to toggle • Hold to talk</string>
+
+    <!-- Actions & More Hubs -->
+    <string name="actions_title">Actions</string>
+    <string name="actions_subtitle">Routines, commands, macros, reminders &amp; memory</string>
+    <string name="more_title">More</string>
+    <string name="more_subtitle">Settings, permissions, safety &amp; backup</string>
+    <string name="search_all_hint">Search features, tools &amp; settings…</string>
+
+    <!-- Permissions -->
+    <string name="permissions_title">Permissions Checklist</string>
+    <string name="permissions_subtitle">Har permission ke bina bhi Baby jitna ho sake kaam karegi</string>
+    <string name="permission_granted">Active</string>
+    <string name="permission_missing">Needs Setup</string>
+    <string name="permission_fix">Fix Now</string>
+
+    <!-- Widget -->
+    <string name="widget_tap_mic">Tap Mic to speak</string>
+    <string name="widget_flash">Flash</string>
+    <string name="widget_sos">SOS</string>
+    <string name="widget_mic">Mic</string>
+</resources>

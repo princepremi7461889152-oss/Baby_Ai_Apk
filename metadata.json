@@ -1,0 +1,6 @@
+{
+  "name": "Baby",
+  "description": "Voice and text AI phone assistant with background wake-word control, screen automation, and dual-brain Groq + Gemini routing.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
